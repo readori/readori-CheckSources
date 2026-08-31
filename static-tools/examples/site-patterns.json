@@ -1,0 +1,14 @@
+{
+  "biquge": {
+    "ruleToc.chapterList": "div#list dl dd, .listmain dd, .chapterlist li",
+    "ruleContent.content": "div#content@html"
+  },
+  "qidian": {
+    "ruleToc.chapterList": "ul.cf li, .catalog-content-wrap li",
+    "ruleContent.content": ".read-content@html"
+  },
+  "17k": {
+    "ruleToc.chapterList": ".Volume a, .chapter ul li",
+    "ruleContent.content": ".p@html, .readAreaBox@html"
+  }
+}

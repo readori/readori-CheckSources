@@ -1,0 +1,14 @@
+[
+  {
+    "base": "https://www.example.com",
+    "name": "示例站点A",
+    "search_url": "/search?keyword=测试",
+    "detail_url": "/book/123",
+    "toc_url": "/book/123/catalog",
+    "chapter_url": "/book/123/1"
+  },
+  {
+    "base": "https://www.example.org",
+    "name": "示例站点B"
+  }
+]

@@ -1,0 +1,1 @@
+python capture.py --base https://www.example.com --name 示例书源 --search-url /search?keyword=测试 --detail-url /book/100 --toc-url /book/100/catalog --chapter-url /book/100/1 --output output.source.json

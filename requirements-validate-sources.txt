@@ -1,0 +1,7 @@
+beautifulsoup4
+cryptography
+jsonpath-ng
+py7zr
+quickjs
+rarfile
+requests

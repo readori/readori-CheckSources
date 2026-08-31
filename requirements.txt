@@ -1,0 +1,6 @@
+# Runtime dependencies for the standalone validator.
+-r requirements-validate-sources.txt
+
+# Optional only when building Windows executables:
+# pyinstaller
+

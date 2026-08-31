@@ -1,0 +1,1 @@
+python capture.py --batch-file examples/batch-input.real.json --batch-output-dir batch-output-real --report batch-output-real/batch.report.json

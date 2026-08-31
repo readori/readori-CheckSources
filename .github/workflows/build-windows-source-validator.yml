@@ -1,0 +1,124 @@
+name: Build Windows Source Validator
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "在选定的 source-validator-v* 标签上发布 GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-source-validator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows x64 EXEs
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: standalone-source-validator/requirements-validate-sources.txt
+
+      - name: Install validator dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r standalone-source-validator/requirements-validate-sources.txt pyinstaller
+
+      - name: Static validation
+        shell: pwsh
+        run: |
+          python -m py_compile `
+            standalone-source-validator/source_validator_gui.py `
+            standalone-source-validator/source_validator_cli.py `
+            standalone-source-validator/validator/validate_source_packages.py `
+            scripts/validate_source_packages.py
+          powershell -NoProfile -ExecutionPolicy Bypass -File standalone-source-validator/verify_standalone.ps1 -Python (Get-Command python).Source
+
+      - name: Build GUI and CLI EXEs
+        shell: pwsh
+        run: |
+          $releaseDist = Join-Path $env:GITHUB_WORKSPACE "release\dist"
+          New-Item -ItemType Directory -Force -Path $releaseDist | Out-Null
+          powershell -NoProfile -ExecutionPolicy Bypass `
+            -File standalone-source-validator/build_windows.ps1 `
+            -Python (Get-Command python).Source `
+            -OutputDir $releaseDist
+
+      - name: Package release files
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          $releaseRoot = Join-Path $env:GITHUB_WORKSPACE "release"
+          $packageName = if ($env:RELEASE_REF) { $env:RELEASE_REF } else { "dev-$env:GITHUB_RUN_NUMBER" }
+          $packageName = $packageName -replace "[^A-Za-z0-9._-]", "-"
+          $staging = Join-Path $releaseRoot "ReadoriSourceValidator"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item (Join-Path $releaseRoot "dist\ReadoriSourceValidator.exe") $staging -Force
+          Copy-Item (Join-Path $releaseRoot "dist\ReadoriSourceValidatorCLI.exe") $staging -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "standalone-source-validator\README.md") $staging -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "standalone-source-validator\requirements-validate-sources.txt") $staging -Force
+          $hashes = Get-ChildItem -LiteralPath $staging -File | ForEach-Object {
+            "$(Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName | Select-Object -ExpandProperty Hash)  $($_.Name)"
+          }
+          $hashes | Set-Content -LiteralPath (Join-Path $releaseRoot "SHA256SUMS.txt") -Encoding ascii
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath (Join-Path $releaseRoot "ReadoriSourceValidator-$packageName-windows-x64.zip") -CompressionLevel Optimal -Force
+          Get-ChildItem -LiteralPath $releaseRoot -File | Select-Object Name, Length
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReadoriSourceValidator-windows-x64-${{ github.run_number }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish_release && startsWith(github.ref, 'refs/tags/source-validator-v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ReadoriSourceValidator-windows-x64-*
+          path: release
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release -maxdepth 1 -type f \( -name '*.zip' -o -name 'SHA256SUMS.txt' \) -print)
+          test "${#assets[@]}" -gt 0
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Readori Source Validator $TAG_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
