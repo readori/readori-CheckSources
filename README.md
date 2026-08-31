@@ -59,7 +59,7 @@ git tag source-validator-v1.0.0
 git push origin source-validator-v1.0.0
 ```
 
-然后在 GitHub Actions 中选择 `Build Windows Source Validator`，选择该标签作为运行引用（或者在 `release_tag` 中填写已有标签），并将 `publish_release` 设为 `true`。如果只需要测试构建，保持 `publish_release=false` 即可。工作流只发布已有的 `source-validator-v*` 标签，不会隐式创建标签。
+然后在 GitHub Actions 中选择 `Build Windows Source Validator` 并运行。`publish_release` 默认开启：选择已有的 `source-validator-v*` 标签会更新该 Release；从分支运行且不填写 `release_tag` 时，会自动生成 `source-validator-v0.0.<运行编号>` 并发布到当前提交。填写 `release_tag` 可指定一个已有或待创建的 `source-validator-v*` 标签；仅需要构建附件时才取消勾选 `publish_release`。
 
 Release ZIP 内含 `ReadoriSourceValidator.exe`、`ReadoriSourceValidatorCLI.exe`、README 和运行依赖清单；不包含书源数据、Cookie 或其他用户文件。
 

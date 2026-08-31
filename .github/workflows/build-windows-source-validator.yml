@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: "在选定的 source-validator-v* 标签上发布 GitHub Release"
+        description: "构建成功后自动发布 GitHub Release（取消勾选可只保留构建附件）"
         required: true
-        default: false
+        default: true
         type: boolean
       release_tag:
-        description: "发布标签；留空使用当前运行引用（必须是 source-validator-v*）"
+        description: "可选 Release 标签；留空时自动生成 source-validator-v0.0.<运行编号>"
         required: false
         default: ""
         type: string
@@ -26,10 +26,33 @@ jobs:
     name: Build Windows x64 EXEs
     runs-on: windows-latest
     timeout-minutes: 30
+    outputs:
+      release_tag: ${{ steps.resolve_release.outputs.release_tag }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve release tag
+        id: resolve_release
+        shell: pwsh
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $requested = ($env:REQUESTED_RELEASE_TAG ?? "").Trim()
+          if ($requested) {
+            $releaseTag = $requested
+          } elseif ($env:GITHUB_REF -like "refs/tags/source-validator-v*") {
+            $releaseTag = $env:GITHUB_REF_NAME
+          } else {
+            $releaseTag = "source-validator-v0.0.$env:GITHUB_RUN_NUMBER"
+          }
+          if ($releaseTag -notmatch '^source-validator-v[0-9A-Za-z][0-9A-Za-z._-]*$') {
+            Write-Error "Release 标签必须以 source-validator-v 开头，并且只能包含字母、数字、点、下划线或短横线"
+            exit 1
+          }
+          "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Resolved release tag: $releaseTag"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -97,7 +120,7 @@ jobs:
       - name: Package release files
         shell: pwsh
         env:
-          RELEASE_REF: ${{ inputs.release_tag || github.ref_name }}
+          RELEASE_REF: ${{ steps.resolve_release.outputs.release_tag }}
         run: |
           $releaseRoot = Join-Path $env:GITHUB_WORKSPACE "release"
           $packageName = if ($env:RELEASE_REF) { $env:RELEASE_REF } else { "dev-$env:GITHUB_RUN_NUMBER" }
@@ -126,7 +149,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: ${{ inputs.publish_release && (startsWith(github.ref, 'refs/tags/source-validator-v') || startsWith(inputs.release_tag, 'source-validator-v')) }}
+    if: ${{ inputs.publish_release && needs.build.result == 'success' }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -144,7 +167,7 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ inputs.release_tag || github.ref_name }}
+          TAG_NAME: ${{ needs.build.outputs.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -153,10 +176,16 @@ jobs:
           test "${#assets[@]}" -gt 0
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
+          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME" >/dev/null 2>&1; then
             gh release create "$TAG_NAME" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Readori Source Validator $TAG_NAME" \
               --generate-notes \
               --verify-tag
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Readori Source Validator $TAG_NAME" \
+              --generate-notes \
+              --target "$GITHUB_SHA"
           fi

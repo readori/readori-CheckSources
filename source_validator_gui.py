@@ -224,7 +224,16 @@ class ValidatorApp(tk.Tk):
         if self.limit_var.get() > 0:
             command.extend(["--limit", str(self.limit_var.get())])
 
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # A frozen GUI is a windowed process, but the validator child is a
+        # console executable (or python.exe during development).  On Windows
+        # that child would otherwise allocate a visible console window. Keep
+        # the process group for cancellation and suppress only the console;
+        # stdout remains piped to the GUI log, so closing a stray CMD window
+        # can no longer terminate the validation accidentally.
+        creationflags = 0
+        if os.name == "nt":
+            creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         child_environment = os.environ.copy()
         child_environment["PYTHONUNBUFFERED"] = "1"
         try:

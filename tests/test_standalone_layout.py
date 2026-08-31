@@ -15,4 +15,4 @@ def test_gui_has_safe_child_process_controls() -> None:
     assert "subprocess.Popen" in text
     assert "process.terminate" in text
     assert "--source-timeout" in text
-
+    assert "CREATE_NO_WINDOW" in text
