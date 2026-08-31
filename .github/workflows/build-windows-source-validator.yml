@@ -8,6 +8,11 @@ on:
         required: true
         default: false
         type: boolean
+      release_tag:
+        description: "发布标签；留空使用当前运行引用（必须是 source-validator-v*）"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -24,45 +29,75 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: standalone-source-validator/requirements-validate-sources.txt
+
+      - name: Verify validator source tree
+        shell: pwsh
+        run: |
+          $validatorRoot = if (Test-Path -LiteralPath "standalone-source-validator\requirements-validate-sources.txt") {
+            "standalone-source-validator"
+          } elseif (Test-Path -LiteralPath "requirements-validate-sources.txt") {
+            "."
+          } else {
+            ""
+          }
+          if ($validatorRoot) {
+            "VALIDATOR_ROOT=$validatorRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          $required = @(
+            (Join-Path $validatorRoot "requirements-validate-sources.txt"),
+            (Join-Path $validatorRoot "build_windows.ps1"),
+            (Join-Path $validatorRoot "source_validator_gui.py"),
+            (Join-Path $validatorRoot "source_validator_cli.py"),
+            (Join-Path $validatorRoot "validator\validate_source_packages.py")
+          )
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
+          if ($missing.Count -gt 0) {
+            Write-Error ("独立验证器文件未在远端提交或目录结构不正确，无法构建：" + ($missing -join ", "))
+            exit 1
+          }
 
       - name: Install validator dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r standalone-source-validator/requirements-validate-sources.txt pyinstaller
+          python -m pip install -r (Join-Path $env:VALIDATOR_ROOT "requirements-validate-sources.txt") pyinstaller
 
       - name: Static validation
         shell: pwsh
         run: |
+          $validatorRoot = $env:VALIDATOR_ROOT
           python -m py_compile `
-            standalone-source-validator/source_validator_gui.py `
-            standalone-source-validator/source_validator_cli.py `
-            standalone-source-validator/validator/validate_source_packages.py `
-            scripts/validate_source_packages.py
-          powershell -NoProfile -ExecutionPolicy Bypass -File standalone-source-validator/verify_standalone.ps1 -Python (Get-Command python).Source
+            (Join-Path $validatorRoot "source_validator_gui.py") `
+            (Join-Path $validatorRoot "source_validator_cli.py") `
+            (Join-Path $validatorRoot "validator\validate_source_packages.py")
+          $verifyScript = Join-Path $validatorRoot "verify_standalone.ps1"
+          powershell -NoProfile -ExecutionPolicy Bypass -File $verifyScript -Python (Get-Command python).Source
+          $repoScript = Join-Path $env:GITHUB_WORKSPACE "scripts\validate_source_packages.py"
+          if (Test-Path -LiteralPath $repoScript) {
+            python -m py_compile $repoScript
+          }
 
       - name: Build GUI and CLI EXEs
         shell: pwsh
         run: |
+          $validatorRoot = $env:VALIDATOR_ROOT
           $releaseDist = Join-Path $env:GITHUB_WORKSPACE "release\dist"
           New-Item -ItemType Directory -Force -Path $releaseDist | Out-Null
           powershell -NoProfile -ExecutionPolicy Bypass `
-            -File standalone-source-validator/build_windows.ps1 `
+            -File (Join-Path $validatorRoot "build_windows.ps1") `
             -Python (Get-Command python).Source `
             -OutputDir $releaseDist
 
       - name: Package release files
         shell: pwsh
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.release_tag || github.ref_name }}
         run: |
           $releaseRoot = Join-Path $env:GITHUB_WORKSPACE "release"
           $packageName = if ($env:RELEASE_REF) { $env:RELEASE_REF } else { "dev-$env:GITHUB_RUN_NUMBER" }
@@ -71,8 +106,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item (Join-Path $releaseRoot "dist\ReadoriSourceValidator.exe") $staging -Force
           Copy-Item (Join-Path $releaseRoot "dist\ReadoriSourceValidatorCLI.exe") $staging -Force
-          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "standalone-source-validator\README.md") $staging -Force
-          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "standalone-source-validator\requirements-validate-sources.txt") $staging -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "$env:VALIDATOR_ROOT\README.md") $staging -Force
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "$env:VALIDATOR_ROOT\requirements-validate-sources.txt") $staging -Force
           $hashes = Get-ChildItem -LiteralPath $staging -File | ForEach-Object {
             "$(Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName | Select-Object -ExpandProperty Hash)  $($_.Name)"
           }
@@ -83,13 +118,15 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
+          # This artifact only transfers the build between jobs; published Release
+          # assets are stored by GitHub Releases and are not subject to this TTL.
           name: ReadoriSourceValidator-windows-x64-${{ github.run_number }}
           path: release/*
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    if: ${{ inputs.publish_release && startsWith(github.ref, 'refs/tags/source-validator-v') }}
+    if: ${{ inputs.publish_release && (startsWith(github.ref, 'refs/tags/source-validator-v') || startsWith(inputs.release_tag, 'source-validator-v')) }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -107,10 +144,11 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ inputs.release_tag || github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$TAG_NAME" == source-validator-v* ]] || { echo "::error::release_tag 必须以 source-validator-v 开头"; exit 1; }
           mapfile -t assets < <(find release -maxdepth 1 -type f \( -name '*.zip' -o -name 'SHA256SUMS.txt' \) -print)
           test "${#assets[@]}" -gt 0
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

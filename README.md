@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\build_windows.ps1
 
 ## GitHub Actions 自动构建与 Releases
 
-仓库工作流 `.github/workflows/build-windows-source-validator.yml` 仅支持 Actions 页面手动运行，不会因分支推送、Pull Request 或标签推送自动执行；每次运行都会编译 Windows x64 GUI/CLI EXE，并保留构建附件。若在 Actions 中选择已有的 `source-validator-v*` 标签运行并勾选 `publish_release`，构建成功后会创建或更新 GitHub Release，上传 ZIP 和 `SHA256SUMS.txt`。
+仓库工作流 `.github/workflows/build-windows-source-validator.yml` 仅支持 Actions 页面手动运行，不会因分支推送、Pull Request 或标签推送自动执行；每次运行都会编译 Windows x64 GUI/CLI EXE。勾选 `publish_release` 后，ZIP 和 `SHA256SUMS.txt` 会上传到 GitHub Release；Release 资产不会按 30 天自动过期，只有手动删除 Release 或资产后才会消失。单独的 Actions 构建附件仍受仓库的 Artifact 保留策略管理。
 
 发布示例：
 
@@ -59,7 +59,7 @@ git tag source-validator-v1.0.0
 git push origin source-validator-v1.0.0
 ```
 
-然后在 GitHub Actions 中选择 `Build Windows Source Validator`，选择刚推送的标签作为运行引用，并将 `publish_release` 设为 `true`。如果只需要测试构建，保持 `publish_release=false` 即可。
+然后在 GitHub Actions 中选择 `Build Windows Source Validator`，选择该标签作为运行引用（或者在 `release_tag` 中填写已有标签），并将 `publish_release` 设为 `true`。如果只需要测试构建，保持 `publish_release=false` 即可。工作流只发布已有的 `source-validator-v*` 标签，不会隐式创建标签。
 
 Release ZIP 内含 `ReadoriSourceValidator.exe`、`ReadoriSourceValidatorCLI.exe`、README 和运行依赖清单；不包含书源数据、Cookie 或其他用户文件。
 
