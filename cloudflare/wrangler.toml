@@ -1,0 +1,35 @@
+name = "readori-source-validator-control"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "readori-source-validator"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "INPUTS"
+bucket_name = "readori-source-validator-inputs"
+
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "readori-source-validator-results"
+
+[[queues.producers]]
+binding = "VALIDATION_QUEUE"
+queue = "readori-source-validation"
+
+[vars]
+MAX_INPUT_BYTES = "33554432"
+MAX_RESULT_BYTES = "33554432"
+MAX_PROGRESS_BYTES = "1048576"
+QUEUE_VISIBILITY_TIMEOUT_MS = "43200000"
+
+# Set CONTROL_API_KEY, EXECUTOR_TOKEN, and FRONTEND_ORIGIN with `wrangler secret put`.
+# Do not add a queue consumer here: the AMD Micro executor uses HTTP Pull.

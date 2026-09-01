@@ -4,4 +4,4 @@ dist/
 output/
 __pycache__/
 *.pyc
-
+server/data/

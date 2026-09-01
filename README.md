@@ -5,6 +5,7 @@
 ## 功能
 
 - 按四阶段流水线验证：自动去重 → 快速扫描（连通性、搜索入口）→ 完整链路（详情、目录、正文）→ 稳定性复测。
+- 去重分三层执行：规范化站点 URL → 规则指纹 → 完整验证后的书名/作者聚合；同站点同一本书的规则变体只保留最佳代表，其他站点仍保留以维持覆盖率。
 - 快速扫描默认每源 8 秒硬截止（可用 `--quick-timeout` 调整到 5–10 秒）；完整验证和复测也有独立硬超时，坏源不会拖死整批任务。
 - 每个阶段使用独立并发线程池，阶段之间串行传递结果，避免 1000+ 书源同时进行深链路请求。
 - 快速扫描会缓存候选书 URL、规则变量和 Cookie，完整验证复用缓存避免重复搜索；稳定性复测重新搜索以发现临时失效。
@@ -62,6 +63,22 @@ git push origin source-validator-v1.0.0
 然后在 GitHub Actions 中选择 `Build Windows Source Validator` 并运行。`publish_release` 默认开启：选择已有的 `source-validator-v*` 标签会更新该 Release；从分支运行且不填写 `release_tag` 时，会自动生成 `source-validator-v0.0.<运行编号>` 并发布到当前提交。填写 `release_tag` 可指定一个已有或待创建的 `source-validator-v*` 标签；仅需要构建附件时才取消勾选 `publish_release`。
 
 Release ZIP 内含 `ReadoriSourceValidator.exe`、`ReadoriSourceValidatorCLI.exe`、README 和运行依赖清单；不包含书源数据、Cookie 或其他用户文件。
+
+## 服务器验证服务
+
+服务器版位于 `server/`，网页只负责提交任务和读取进度，实际请求与 Legado 规则解析在后台 worker 执行。它使用 SQLite WAL 保存去重结果、四阶段检查点、事件日志和可恢复任务，并提供每域名并发限制、瞬时网络失败重试、API key 鉴权及设备兼容性门槛：
+
+```powershell
+python -m pip install -r .\server\requirements.txt
+$env:READORI_VALIDATOR_API_KEY = "change-this-key"
+python -m server.source_validator_server --host 0.0.0.0 --port 8787
+```
+
+接口顺序为 `POST /v1/jobs` 或 `/v1/jobs/upload`、轮询 `/v1/jobs/{id}` 与 `/events`、按需 `/cancel`/`/resume`，最后从 `/result` 下载仅通过搜索→详情→目录→正文及设备门槛的书源。配置项、反向代理/TLS、部署隔离和抽样真机复测要求见 [`server/README.md`](server/README.md)。
+
+### Cloudflare 控制面 + AMD Micro
+
+`cloudflare/` 提供可部署到 Cloudflare Workers/Pages 的控制台和 API。Worker 使用 D1 保存任务状态，R2 保存输入/结果，Queues 只发送任务引用；甲骨云 AMD Micro 运行 `python -m server.amd_micro_executor`，通过 HTTP Pull 一次领取一个任务。AMD Micro 画像会强制 `workers=1`、每域名并发 1、最多两轮稳定性复测，避免 1GB 内存被浏览器参数压垮。部署、D1 迁移、Queue Pull、systemd 和密钥环境变量见 [`cloudflare/README.md`](cloudflare/README.md)。
 
 ## 参数建议
 

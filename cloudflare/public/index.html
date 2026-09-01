@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Readori 书源验证控制台</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    body { max-width: 900px; margin: 0 auto; padding: 28px 18px 64px; background: Canvas; color: CanvasText; }
+    h1 { margin: 0 0 8px; font-size: 26px; } p { color: color-mix(in srgb, CanvasText 70%, transparent); }
+    section { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 16px; padding: 18px; margin: 16px 0; }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
+    input,button { font: inherit; border-radius: 10px; border: 1px solid color-mix(in srgb, CanvasText 24%, transparent); padding: 9px 12px; }
+    input[type=text],input[type=password],input[type=file] { width: min(100%, 620px); box-sizing: border-box; background: Canvas; color: CanvasText; }
+    button { cursor:pointer; background: Canvas; color: CanvasText; margin: 8px 6px 0 0; } button.primary { background:#2e78a5; color:white; border-color:#2e78a5; }
+    button:disabled { opacity:.5; cursor:default; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(190px,1fr)); gap: 10px; }
+    .metric { padding: 12px; border-radius: 12px; background: color-mix(in srgb, CanvasText 7%, Canvas); }
+    progress { width:100%; height: 16px; } pre { white-space: pre-wrap; max-height: 260px; overflow:auto; font-size:12px; }
+    .ok { color:#16834b; } .error { color:#c52b35; }
+  </style>
+</head>
+<body>
+  <h1>Readori 书源验证控制台</h1>
+  <p>Cloudflare 只负责控制面，实际验证由 AMD Micro 单并发执行器完成。API Key 仅保存在当前页面内存，不写入日志。</p>
+  <section>
+    <label for="apiKey">控制面 API Key</label>
+    <input id="apiKey" type="password" autocomplete="off" placeholder="CONTROL_API_KEY">
+    <label for="sourceFile">书源 JSON</label>
+    <input id="sourceFile" type="file" accept="application/json,.json">
+    <div><button id="start" class="primary">开始验证</button></div>
+    <p id="message"></p>
+  </section>
+  <section id="jobSection" hidden>
+    <div class="grid">
+      <div class="metric"><strong>任务</strong><br><code id="jobId">-</code></div>
+      <div class="metric"><strong>状态</strong><br><span id="status">-</span></div>
+      <div class="metric"><strong>阶段</strong><br><span id="stage">-</span></div>
+      <div class="metric"><strong>通过</strong><br><span id="passed">0</span> / <span id="total">0</span></div>
+    </div>
+    <p><progress id="progress" value="0" max="1"></progress></p>
+    <button id="cancel">取消任务</button>
+    <button id="resume">恢复任务</button>
+    <button id="download" hidden>下载通过书源</button>
+    <pre id="events"></pre>
+  </section>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let currentJob = ""; let timer = 0; let lastEvent = 0;
+    const headers = () => ({ "content-type":"application/json", "x-api-key":$("apiKey").value.trim() });
+    function message(text, error=false) { $("message").textContent=text; $("message").className=error?"error":"ok"; }
+    async function request(path, options={}) {
+      const response = await fetch(path, { ...options, headers: { ...headers(), ...(options.headers||{}) } });
+      const body = response.headers.get("content-type")?.includes("json") ? await response.json() : await response.text();
+      if (!response.ok) throw new Error(body?.error || body?.detail || `HTTP ${response.status}`);
+      return body;
+    }
+    async function startJob() {
+      const file=$("sourceFile").files[0]; if(!file) return message("请选择 JSON 文件",true);
+      if(!$("apiKey").value.trim()) return message("请输入 API Key",true);
+      $("start").disabled=true; message("正在上传并创建任务…");
+      try {
+        const payload=JSON.parse(await file.text());
+        const body=Array.isArray(payload)?{sources:payload,inputName:file.name}:{...payload,inputName:payload.inputName||file.name};
+        const created=await request("/api/jobs",{method:"POST",body:JSON.stringify(body)});
+        currentJob=created.job.id; lastEvent=0; $("jobSection").hidden=false; $("jobId").textContent=currentJob; message("任务已排队"); poll();
+      } catch(error) { message(error.message,true); }
+      finally { $("start").disabled=false; }
+    }
+    async function poll() {
+      if(!currentJob) return;
+      try {
+        const job=await request(`/api/jobs/${encodeURIComponent(currentJob)}`);
+        $("status").textContent=job.status; $("stage").textContent=job.stage; $("progress").value=job.progress||0; $("passed").textContent=job.passedCount||0; $("total").textContent=job.totalSources||0;
+        const events=await request(`/api/jobs/${encodeURIComponent(currentJob)}/events?afterId=${lastEvent}`);
+        for(const event of events.items||[]) { lastEvent=Math.max(lastEvent,event.id); $("events").textContent+=`[${event.stage}] ${event.message}\n`; }
+        $("download").hidden=job.status!=="completed";
+        if(["completed","failed","cancelled"].includes(job.status)) { message(job.status==="completed"?"验证完成":`任务${job.status}`,job.status!=="completed"); return; }
+        clearTimeout(timer); timer=setTimeout(poll,2000);
+      } catch(error) { message(error.message,true); clearTimeout(timer); timer=setTimeout(poll,5000); }
+    }
+    $("start").addEventListener("click",startJob);
+    $("cancel").addEventListener("click",async()=>{try{await request(`/api/jobs/${currentJob}/cancel`,{method:"POST",body:"{}"});poll();}catch(e){message(e.message,true);}});
+    $("resume").addEventListener("click",async()=>{try{await request(`/api/jobs/${currentJob}/resume`,{method:"POST",body:"{}"});poll();}catch(e){message(e.message,true);}});
+    $("download").addEventListener("click",async()=>{try{const response=await fetch(`/api/jobs/${currentJob}/result`,{headers:headers()});if(!response.ok)throw new Error(`HTTP ${response.status}`);const blob=await response.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`validated-${currentJob}.json`;a.click();URL.revokeObjectURL(a.href);}catch(e){message(e.message,true);}});
+  </script>
+</body>
+</html>
