@@ -297,7 +297,13 @@ class ValidatorApp(tk.Tk):
         if limit > 0:
             command.extend(["--limit", str(limit)])
 
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # The CLI is a console executable (and python.exe in source mode).
+        # Keep it in its own process group for cancellation, but do not let
+        # Windows create a visible console window behind the GUI.
+        creationflags = 0
+        if os.name == "nt":
+            creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         child_environment = os.environ.copy()
         child_environment["PYTHONUNBUFFERED"] = "1"
         try:

@@ -518,6 +518,17 @@ def discover_json_files(json_dir: Path) -> list[Path]:
     return out
 
 
+def display_path(path: Path, root: Path = ROOT) -> str:
+    """Return a report path without failing for external user-selected inputs."""
+    resolved = path.expanduser().resolve()
+    try:
+        return str(resolved.relative_to(root.expanduser().resolve()))
+    except ValueError:
+        # A bundled PyInstaller process has a temporary _MEI root; selected
+        # JSON files/directories normally live elsewhere on the user's disk.
+        return str(resolved)
+
+
 def load_sources_from_dir(json_dir: Path) -> tuple[list[dict[str, Any]], list[str]]:
     """加载目录下全部书源 JSON（排除验证报告输出），并合并不在目录中的 LEGACY 路径。"""
     root = ROOT.resolve()
@@ -529,7 +540,7 @@ def load_sources_from_dir(json_dir: Path) -> tuple[list[dict[str, Any]], list[st
         batch = load_json_file(path)
         if batch:
             out.extend(batch)
-            loaded_names.append(str(path.resolve().relative_to(root)))
+            loaded_names.append(display_path(path, root))
     for path in LEGACY_INPUT_FILES:
         rp = path.resolve()
         if rp in seen_paths:
@@ -537,7 +548,7 @@ def load_sources_from_dir(json_dir: Path) -> tuple[list[dict[str, Any]], list[st
         batch = load_json_file(path)
         if batch:
             out.extend(batch)
-            loaded_names.append(str(rp.relative_to(root)))
+            loaded_names.append(display_path(rp, root))
             seen_paths.add(rp)
     return out, loaded_names
 
@@ -562,7 +573,7 @@ def load_sources_from_paths(input_paths: list[Path]) -> tuple[list[dict[str, Any
             continue
         out.extend(batch)
         try:
-            loaded_names.append(str(path.relative_to(root_resolved)))
+            loaded_names.append(display_path(path, root_resolved))
         except ValueError:
             loaded_names.append(str(path))
         seen_files.add(path)

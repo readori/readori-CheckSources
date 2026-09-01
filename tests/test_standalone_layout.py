@@ -21,6 +21,13 @@ def test_gui_has_safe_child_process_controls() -> None:
     assert "taskkill" in text
     assert "process.terminate" not in text
     assert "--source-timeout" in text
+    assert "CREATE_NO_WINDOW" in text
+
+
+def test_validator_reports_external_directory_paths_without_relative_to_crash() -> None:
+    text = (ROOT / "validator" / "validate_source_packages.py").read_text(encoding="utf-8")
+    assert "def display_path" in text
+    assert "loaded_names.append(display_path(path, root))" in text
 
 
 def test_gui_spinboxes_reject_non_numeric_input() -> None:
@@ -41,4 +48,3 @@ def test_gui_input_mode_validation_does_not_cross_check_unrelated_field() -> Non
     text = (ROOT / "source_validator_gui.py").read_text(encoding="utf-8")
     assert 'mode = "file"' in text
     assert 'mode = "directory"' in text
-

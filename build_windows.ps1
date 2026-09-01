@@ -27,6 +27,7 @@ $venvPython = Join-Path $venv "Scripts\python.exe"
 if (-not $OutputDir) {
     $OutputDir = Join-Path $root "dist"
 }
+$OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $buildRoot = Join-Path $root "build"
 New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
@@ -40,7 +41,11 @@ $common = @(
 & $venvPython -m PyInstaller @common "--name" "ReadoriSourceValidatorCLI" "--console" (Join-Path $root "source_validator_cli.py")
 & $venvPython -m PyInstaller @common "--name" "ReadoriSourceValidator" "--windowed" (Join-Path $root "source_validator_gui.py")
 
-Copy-Item (Join-Path $root "README.md") (Join-Path $OutputDir "README.md") -Force
+$readmeSource = [System.IO.Path]::GetFullPath((Join-Path $root "README.md"))
+$readmeDestination = [System.IO.Path]::GetFullPath((Join-Path $OutputDir "README.md"))
+if (-not [System.String]::Equals($readmeSource, $readmeDestination, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item $readmeSource $readmeDestination -Force
+}
 Write-Host "Build completed:"
 Write-Host (Join-Path $OutputDir "ReadoriSourceValidator.exe")
 Write-Host (Join-Path $OutputDir "ReadoriSourceValidatorCLI.exe")
