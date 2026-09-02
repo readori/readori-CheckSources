@@ -12,6 +12,9 @@
 #   READORI_CF_QUEUE_API_TOKEN     account Queue HTTP Pull read/write token
 #
 # Optional variables:
+#   READORI_SOURCE_REPOSITORY (default readori/readori-CheckSources)
+#   READORI_SOURCE_REF (default main; used when only server/ was checked out)
+#   READORI_SOURCE_TOKEN (optional GitHub token for a private source repository)
 #   READORI_INSTALL_DIR (default /opt/readori-validator)
 #   READORI_AMD_EXECUTOR_ID (default amd-micro-<hostname>)
 #   READORI_AMD_WORK_DIR (default /var/lib/readori-validator)
@@ -25,6 +28,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+SOURCE_REPOSITORY="${READORI_SOURCE_REPOSITORY:-readori/readori-CheckSources}"
+SOURCE_REF="${READORI_SOURCE_REF:-main}"
+SOURCE_TOKEN="${READORI_SOURCE_TOKEN:-}"
 INSTALL_DIR="${READORI_INSTALL_DIR:-/opt/readori-validator}"
 CONFIG_DIR="/etc/readori-validator"
 ENV_FILE="$CONFIG_DIR/amd-micro.env"
@@ -77,6 +83,20 @@ require_value() {
   validate_single_line "$name" "$value"
 }
 
+validate_source_reference() {
+  case "$SOURCE_REPOSITORY" in
+    */*) ;;
+    *) die "READORI_SOURCE_REPOSITORY must use owner/repository form" ;;
+  esac
+  case "$SOURCE_REPOSITORY" in
+    ''|/*|*/|*//*|*..*|*[^A-Za-z0-9._/-]*) die "READORI_SOURCE_REPOSITORY contains unsafe path characters" ;;
+  esac
+  case "$SOURCE_REF" in
+    ''|/*|*/|*//*|*..*|*[^A-Za-z0-9._/-]*) die "READORI_SOURCE_REF contains unsafe path characters" ;;
+  esac
+  validate_single_line READORI_SOURCE_TOKEN "$SOURCE_TOKEN"
+}
+
 env_quote() {
   # systemd EnvironmentFile understands double-quoted values. Escape only the
   # characters that can terminate or alter that quoted value.
@@ -100,6 +120,49 @@ install_os_dependencies() {
     ca-certificates curl openssl \
     python3 python3-dev python3-venv python3-pip \
     build-essential nodejs p7zip-full unzip
+}
+
+bootstrap_minimal_runtime_files() {
+  [ -f "$SOURCE_ROOT/validator/__init__.py" ] && \
+    [ -f "$SOURCE_ROOT/validator/validate_source_packages.py" ] && \
+    [ -f "$SOURCE_ROOT/requirements-validate-sources.txt" ] && \
+    [ -f "$SOURCE_ROOT/requirements.txt" ] && return
+
+  command -v curl >/dev/null 2>&1 || die "curl is required to bootstrap validator files"
+  validate_source_reference
+  local base_url="https://raw.githubusercontent.com/$SOURCE_REPOSITORY/$SOURCE_REF"
+  local bootstrap_dir
+  bootstrap_dir="$(mktemp -d "$SOURCE_ROOT/.readori-source-bootstrap.XXXXXX")"
+  local -a curl_auth=()
+  if [ -n "$SOURCE_TOKEN" ]; then
+    curl_auth=(-H "Authorization: Bearer $SOURCE_TOKEN")
+  fi
+
+  fetch_runtime_file() {
+    local relative_path="$1"
+    local destination="$bootstrap_dir/$relative_path"
+    mkdir -p "$(dirname -- "$destination")"
+    if ! curl --fail --silent --show-error --location --retry 3 --retry-delay 1 \
+      "${curl_auth[@]}" "$base_url/$relative_path" --output "$destination"; then
+      rm -rf -- "$bootstrap_dir"
+      die "failed to download $relative_path from $SOURCE_REPOSITORY@$SOURCE_REF"
+    fi
+    [ -s "$destination" ] || {
+      rm -rf -- "$bootstrap_dir"
+      die "downloaded file is empty: $relative_path"
+    }
+  }
+
+  info "Only server/ was checked out; bootstrapping validator runtime files from $SOURCE_REPOSITORY@$SOURCE_REF"
+  fetch_runtime_file validator/__init__.py
+  fetch_runtime_file validator/validate_source_packages.py
+  fetch_runtime_file requirements-validate-sources.txt
+  fetch_runtime_file requirements.txt
+  mkdir -p "$SOURCE_ROOT/validator"
+  cp -a "$bootstrap_dir/validator/." "$SOURCE_ROOT/validator/"
+  cp -f "$bootstrap_dir/requirements-validate-sources.txt" "$SOURCE_ROOT/requirements-validate-sources.txt"
+  cp -f "$bootstrap_dir/requirements.txt" "$SOURCE_ROOT/requirements.txt"
+  rm -rf -- "$bootstrap_dir"
 }
 
 copy_project() {
@@ -256,8 +319,9 @@ start_service() {
 
 main() {
   require_root
-  [ -f "$SOURCE_ROOT/validator/validate_source_packages.py" ] || die "run this script from the source-validator repository"
+  [ -f "$SOURCE_ROOT/server/amd_micro_executor.py" ] || die "server/amd_micro_executor.py is missing; sparse checkout must include server/"
   install_os_dependencies
+  bootstrap_minimal_runtime_files
   copy_project
   create_service_account
   create_virtualenv
