@@ -241,38 +241,58 @@ jobs:
           PY
           }
 
+          cloudflare_api_get() {
+            local path="$1"
+            local output="$2"
+            if ! curl --fail --silent --show-error --location \
+              --retry 2 --retry-delay 1 \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Accept: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}${path}" \
+              --output "$output"; then
+              echo "::error::Cloudflare resource API request failed for ${path}; verify CLOUDFLARE_ACCOUNT_ID and token permissions."
+              exit 1
+            fi
+          }
+
           if [ -n "${CLOUDFLARE_D1_DATABASE_ID:-}" ]; then
             RESOLVED_D1_DATABASE_ID="$CLOUDFLARE_D1_DATABASE_ID"
           else
-            npx wrangler d1 list --json > "$RUNNER_TEMP/readori-d1.json"
+            # Wrangler 4.30+ has no --json flag for resource list commands.
+            # Use the documented Cloudflare API JSON endpoints instead.
+            cloudflare_api_get "/d1/database?per_page=1000" "$RUNNER_TEMP/readori-d1.json"
             RESOLVED_D1_DATABASE_ID="$(resource_value d1 "$RUNNER_TEMP/readori-d1.json" "$D1_DATABASE_NAME")"
           fi
           if [ -z "$RESOLVED_D1_DATABASE_ID" ] && [ "$DEPLOY_MODE" != "dry-run" ] && [ "$BOOTSTRAP_RESOURCES" = "true" ]; then
             npx wrangler d1 create "$D1_DATABASE_NAME" > "$RUNNER_TEMP/readori-d1-create.txt"
-            npx wrangler d1 list --json > "$RUNNER_TEMP/readori-d1.json"
+            cloudflare_api_get "/d1/database?per_page=1000" "$RUNNER_TEMP/readori-d1.json"
             RESOLVED_D1_DATABASE_ID="$(resource_value d1 "$RUNNER_TEMP/readori-d1.json" "$D1_DATABASE_NAME")"
           fi
-          [ -n "$RESOLVED_D1_DATABASE_ID" ] || { echo "::error::D1 database '$D1_DATABASE_NAME' was not found. Set CLOUDFLARE_D1_DATABASE_ID or enable bootstrap_resources."; exit 1; }
+          [ -n "$RESOLVED_D1_DATABASE_ID" ] || {
+            echo "::error::D1 database '$D1_DATABASE_NAME' was not found in Cloudflare account '${CLOUDFLARE_ACCOUNT_ID}'."
+            echo "::error::Set CLOUDFLARE_D1_DATABASE_ID to the database UUID, or run a non-dry-run with bootstrap_resources=true and D1 create permission."
+            exit 1
+          }
           [[ "$RESOLVED_D1_DATABASE_ID" =~ ^[A-Za-z0-9-]{16,80}$ ]] || { echo "::error::resolved D1 database ID has an invalid format"; exit 1; }
 
-          npx wrangler r2 bucket list --json > "$RUNNER_TEMP/readori-r2.json"
+          cloudflare_api_get "/r2/buckets?per_page=1000" "$RUNNER_TEMP/readori-r2.json"
           INPUT_BUCKET_EXISTS="$(resource_value r2 "$RUNNER_TEMP/readori-r2.json" "$INPUT_BUCKET_NAME")"
           RESULT_BUCKET_EXISTS="$(resource_value r2 "$RUNNER_TEMP/readori-r2.json" "$RESULT_BUCKET_NAME")"
           if [ "$DEPLOY_MODE" != "dry-run" ] && [ "$BOOTSTRAP_RESOURCES" = "true" ]; then
             [ -n "$INPUT_BUCKET_EXISTS" ] || npx wrangler r2 bucket create "$INPUT_BUCKET_NAME"
             [ -n "$RESULT_BUCKET_EXISTS" ] || npx wrangler r2 bucket create "$RESULT_BUCKET_NAME"
-            npx wrangler r2 bucket list --json > "$RUNNER_TEMP/readori-r2.json"
+            cloudflare_api_get "/r2/buckets?per_page=1000" "$RUNNER_TEMP/readori-r2.json"
             INPUT_BUCKET_EXISTS="$(resource_value r2 "$RUNNER_TEMP/readori-r2.json" "$INPUT_BUCKET_NAME")"
             RESULT_BUCKET_EXISTS="$(resource_value r2 "$RUNNER_TEMP/readori-r2.json" "$RESULT_BUCKET_NAME")"
           fi
           [ -n "$INPUT_BUCKET_EXISTS" ] || { echo "::error::R2 bucket '$INPUT_BUCKET_NAME' was not found."; exit 1; }
           [ -n "$RESULT_BUCKET_EXISTS" ] || { echo "::error::R2 bucket '$RESULT_BUCKET_NAME' was not found."; exit 1; }
 
-          npx wrangler queues list --json > "$RUNNER_TEMP/readori-queues.json"
+          cloudflare_api_get "/queues" "$RUNNER_TEMP/readori-queues.json"
           QUEUE_ID="$(resource_value queue "$RUNNER_TEMP/readori-queues.json" "$QUEUE_NAME")"
           if [ -z "$QUEUE_ID" ] && [ "$DEPLOY_MODE" != "dry-run" ] && [ "$BOOTSTRAP_RESOURCES" = "true" ]; then
             npx wrangler queues create "$QUEUE_NAME"
-            npx wrangler queues list --json > "$RUNNER_TEMP/readori-queues.json"
+            cloudflare_api_get "/queues" "$RUNNER_TEMP/readori-queues.json"
             QUEUE_ID="$(resource_value queue "$RUNNER_TEMP/readori-queues.json" "$QUEUE_NAME")"
           fi
           [ -n "$QUEUE_ID" ] || { echo "::error::Queue '$QUEUE_NAME' was not found."; exit 1; }
