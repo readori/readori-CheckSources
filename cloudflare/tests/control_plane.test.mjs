@@ -16,8 +16,14 @@ test("preflight does not require an API key", async () => {
   assert.match(response.headers.get("access-control-allow-methods"), /POST/);
 });
 
-test("public API fails closed when the control key is not configured", async () => {
-  const response = await worker.fetch(new Request("https://validator.example/api/jobs", { method: "GET" }), {});
+test("public control plane accepts browser requests without an API key", async () => {
+  const response = await worker.fetch(new Request("https://validator.example/api/jobs", { method: "GET" }), { PUBLIC_CONTROL_PLANE: "true" });
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).error, "route not found");
+});
+
+test("private control plane still requires an API key when public mode is disabled", async () => {
+  const response = await worker.fetch(new Request("https://validator.example/api/jobs", { method: "GET" }), { PUBLIC_CONTROL_PLANE: "false" });
   assert.equal(response.status, 503);
   assert.equal((await response.json()).error, "CONTROL_API_KEY is not configured");
 });

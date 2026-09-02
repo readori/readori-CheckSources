@@ -22,6 +22,7 @@ binding = "RESULTS"
 bucket_name = "readori-source-validator-results"
 
 [vars]
+PUBLIC_CONTROL_PLANE = "true"
 MAX_INPUT_BYTES = "33554432"
 MAX_RESULT_BYTES = "33554432"
 MAX_PROGRESS_BYTES = "1048576"
@@ -29,6 +30,7 @@ MAX_PROGRESS_BYTES = "1048576"
 # bounded so a crashed AMD instance can be recovered without Queue Pull.
 QUEUE_VISIBILITY_TIMEOUT_MS = "43200000"
 
-# Set CONTROL_API_KEY, EXECUTOR_TOKEN, and FRONTEND_ORIGIN with `wrangler secret put`.
+# The public console uses PUBLIC_CONTROL_PLANE=true; set EXECUTOR_TOKEN and
+# optional FRONTEND_ORIGIN with `wrangler secret put`.
 # The AMD Micro executor polls `/internal/next`; no Queue REST token or binding
 # is required on the executor host.

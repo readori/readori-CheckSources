@@ -22,10 +22,8 @@
 </head>
 <body>
   <h1>Readori 书源验证控制台</h1>
-  <p>Cloudflare 只负责控制面，实际验证由 AMD Micro 单并发执行器完成。API Key 仅保存在当前页面内存，不写入日志。</p>
+  <p>Cloudflare 提供公开控制面，实际验证由 AMD Micro 单并发执行器完成。无需输入 API Key。</p>
   <section>
-    <label for="apiKey">控制面 API Key</label>
-    <input id="apiKey" type="password" autocomplete="off" placeholder="CONTROL_API_KEY">
     <label for="sourceFile">书源 JSON</label>
     <input id="sourceFile" type="file" accept="application/json,.json">
     <div><button id="start" class="primary">开始验证</button></div>
@@ -47,17 +45,16 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let currentJob = ""; let timer = 0; let lastEvent = 0;
-    const headers = () => ({ "content-type":"application/json", "x-api-key":$("apiKey").value.trim() });
+    const headers = () => ({ "content-type":"application/json" });
     function message(text, error=false) { $("message").textContent=text; $("message").className=error?"error":"ok"; }
     async function request(path, options={}) {
-      const response = await fetch(path, { ...options, headers: { ...headers(), ...(options.headers||{}) } });
+      const response = await fetch(path, { credentials:"include", ...options, headers: { ...headers(), ...(options.headers||{}) } });
       const body = response.headers.get("content-type")?.includes("json") ? await response.json() : await response.text();
       if (!response.ok) throw new Error(body?.error || body?.detail || `HTTP ${response.status}`);
       return body;
     }
     async function startJob() {
       const file=$("sourceFile").files[0]; if(!file) return message("请选择 JSON 文件",true);
-      if(!$("apiKey").value.trim()) return message("请输入 API Key",true);
       $("start").disabled=true; message("正在上传并创建任务…");
       try {
         const payload=JSON.parse(await file.text());
@@ -82,7 +79,7 @@
     $("start").addEventListener("click",startJob);
     $("cancel").addEventListener("click",async()=>{try{await request(`/api/jobs/${currentJob}/cancel`,{method:"POST",body:"{}"});poll();}catch(e){message(e.message,true);}});
     $("resume").addEventListener("click",async()=>{try{await request(`/api/jobs/${currentJob}/resume`,{method:"POST",body:"{}"});poll();}catch(e){message(e.message,true);}});
-    $("download").addEventListener("click",async()=>{try{const response=await fetch(`/api/jobs/${currentJob}/result`,{headers:headers()});if(!response.ok)throw new Error(`HTTP ${response.status}`);const blob=await response.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`validated-${currentJob}.json`;a.click();URL.revokeObjectURL(a.href);}catch(e){message(e.message,true);}});
+    $("download").addEventListener("click",async()=>{try{const response=await fetch(`/api/jobs/${currentJob}/result`,{credentials:"include",headers:headers()});if(!response.ok)throw new Error(`HTTP ${response.status}`);const blob=await response.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`validated-${currentJob}.json`;a.click();URL.revokeObjectURL(a.href);}catch(e){message(e.message,true);}});
   </script>
 </body>
 </html>

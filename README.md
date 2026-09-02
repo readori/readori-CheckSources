@@ -66,7 +66,7 @@ Release ZIP 内含 `ReadoriSourceValidator.exe`、`ReadoriSourceValidatorCLI.exe
 
 ## 服务器验证服务
 
-服务器版位于 `server/`，网页只负责提交任务和读取进度，实际请求与 Legado 规则解析在后台 worker 执行。它使用 SQLite WAL 保存去重结果、四阶段检查点、事件日志和可恢复任务，并提供每域名并发限制、瞬时网络失败重试、API key 鉴权及设备兼容性门槛：
+服务器版位于 `server/`，网页只负责提交任务和读取进度，实际请求与 Legado 规则解析在后台 worker 执行。它使用 SQLite WAL 保存去重结果、四阶段检查点、事件日志和可恢复任务，并提供每域名并发限制、瞬时网络失败重试及设备兼容性门槛；Cloudflare 控制台按公开模式运行，不要求用户输入 API key：
 
 ```powershell
 python -m pip install -r .\server\requirements.txt

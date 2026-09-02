@@ -54,7 +54,13 @@ function constantTimeEqual(left, right) {
   return result === 0;
 }
 
+function publicControlPlaneEnabled(env) {
+  const value = String(env.PUBLIC_CONTROL_PLANE || "").trim().toLowerCase();
+  return ["1", "true", "yes", "public"].includes(value);
+}
+
 function publicAuth(request, env) {
+  if (publicControlPlaneEnabled(env)) return {};
   const expected = String(env.CONTROL_API_KEY || "");
   if (!expected) return { response: textError(request, env, 503, "CONTROL_API_KEY is not configured") };
   if (!constantTimeEqual(bearerOrHeader(request, "x-api-key"), expected)) {

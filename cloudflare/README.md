@@ -1,6 +1,6 @@
 # Readori Cloudflare 控制面 + AMD Micro 执行器
 
-该目录把验证器拆成两个运行平面：Cloudflare Workers/Pages 只处理 Web 控制台、鉴权、任务状态、D1 租约和 R2 制品；`server/amd_micro_executor.py` 在甲骨云 AMD Micro 上以单并发运行现有 Python/QuickJS/Node 验证核心。AMD Micro 只有 1GB RAM，不能按本地 GUI 的 16 workers 配置运行。
+该目录把验证器拆成两个运行平面：Cloudflare Workers/Pages 提供公开 Web 控制台、任务状态、D1 租约和 R2 制品；`server/amd_micro_executor.py` 在甲骨云 AMD Micro 上以单并发运行现有 Python/QuickJS/Node 验证核心。AMD Micro 只有 1GB RAM，不能按本地 GUI 的 16 workers 配置运行。
 
 ## Cloudflare 资源
 
@@ -21,7 +21,6 @@ npx wrangler d1 create readori-source-validator
 npx wrangler d1 migrations apply readori-source-validator --remote
 npx wrangler r2 bucket create readori-source-validator-inputs
 npx wrangler r2 bucket create readori-source-validator-results
-npx wrangler secret put CONTROL_API_KEY
 npx wrangler secret put EXECUTOR_TOKEN
 # 可选：限制浏览器来源
 npx wrangler secret put FRONTEND_ORIGIN
@@ -38,11 +37,11 @@ npx wrangler deploy
 
 - `TARGET_REPO_PAT`：只读访问 `readori-CheckSources` 的 fine-grained token；
 - `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`：具备 Worker、D1、R2 所需权限；
-- `CONTROL_API_KEY`、`EXECUTOR_TOKEN`：分别对应 Worker 的 `wrangler secret put`；前者供 `/api/*` 使用，后者必须与 AMD Micro 的 `READORI_AMD_EXECUTOR_TOKEN` 完全一致；
+- `EXECUTOR_TOKEN`：对应 Worker 的 `wrangler secret put`，必须与 AMD Micro 的 `READORI_AMD_EXECUTOR_TOKEN` 完全一致；公开控制面无需浏览器 API Key；
 - 可选 `CLOUDFLARE_D1_DATABASE_ID`、`FRONTEND_ORIGIN`，不配置时工作流会从 Cloudflare 列表解析；
 - 手动运行时填写 `source_ref`、`mode`、`bootstrap_resources` 和可选 `health_url`。
 
-工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token、Queue token 或 API key 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；如果非 dry-run 日志提示 `CONTROL_API_KEY` 或 `EXECUTOR_TOKEN` 缺失，说明该 Secret 未创建、名称拼写不一致，或被放到了未绑定的环境；AMD Micro 执行器仍需在服务器上单独安装和配置。
+工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token 或 Queue token 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；如果非 dry-run 日志提示 `EXECUTOR_TOKEN` 缺失，说明该 Secret 未创建、名称拼写不一致，或被放到了未绑定的环境；AMD Micro 执行器仍需在服务器上单独安装和配置。
 
 资源清单由工作流通过 Cloudflare 官方 API 的 JSON 端点读取，以兼容 Wrangler 4.30+（`wrangler d1/r2/queues list` 不接受 `--json`）；创建和部署仍由 Wrangler 执行。AMD 主机只需要 Worker URL 和 `EXECUTOR_TOKEN`，不需要账户级 Queues Token。
 
@@ -75,7 +74,7 @@ sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN \
 
 ## Worker API
 
-公共接口（`CONTROL_API_KEY`）：
+公共接口（无需 API Key；由 `PUBLIC_CONTROL_PLANE=true` 开启）：
 
 - `POST /api/uploads`：上传 JSON，返回 `inputKey`。
 - `POST /api/jobs`：传 `sources` 或已上传的 `inputKey` 创建任务。

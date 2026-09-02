@@ -54,7 +54,6 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID || vars.CLOUDFLARE_D1_DATABASE_ID }}
-      CONTROL_API_KEY: ${{ secrets.CONTROL_API_KEY }}
       EXECUTOR_TOKEN: ${{ secrets.EXECUTOR_TOKEN }}
       FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN || vars.FRONTEND_ORIGIN }}
       DEPLOY_MODE: ${{ inputs.mode }}
@@ -71,19 +70,17 @@ jobs:
           [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || missing+=("CLOUDFLARE_API_TOKEN")
           [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || missing+=("CLOUDFLARE_ACCOUNT_ID")
           if [ "${DEPLOY_MODE}" != "dry-run" ]; then
-            [ -n "${CONTROL_API_KEY:-}" ] || missing+=("CONTROL_API_KEY")
             [ -n "${EXECUTOR_TOKEN:-}" ] || missing+=("EXECUTOR_TOKEN")
           fi
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Missing deployment secrets/variables: ${missing[*]}"
             echo "::error::Add the missing values as GitHub Secrets in the production environment (or repository-level Secrets), not Variables."
-            echo "::error::CONTROL_API_KEY is used by the public /api/* endpoints; EXECUTOR_TOKEN must exactly match the AMD Micro executor token."
+            echo "::error::EXECUTOR_TOKEN must exactly match the AMD Micro executor token. The public control plane does not require a browser API key."
             echo "::error::Use mode=dry-run when checking repository/Cloudflare access without deploying; deploy and deploy-and-migrate require both runtime secrets."
             exit 1
           fi
           echo "::add-mask::$TARGET_REPO_PAT"
           echo "::add-mask::$CLOUDFLARE_API_TOKEN"
-          [ -z "${CONTROL_API_KEY:-}" ] || echo "::add-mask::$CONTROL_API_KEY"
           [ -z "${EXECUTOR_TOKEN:-}" ] || echo "::add-mask::$EXECUTOR_TOKEN"
           echo "Source repository: ${SOURCE_REPOSITORY}"
           echo "Source ref: ${SOURCE_REF}"
@@ -350,7 +347,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s' "$CONTROL_API_KEY" | npx wrangler secret put CONTROL_API_KEY --config wrangler-ci.toml
           printf '%s' "$EXECUTOR_TOKEN" | npx wrangler secret put EXECUTOR_TOKEN --config wrangler-ci.toml
           if [ -n "${FRONTEND_ORIGIN:-}" ]; then
             printf '%s' "$FRONTEND_ORIGIN" | npx wrangler secret put FRONTEND_ORIGIN --config wrangler-ci.toml
