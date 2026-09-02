@@ -1,6 +1,11 @@
 name = "readori-source-validator-control"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
+workers_dev = false
+
+[[routes]]
+pattern = "syyz.readori.com"
+custom_domain = true
 
 [assets]
 directory = "./public"
@@ -12,4 +17,4 @@ not_found_handling = "single-page-application"
 # progress and results live on the AMD Micro server; no D1/R2 binding is used.
 VALIDATOR_SERVER_URL = "https://validator.example.com"
 PUBLIC_CONTROL_PLANE = "true"
-FRONTEND_ORIGIN = ""
+FRONTEND_ORIGIN = "https://syyz.readori.com"

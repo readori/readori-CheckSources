@@ -2,12 +2,21 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
 
-const env = { VALIDATOR_SERVER_URL: "https://validator.example", VALIDATOR_SERVER_TOKEN: "server-secret" };
+const env = { VALIDATOR_SERVER_URL: "https://validator.example", VALIDATOR_SERVER_TOKEN: "server-secret", FRONTEND_ORIGIN: "https://syyz.readori.com" };
 
 test("preflight does not require D1 or a browser API key", async () => {
   const response = await worker.fetch(new Request("https://control.example/api/jobs", { method: "OPTIONS" }), {});
   assert.equal(response.status, 204);
   assert.match(response.headers.get("access-control-allow-methods"), /POST/);
+});
+
+test("preflight allows the configured public custom domain", async () => {
+  const response = await worker.fetch(new Request("https://syyz.readori.com/api/jobs", {
+    method: "OPTIONS",
+    headers: { Origin: "https://syyz.readori.com" },
+  }), env);
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("access-control-allow-origin"), "https://syyz.readori.com");
 });
 
 test("missing server configuration fails closed without touching D1", async () => {

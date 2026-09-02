@@ -38,7 +38,7 @@ journalctl -u readori-source-validator.service -n 50 --no-pager
 
 ## Worker 配置
 
-`wrangler.toml` 不含任何 D1/R2 配置。部署前设置：
+`wrangler.toml` 不含任何 D1/R2 配置，并将 `syyz.readori.com` 声明为 Worker Custom Domain。部署前设置：
 
 ```bash
 # Put the AMD Micro HTTPS URL in wrangler.toml [vars].
@@ -47,6 +47,8 @@ npx wrangler deploy
 ```
 
 `VALIDATOR_SERVER_URL` 必须是 AMD Micro 的 HTTPS 地址，例如 `https://validator.example.com`；`VALIDATOR_SERVER_TOKEN` 必须等于服务器的 `READORI_VALIDATOR_API_KEY`。Worker 公共页面不要求用户输入 API key，但服务器 token 只保存在 Worker secret 和服务器的 0600 环境文件中。
+
+用户访问入口固定为 [`https://syyz.readori.com/`](https://syyz.readori.com/)，接口健康检查为 [`https://syyz.readori.com/api/healthz`](https://syyz.readori.com/api/healthz)。Cloudflare 控制台中已经绑定该 Custom Domain 时，重新部署同一 Worker 即可；不要再为同一主机添加 `/*` Route。
 
 ## API 映射
 
