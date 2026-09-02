@@ -329,7 +329,10 @@ start_service() {
   fi
   command -v systemctl >/dev/null 2>&1 || die "systemd is unavailable; set READORI_SKIP_SYSTEMD=1 and run the validator server manually"
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME.service"
+  # Restart on every install so upgrades cannot leave an old process running
+  # with stale code, environment, or port settings.
+  systemctl enable "$SERVICE_NAME.service"
+  systemctl restart "$SERVICE_NAME.service"
   if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
     systemctl --no-pager --full status "$SERVICE_NAME.service" || true
     die "validator service did not stay active"
