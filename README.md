@@ -5,7 +5,7 @@
 ## 功能
 
 - 按四阶段流水线验证：自动去重 → 快速扫描（连通性、搜索入口）→ 完整链路（详情、目录、正文）→ 稳定性复测。
-- 去重分三层执行：规范化站点 URL → 规则指纹 → 完整验证后的书名/作者聚合；同站点同一本书的规则变体只保留最佳代表，其他站点仍保留以维持覆盖率。
+- 去重分三层执行：规范化站点 URL（合并协议、大小写、端口、路径和查询顺序差异）→ 规则指纹（保留同站点的不同有效规则）→ 完整验证后的书名/作者聚合（仅合并同一站点解析到同一本书的变体，避免误删其他站点覆盖）。
 - 快速扫描默认每源 8 秒硬截止（可用 `--quick-timeout` 调整到 5–10 秒）；完整验证和复测也有独立硬超时，坏源不会拖死整批任务。
 - 每个阶段使用独立并发线程池，阶段之间串行传递结果，避免 1000+ 书源同时进行深链路请求。
 - 快速扫描会缓存候选书 URL、规则变量和 Cookie，完整验证复用缓存避免重复搜索；稳定性复测重新搜索以发现临时失效。
@@ -79,6 +79,8 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 ### Cloudflare 控制面 + AMD Micro
 
 `cloudflare/` 提供可部署到 Cloudflare Workers/Pages 的控制台和 API。Worker 使用 D1 保存任务状态，R2 保存输入/结果，Queues 只发送任务引用；甲骨云 AMD Micro 运行 `python -m server.amd_micro_executor`，通过 HTTP Pull 一次领取一个任务。AMD Micro 画像会强制 `workers=1`、每域名并发 1、最多两轮稳定性复测，避免 1GB 内存被浏览器参数压垮。部署、D1 迁移、Queue Pull、systemd 和密钥环境变量见 [`cloudflare/README.md`](cloudflare/README.md)。
+
+专用部署仓库 `readori/test-env-setup` 的 `deploy-readori-source-validator-cloudflare.yml` 仅手动触发，并从 `readori/readori-CheckSources` 拉取源代码后执行 Cloudflare dry-run/迁移/部署；服务器端可直接运行 [`server/install_amd_micro.sh`](server/install_amd_micro.sh) 完成 AMD Micro 的一键安装配置。
 
 ## 参数建议
 

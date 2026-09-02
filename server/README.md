@@ -14,6 +14,22 @@ $env:READORI_VALIDATOR_DB = "D:\Readzen\readori-shuyuan\server\data\validator.sq
 
 未设置 API key 时仅适合本机开发；部署到局域网或公网前必须设置 `READORI_VALIDATOR_API_KEY`，并在反向代理启用 TLS。可用 `READORI_VALIDATOR_INPUT_ROOT` 限制 `input_path` 只能读取指定目录。
 
+### AMD Micro 一键安装
+
+Cloudflare 控制面方案中的 AMD Micro 只运行 Queue Pull 执行器，不启动 FastAPI、GUI 或多并发任务。Ubuntu/Debian 服务器可使用 `install_amd_micro.sh` 自动安装 Python/Node/7-Zip 依赖、创建低权限 `readori` 用户、建立虚拟环境、写入 0600 环境文件并启用 systemd：
+
+```bash
+export READORI_AMD_EXECUTOR_BASE_URL='https://validator.example.com'
+export READORI_AMD_EXECUTOR_TOKEN='same-as-cloudflare-EXECUTOR_TOKEN'
+export READORI_CF_ACCOUNT_ID='cloudflare-account-id'
+export READORI_CF_QUEUE_ID='queue-id-not-name'
+export READORI_CF_QUEUE_API_TOKEN='queue-http-pull-token'
+sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN,READORI_CF_ACCOUNT_ID,READORI_CF_QUEUE_ID,READORI_CF_QUEUE_API_TOKEN \
+  bash server/install_amd_micro.sh
+```
+
+脚本默认安装到 `/opt/readori-validator`、运行目录 `/var/lib/readori-validator`，服务名为 `readori-source-validator.service`。可通过 `READORI_INSTALL_DIR`、`READORI_AMD_EXECUTOR_ID`、`READORI_AMD_POLL_SECONDS`、`READORI_AMD_MAX_ATTEMPTS` 调整；`READORI_SKIP_APT=1` 或 `READORI_SKIP_SYSTEMD=1` 适用于已准备好的主机。密钥只写入 `/etc/readori-validator/amd-micro.env`（0600），不会打印或放进 ExecStart 命令行。安装完成后用 `systemctl status readori-source-validator` 和 `journalctl -u readori-source-validator -f` 检查运行状态。
+
 ## API 流程
 
 1. `POST /v1/jobs` 上传 JSON 数组（或传 `input_path`）创建任务；也可使用 `POST /v1/jobs/upload` 的 multipart 文件上传。
