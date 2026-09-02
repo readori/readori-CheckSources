@@ -1,5 +1,5 @@
 [Unit]
-Description=Readori AMD Micro source validation executor
+Description=Readori AMD Micro source validation server
 After=network-online.target
 Wants=network-online.target
 
@@ -10,7 +10,7 @@ Group=readori
 WorkingDirectory=/opt/readori-validator
 EnvironmentFile=/etc/readori-validator/amd-micro.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/readori-validator/.venv/bin/python -m server.amd_micro_executor --work-dir /var/lib/readori-validator --poll-seconds 2
+ExecStart=/opt/readori-validator/.venv/bin/python -m server.source_validator_server --host 0.0.0.0 --port 8787
 Restart=always
 RestartSec=10
 NoNewPrivileges=true

@@ -2,86 +2,95 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
 
-test("health endpoint is public and returns a stable service marker", async () => {
-  const response = await worker.fetch(new Request("https://validator.example/api/healthz"), {});
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.ok, true);
-  assert.equal(body.service, "readori-source-validator-control");
-});
+const env = { VALIDATOR_SERVER_URL: "https://validator.example", VALIDATOR_SERVER_TOKEN: "server-secret" };
 
-test("preflight does not require an API key", async () => {
-  const response = await worker.fetch(new Request("https://validator.example/api/jobs", { method: "OPTIONS" }), {});
+test("preflight does not require D1 or a browser API key", async () => {
+  const response = await worker.fetch(new Request("https://control.example/api/jobs", { method: "OPTIONS" }), {});
   assert.equal(response.status, 204);
   assert.match(response.headers.get("access-control-allow-methods"), /POST/);
 });
 
-test("public control plane accepts browser requests without an API key", async () => {
-  const response = await worker.fetch(new Request("https://validator.example/api/jobs", { method: "GET" }), { PUBLIC_CONTROL_PLANE: "true" });
-  assert.equal(response.status, 404);
-  assert.equal((await response.json()).error, "route not found");
-});
-
-test("private control plane still requires an API key when public mode is disabled", async () => {
-  const response = await worker.fetch(new Request("https://validator.example/api/jobs", { method: "GET" }), { PUBLIC_CONTROL_PLANE: "false" });
+test("missing server configuration fails closed without touching D1", async () => {
+  const response = await worker.fetch(new Request("https://control.example/api/healthz"), {});
   assert.equal(response.status, 503);
-  assert.equal((await response.json()).error, "CONTROL_API_KEY is not configured");
+  assert.equal((await response.json()).error, "VALIDATOR_SERVER_URL is not configured");
 });
 
-test("executor lease endpoint fails closed without the executor secret", async () => {
-  const response = await worker.fetch(new Request("https://validator.example/internal/next", { method: "POST" }), {});
-  assert.equal(response.status, 503);
-  assert.equal((await response.json()).error, "EXECUTOR_TOKEN is not configured");
+test("health is proxied to the server", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (request, options) => {
+    assert.equal(new URL(request).pathname, "/healthz");
+    assert.equal(options.headers.get("x-api-key"), "server-secret");
+    return new Response(JSON.stringify({ ok: true, service: "readori-source-validator" }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const response = await worker.fetch(new Request("https://control.example/api/healthz"), env);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, service: "readori-source-validator" });
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
-test("executor lease endpoint atomically returns a queued job", async () => {
-  const row = {
-    id: "job-1",
-    status: "running",
-    stage: "claimed",
-    input_key: "inputs/job-1.json",
-    input_name: "sources.json",
-    config_json: "{}",
-    total_sources: 2,
-    duplicate_count: 0,
-    completed_count: 0,
-    passed_count: 0,
-    progress: 0,
-    error: "",
-    cancel_requested: 0,
-    result_count: 0,
-    attempt_count: 1,
-    created_at: 1,
-    updated_at: 2,
+test("job creation is forwarded with the server token and compatible field names", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (request, options) => {
+    assert.equal(new URL(request).pathname, "/v1/jobs");
+    assert.equal(options.headers.get("x-api-key"), "server-secret");
+    const body = JSON.parse(options.body);
+    assert.equal(body.input_name, "sources.json");
+    assert.equal("inputName" in body, false);
+    return new Response(JSON.stringify({ job: { id: "job-1", status: "queued", input_name: "sources.json", source_count: 2, config_json: "{}" }, deduplicated: 1 }), { status: 201, headers: { "content-type": "application/json" } });
   };
-  const db = {
-    prepare(sql) {
-      return {
-        bind(...args) {
-          return {
-            async first() {
-              if (sql.includes("status='running' AND lease_expires_at>?2")) return null;
-              return row;
-            },
-            async run() {
-              return { meta: { changes: sql.startsWith("UPDATE jobs SET status='running'") ? 1 : 0 } };
-            },
-          };
-        },
-      };
-    },
-  };
-  const response = await worker.fetch(
-    new Request("https://validator.example/internal/next", {
+  try {
+    const response = await worker.fetch(new Request("https://control.example/api/jobs", {
       method: "POST",
-      headers: { authorization: "Bearer executor-secret", "x-executor-id": "amd-1" },
-      body: "{}",
-    }),
-    { EXECUTOR_TOKEN: "executor-secret", DB: db },
-  );
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.claimed, true);
-  assert.equal(body.job.id, "job-1");
-  assert.equal(body.job.attemptCount, 1);
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ inputName: "sources.json", sources: [{ bookSourceUrl: "https://example.com" }], config: {} }),
+    }), env);
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.equal(body.job.inputName, "sources.json");
+    assert.equal(body.job.totalSources, 2);
+    assert.equal(body.deduplicated, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("status and event polling are translated from the local server API", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (request) => {
+    const url = new URL(request);
+    if (url.pathname === "/v1/jobs/job-1") {
+      return new Response(JSON.stringify({ id: "job-1", status: "running", stage: "quick-scan", source_count: 2, completed_count: 1, passed_count: 1, config_json: "{}" }), { headers: { "content-type": "application/json" } });
+    }
+    assert.equal(url.pathname, "/v1/jobs/job-1/events");
+    assert.equal(url.searchParams.get("after_id"), "7");
+    return new Response(JSON.stringify({ items: [{ id: 8, stage: "quick-scan", message: "ok", created_at: "now", payload_json: "{}" }] }), { headers: { "content-type": "application/json" } });
+  };
+  try {
+    const status = await worker.fetch(new Request("https://control.example/api/jobs/job-1"), env);
+    const job = await status.json();
+    assert.equal(job.completedCount, 1);
+    assert.equal(job.totalSources, 2);
+    const events = await worker.fetch(new Request("https://control.example/api/jobs/job-1/events?afterId=7"), env);
+    const body = await events.json();
+    assert.equal(body.items[0].createdAt, "now");
+    assert.deepEqual(body.items[0].payload, {});
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("upstream failures are returned without D1 fallback", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ detail: "server unavailable" }), { status: 503, headers: { "content-type": "application/json" } });
+  try {
+    const response = await worker.fetch(new Request("https://control.example/api/jobs/job-1"), env);
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).detail, "server unavailable");
+  } finally {
+    globalThis.fetch = original;
+  }
 });

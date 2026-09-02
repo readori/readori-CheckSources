@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# Install the Readori source-validator D1 lease executor on a small Ubuntu/Debian VM.
+# Install the Readori source-validator server on a small Ubuntu/Debian VM.
+#
+# This script intentionally runs the FastAPI validator directly.  It no longer
+# starts the legacy D1 lease executor, so task state, inputs, progress and
+# results stay on this server's SQLite/filesystem instead of consuming D1/R2.
 #
 # The script is intentionally non-interactive: provide Cloudflare values through
 # environment variables (or source an untracked env file) so credentials never
 # appear in shell history or in the generated unit file's command line.
 # Required variables:
-#   READORI_AMD_EXECUTOR_BASE_URL  Cloudflare Worker URL (https://...)
-#   READORI_AMD_EXECUTOR_TOKEN     same value as Worker EXECUTOR_TOKEN
+#   READORI_VALIDATOR_API_KEY     token held by the Worker proxy (or clients)
+#
+# Backwards compatibility: READORI_AMD_EXECUTOR_TOKEN is accepted as the API
+# key when READORI_VALIDATOR_API_KEY is not set.  READORI_AMD_EXECUTOR_BASE_URL
+# is ignored and is no longer required.
 #
 # Optional variables:
 #   READORI_SOURCE_REPOSITORY (default readori/readori-CheckSources)
 #   READORI_SOURCE_REF (default main; used when only server/ was checked out)
 #   READORI_SOURCE_TOKEN (optional GitHub token for a private source repository)
 #   READORI_INSTALL_DIR (default /opt/readori-validator)
-#   READORI_AMD_EXECUTOR_ID (default amd-micro-<hostname>)
 #   READORI_AMD_WORK_DIR (default /var/lib/readori-validator)
-#   READORI_AMD_POLL_SECONDS (default 3)
-#   READORI_AMD_MAX_ATTEMPTS (default 3)
-#   READORI_VALIDATOR_PORT / READORI_VALIDATOR_HOST are accepted for shared env
+#   READORI_VALIDATOR_PORT (default 8787)
+#   READORI_VALIDATOR_HOST (default 0.0.0.0)
 #   READORI_SKIP_APT=1 skips apt package installation (use only on prepared hosts)
 #   READORI_SKIP_SYSTEMD=1 installs files and the virtualenv without starting it
 
@@ -33,6 +38,8 @@ CONFIG_DIR="/etc/readori-validator"
 ENV_FILE="$CONFIG_DIR/amd-micro.env"
 SERVICE_NAME="readori-source-validator"
 WORK_DIR="${READORI_AMD_WORK_DIR:-/var/lib/readori-validator}"
+VALIDATOR_HOST="${READORI_VALIDATOR_HOST:-0.0.0.0}"
+VALIDATOR_PORT="${READORI_VALIDATOR_PORT:-8787}"
 SERVICE_USER="readori"
 SERVICE_GROUP="readori"
 
@@ -174,6 +181,13 @@ copy_project() {
     [ -e "$SOURCE_ROOT/$item" ] || die "source file is missing: $SOURCE_ROOT/$item"
     cp -a "$SOURCE_ROOT/$item" "$INSTALL_DIR/"
   done
+  # Remove the legacy D1/Queue executor when upgrading an existing install.
+  # Leaving it on disk is misleading and can lead to an accidental manual
+  # launch even though the systemd unit now runs the local API server.
+  if [ -f "$INSTALL_DIR/server/amd_micro_executor.py" ]; then
+    rm -f -- "$INSTALL_DIR/server/amd_micro_executor.py"
+    info "Removed legacy server/amd_micro_executor.py from $INSTALL_DIR"
+  fi
   # Prevent stale bytecode and local job databases from being copied or used by
   # the service. The source repository never needs those runtime artefacts.
   find "$INSTALL_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
@@ -212,41 +226,46 @@ create_virtualenv() {
     -r "$INSTALL_DIR/requirements-validate-sources.txt" \
     -r "$INSTALL_DIR/server/requirements.txt"
   "$INSTALL_DIR/.venv/bin/python" -m py_compile \
-    "$INSTALL_DIR/server/amd_micro_executor.py" \
     "$INSTALL_DIR/server/source_validator_server.py" \
     "$INSTALL_DIR/validator/validate_source_packages.py"
 }
 
 write_env_file() {
-  require_value READORI_AMD_EXECUTOR_BASE_URL
-  require_value READORI_AMD_EXECUTOR_TOKEN
+  if [ -z "${READORI_VALIDATOR_API_KEY:-}" ] && [ -n "${READORI_AMD_EXECUTOR_TOKEN:-}" ]; then
+    READORI_VALIDATOR_API_KEY="$READORI_AMD_EXECUTOR_TOKEN"
+    export READORI_VALIDATOR_API_KEY
+  fi
+  require_value READORI_VALIDATOR_API_KEY
 
-  local executor_id="${READORI_AMD_EXECUTOR_ID:-amd-micro-$(hostname -s 2>/dev/null || hostname)}"
-  local poll_seconds="${READORI_AMD_POLL_SECONDS:-3}"
-  local max_attempts="${READORI_AMD_MAX_ATTEMPTS:-3}"
-  validate_single_line READORI_AMD_EXECUTOR_ID "$executor_id"
-  validate_single_line READORI_AMD_POLL_SECONDS "$poll_seconds"
-  validate_single_line READORI_AMD_MAX_ATTEMPTS "$max_attempts"
-
-  case "$poll_seconds" in
-    ''|*[!0-9.]* ) die "READORI_AMD_POLL_SECONDS must be numeric" ;;
+  local validator_host="$VALIDATOR_HOST"
+  local validator_port="$VALIDATOR_PORT"
+  validate_single_line READORI_VALIDATOR_HOST "$validator_host"
+  validate_single_line READORI_VALIDATOR_PORT "$validator_port"
+  case "$validator_host" in
+    ''|*[!A-Za-z0-9._:-]*) die "READORI_VALIDATOR_HOST contains unsafe characters" ;;
   esac
-  case "$max_attempts" in
-    ''|*[!0-9]* ) die "READORI_AMD_MAX_ATTEMPTS must be an integer" ;;
+  case "$validator_port" in
+    ''|*[!0-9]*) die "READORI_VALIDATOR_PORT must be an integer" ;;
   esac
+  [ "$validator_port" -ge 1 ] && [ "$validator_port" -le 65535 ] || die "READORI_VALIDATOR_PORT must be between 1 and 65535"
 
   umask 077
   local temp_file
   temp_file="$(mktemp "$CONFIG_DIR/amd-micro.env.XXXXXX")"
   trap 'rm -f -- "${temp_file:-}"' RETURN
   {
-    printf 'READORI_AMD_EXECUTOR_BASE_URL=%s\n' "$(env_quote "$READORI_AMD_EXECUTOR_BASE_URL")"
-    printf 'READORI_AMD_EXECUTOR_TOKEN=%s\n' "$(env_quote "$READORI_AMD_EXECUTOR_TOKEN")"
-    printf 'READORI_AMD_EXECUTOR_ID=%s\n' "$(env_quote "$executor_id")"
+    printf 'READORI_VALIDATOR_API_KEY=%s\n' "$(env_quote "$READORI_VALIDATOR_API_KEY")"
+    printf 'READORI_VALIDATOR_HOST=%s\n' "$(env_quote "$validator_host")"
+    printf 'READORI_VALIDATOR_PORT=%s\n' "$(env_quote "$validator_port")"
+    printf 'READORI_VALIDATOR_DB=%s\n' "$(env_quote "$WORK_DIR/validator.sqlite3")"
     printf 'READORI_VALIDATOR_EXECUTOR_PROFILE=amd-micro\n'
+    printf 'READORI_AMD_MICRO=1\n'
+    printf 'READORI_VALIDATOR_MAX_WORKERS=1\n'
+    printf 'READORI_VALIDATOR_MAX_JOBS=1\n'
+    printf 'READORI_VALIDATOR_DOMAIN_CONCURRENCY=1\n'
+    printf 'READORI_VALIDATOR_MAX_SOURCES=20000\n'
+    printf 'READORI_VALIDATOR_MAX_UPLOAD_BYTES=67108864\n'
     printf 'READORI_AMD_WORK_DIR=%s\n' "$(env_quote "$WORK_DIR")"
-    printf 'READORI_AMD_POLL_SECONDS=%s\n' "$(env_quote "$poll_seconds")"
-    printf 'READORI_AMD_MAX_ATTEMPTS=%s\n' "$(env_quote "$max_attempts")"
     printf 'PYTHONUNBUFFERED=1\n'
   } > "$temp_file"
   chown root:root "$temp_file"
@@ -258,15 +277,18 @@ write_env_file() {
 validate_runtime_configuration() {
   # Fail before apt/pip work so a missing secret cannot waste time or leave a
   # partially prepared host after a disconnected SSH session.
-  require_value READORI_AMD_EXECUTOR_BASE_URL
-  require_value READORI_AMD_EXECUTOR_TOKEN
+  if [ -z "${READORI_VALIDATOR_API_KEY:-}" ] && [ -n "${READORI_AMD_EXECUTOR_TOKEN:-}" ]; then
+    READORI_VALIDATOR_API_KEY="$READORI_AMD_EXECUTOR_TOKEN"
+    export READORI_VALIDATOR_API_KEY
+  fi
+  require_value READORI_VALIDATOR_API_KEY
 }
 
 write_systemd_unit() {
   local unit_path="/etc/systemd/system/$SERVICE_NAME.service"
   cat > "$unit_path" <<EOF
 [Unit]
-Description=Readori AMD Micro source validation executor
+Description=Readori AMD Micro source validation server
 After=network-online.target
 Wants=network-online.target
 
@@ -276,7 +298,7 @@ User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$ENV_FILE
-ExecStart=$INSTALL_DIR/.venv/bin/python -m server.amd_micro_executor --work-dir $WORK_DIR
+ExecStart=$INSTALL_DIR/.venv/bin/python -m server.source_validator_server --host $VALIDATOR_HOST --port $VALIDATOR_PORT
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
@@ -294,7 +316,7 @@ EOF
 }
 
 verify_runtime() {
-  "$INSTALL_DIR/.venv/bin/python" -c 'import requests, quickjs; import server.amd_micro_executor; print("python runtime: ok")'
+  "$INSTALL_DIR/.venv/bin/python" -c 'import requests, quickjs, fastapi; import server.source_validator_server; print("python runtime: ok")'
   command -v node >/dev/null 2>&1 || die "node is required by JavaScript source rules"
   node --version
   command -v 7z >/dev/null 2>&1 || info "7z is unavailable; RAR/7z source rules will be marked unsupported"
@@ -312,11 +334,15 @@ start_service() {
     systemctl --no-pager --full status "$SERVICE_NAME.service" || true
     die "executor service did not stay active"
   fi
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
+      "http://127.0.0.1:${VALIDATOR_PORT}/healthz" >/dev/null || die "validator server health check failed"
+  fi
 }
 
 main() {
   require_root
-  [ -f "$SOURCE_ROOT/server/amd_micro_executor.py" ] || die "server/amd_micro_executor.py is missing; sparse checkout must include server/"
+  [ -f "$SOURCE_ROOT/server/source_validator_server.py" ] || die "server/source_validator_server.py is missing; sparse checkout must include server/"
   validate_runtime_configuration
   install_os_dependencies
   bootstrap_minimal_runtime_files
@@ -327,7 +353,7 @@ main() {
   write_systemd_unit
   verify_runtime
   start_service
-  info "Installed $SERVICE_NAME at $INSTALL_DIR"
+  info "Installed $SERVICE_NAME at $INSTALL_DIR (server-only mode; D1/R2 not used)"
   info "Service status: systemctl status $SERVICE_NAME"
   info "Secret configuration: $ENV_FILE (mode 0600; values are not printed)"
 }

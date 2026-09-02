@@ -16,7 +16,7 @@ $env:READORI_VALIDATOR_DB = "D:\Readzen\readori-shuyuan\server\data\validator.sq
 
 ### AMD Micro 一键安装
 
-Cloudflare 控制面方案中的 AMD Micro 只运行 D1 租约执行器，不启动 FastAPI、GUI 或多并发任务。Ubuntu/Debian 服务器可使用 `install_amd_micro.sh` 自动安装 Python/Node/7-Zip 依赖、创建低权限 `readori` 用户、建立虚拟环境、写入 0600 环境文件并启用 systemd：
+当前 AMD Micro 使用 server-only 模式，直接运行 FastAPI 和本地 SQLite 验证队列，不启动 D1 租约执行器、GUI 或多并发任务。Ubuntu/Debian 服务器可使用 `install_amd_micro.sh` 自动安装 Python/Node/7-Zip 依赖、创建低权限 `readori` 用户、建立虚拟环境、写入 0600 环境文件并启用 systemd：
 
 如果 SSH 端只需要下载 `server/`，安装器会在执行时从同一仓库和分支自动补齐 `validator/`、`requirements-validate-sources.txt` 与 `requirements.txt` 四个最小运行文件，不会检出或复制仓库其它目录。公共仓库无需 GitHub token；私有仓库可额外设置 `READORI_SOURCE_TOKEN`（只通过请求头使用，不写入命令行或日志）。
 
@@ -36,15 +36,16 @@ git sparse-checkout set server
 
 ```bash
 cd /opt/readori-source-validator
-export READORI_AMD_EXECUTOR_BASE_URL='https://validator.example.com'
-export READORI_AMD_EXECUTOR_TOKEN='same-as-cloudflare-EXECUTOR_TOKEN'
-sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN \
+export READORI_VALIDATOR_API_KEY='same-as-cloudflare-VALIDATOR_SERVER_TOKEN'
+export READORI_VALIDATOR_HOST='0.0.0.0'
+export READORI_VALIDATOR_PORT='8787'
+sudo --preserve-env=READORI_VALIDATOR_API_KEY,READORI_VALIDATOR_HOST,READORI_VALIDATOR_PORT \
   bash server/install_amd_micro.sh
 ```
 
 如果使用私有仓库或非 `main` 分支，额外设置 `READORI_SOURCE_REPOSITORY=owner/repository`、`READORI_SOURCE_REF=branch-or-tag`，并将 `READORI_SOURCE_TOKEN` 加入 `sudo --preserve-env` 列表。
 
-脚本默认安装到 `/opt/readori-validator`、运行目录 `/var/lib/readori-validator`，服务名为 `readori-source-validator.service`。可通过 `READORI_INSTALL_DIR`、`READORI_AMD_EXECUTOR_ID`、`READORI_AMD_POLL_SECONDS`、`READORI_AMD_MAX_ATTEMPTS` 调整；`READORI_SKIP_APT=1` 或 `READORI_SKIP_SYSTEMD=1` 适用于已准备好的主机。密钥只写入 `/etc/readori-validator/amd-micro.env`（0600），不会打印或放进 ExecStart 命令行。安装完成后用 `systemctl status readori-source-validator` 和 `journalctl -u readori-source-validator -f` 检查运行状态。
+脚本默认安装到 `/opt/readori-validator`、运行目录 `/var/lib/readori-validator`，服务名为 `readori-source-validator.service`。可通过 `READORI_INSTALL_DIR`、`READORI_AMD_WORK_DIR`、`READORI_VALIDATOR_HOST`、`READORI_VALIDATOR_PORT` 调整；`READORI_SKIP_APT=1` 或 `READORI_SKIP_SYSTEMD=1` 适用于已准备好的主机。密钥只写入 `/etc/readori-validator/amd-micro.env`（0600），不会打印或放进 ExecStart 命令行。安装完成后用 `systemctl status readori-source-validator` 和 `journalctl -u readori-source-validator -f` 检查运行状态。
 
 ## API 流程
 

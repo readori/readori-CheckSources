@@ -1,95 +1,69 @@
-# Readori Cloudflare 控制面 + AMD Micro 执行器
+# Readori Cloudflare Pages/Worker + AMD Micro 服务器验证器
 
-该目录把验证器拆成两个运行平面：Cloudflare Workers/Pages 提供公开 Web 控制台、任务状态、D1 租约和 R2 制品；`server/amd_micro_executor.py` 在甲骨云 AMD Micro 上以单并发运行现有 Python/QuickJS/Node 验证核心。AMD Micro 只有 1GB RAM，不能按本地 GUI 的 16 workers 配置运行。
+当前版本是 server-only 架构：Cloudflare Worker/Pages 只提供静态控制台和反向代理，任务、输入 JSON、验证进度、SQLite 检查点和结果全部在 AMD Micro 服务器上处理。Worker 不绑定 D1、R2 或 Queue，验证过程不会消耗 D1 免费额度。
 
-## Cloudflare 资源
+## 架构
 
-- Worker/Pages Static Assets：`public/index.html` 控制台。
-- D1：`migrations/0001_init.sql` 中的任务、逐源摘要和事件。
-- R2 `INPUTS`：上传的书源 JSON。
-- R2 `RESULTS`：完整通过书源结果 JSON。
-- D1 `jobs` 表：执行器通过单条原子 UPDATE 获取最旧的排队任务，并用租约过期时间恢复崩溃任务。
-- 不再要求 Cloudflare Queue HTTP Pull Token。Queue 可以保留作历史资源，但新任务分发以 D1 租约为唯一来源。
+```text
+浏览器 -> Cloudflare Worker/Pages /api/* -> HTTPS -> AMD Micro FastAPI
+                                                    ├─ SQLite 任务/逐源状态/事件
+                                                    ├─ 本地输入与结果文件
+                                                    └─ 单并发验证核心
+```
 
-## 部署
+AMD Micro 只有 1GB RAM，服务固定 `workers=1`、每域名并发 1、最多两轮稳定性复测。Worker 保存 `VALIDATOR_SERVER_TOKEN`，浏览器不会接触服务器 API token。
+
+## AMD Micro 安装
+
+使用 `server/install_amd_micro.sh`。它现在启动 `server.source_validator_server`，不再启动 `amd_micro_executor`，也不需要 Cloudflare Account ID、D1、R2、Queue 或 Queue token。
 
 ```bash
-cd cloudflare
-npm install
-npx wrangler d1 create readori-source-validator
-# 将返回的 database_id 填入 wrangler.toml
-npx wrangler d1 migrations apply readori-source-validator --remote
-npx wrangler r2 bucket create readori-source-validator-inputs
-npx wrangler r2 bucket create readori-source-validator-results
-npx wrangler secret put EXECUTOR_TOKEN
-# 可选：限制浏览器来源
-npx wrangler secret put FRONTEND_ORIGIN
+cd /opt/readori-source-validator
+export READORI_VALIDATOR_API_KEY='与 Worker secret 完全一致的长随机字符串'
+export READORI_VALIDATOR_HOST='0.0.0.0'
+export READORI_VALIDATOR_PORT='8787'
+bash server/install_amd_micro.sh
+```
+
+如果仍使用旧变量，`READORI_AMD_EXECUTOR_TOKEN` 会兼容地作为 API key；`READORI_AMD_EXECUTOR_BASE_URL` 已不再需要。安装后确认：
+
+```bash
+systemctl is-enabled readori-source-validator.service
+systemctl is-active readori-source-validator.service
+curl --fail http://127.0.0.1:8787/healthz
+journalctl -u readori-source-validator.service -n 50 --no-pager
+```
+
+服务器必须通过 HTTPS 对 Worker 可访问。可用 Caddy/Nginx 反代 `127.0.0.1:8787`，只开放反代端口，不要直接暴露 SQLite 或工作目录。
+
+## Worker 配置
+
+`wrangler.toml` 不含任何 D1/R2 配置。部署前设置：
+
+```bash
+# Put the AMD Micro HTTPS URL in wrangler.toml [vars].
+npx wrangler secret put VALIDATOR_SERVER_TOKEN
 npx wrangler deploy
 ```
 
-### 专用部署仓库的一键 CI
+`VALIDATOR_SERVER_URL` 必须是 AMD Micro 的 HTTPS 地址，例如 `https://validator.example.com`；`VALIDATOR_SERVER_TOKEN` 必须等于服务器的 `READORI_VALIDATOR_API_KEY`。Worker 公共页面不要求用户输入 API key，但服务器 token 只保存在 Worker secret 和服务器的 0600 环境文件中。
 
-`test-env-setup` 仓库中的 `.github/workflows/deploy-readori-source-validator-cloudflare.yml` 是唯一的自动部署入口，只有 GitHub Actions 页面上的 `workflow_dispatch` 会触发，不响应 push、Pull Request 或定时器。工作流会从 `readori/readori-CheckSources` 拉取指定分支/标签/提交，校验 `cloudflare/` 文件，再执行 Wrangler dry-run；`deploy-and-migrate` 模式会按 `bootstrap_resources` 选项创建缺少的 D1、R2 bucket，应用远程 D1 migration，部署 Worker/Pages 静态控制台并更新加密 Worker secrets。可选 `health_url` 会在部署后执行重试健康检查。
+## API 映射
 
-工作流的部署 job 绑定 GitHub `production` environment；建议在
-`readori/test-env-setup` → Settings → Environments → `production` → Environment secrets
-中配置敏感值。仓库级 Secrets 也兼容，但不要把这些值放到 Variables：
+控制台继续使用原来的 `/api` 路径，Worker 转发到服务器 `/v1`：
 
-- `TARGET_REPO_PAT`：只读访问 `readori-CheckSources` 的 fine-grained token；
-- `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`：具备 Worker、D1、R2 所需权限；
-- `EXECUTOR_TOKEN`：对应 Worker 的 `wrangler secret put`，必须与 AMD Micro 的 `READORI_AMD_EXECUTOR_TOKEN` 完全一致；公开控制面无需浏览器 API Key；
-- 可选 `CLOUDFLARE_D1_DATABASE_ID`、`FRONTEND_ORIGIN`，不配置时工作流会从 Cloudflare 列表解析；
-- 手动运行时填写 `source_ref`、`mode`、`bootstrap_resources` 和可选 `health_url`。
+- `POST /api/jobs` → `POST /v1/jobs`
+- `GET /api/jobs/:id` → `GET /v1/jobs/:id`
+- `GET /api/jobs/:id/sources`、`/events`、`/result`
+- `POST /api/jobs/:id/cancel`、`/resume`
+- `POST /api/uploads` → `POST /v1/jobs/upload`
 
-工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token 或 Queue token 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；如果非 dry-run 日志提示 `EXECUTOR_TOKEN` 缺失，说明该 Secret 未创建、名称拼写不一致，或被放到了未绑定的环境；AMD Micro 执行器仍需在服务器上单独安装和配置。
+服务器 API 使用本地 `JobStore` 的 SQLite WAL 模式，进程重启后会自动恢复 queued/running/resuming 任务。详细阶段和结果不再写入 D1/R2。
 
-资源清单由工作流通过 Cloudflare 官方 API 的 JSON 端点读取，以兼容 Wrangler 4.30+（`wrangler d1/r2/queues list` 不接受 `--json`）；创建和部署仍由 Wrangler 执行。AMD 主机只需要 Worker URL 和 `EXECUTOR_TOKEN`，不需要账户级 Queues Token。
+## 公网使用边界
 
-## AMD Micro 执行器
+控制台是公开的，任何人都可以创建验证任务；因此必须在 Caddy/Nginx 或 Cloudflare WAF 设置 IP 限流、上传大小限制和任务频率限制。单台 AMD Micro 只适合单并发，不能通过提高线程数提速；需要更高吞吐时应增加第二台服务器，而不是提高 1GB 实例并发。
 
-在 Ubuntu/Debian 上只运行一个 systemd 进程，避免同时启动 FastAPI 和 GUI：
+## 部署工作流
 
-```bash
-python3 -m venv /opt/readori-validator/.venv
-/opt/readori-validator/.venv/bin/pip install -r /opt/readori-validator/server/requirements.txt
-export READORI_VALIDATOR_EXECUTOR_PROFILE=amd-micro
-export READORI_AMD_EXECUTOR_BASE_URL=https://validator.example.com
-export READORI_AMD_EXECUTOR_TOKEN='same-as-cloudflare-secret'
-export READORI_AMD_EXECUTOR_ID='amd-micro-01'
-/opt/readori-validator/.venv/bin/python -m server.amd_micro_executor --work-dir /var/lib/readori-validator
-```
-
-Ubuntu/Debian 可直接运行 `server/install_amd_micro.sh` 完成依赖、专用 `readori` 用户、Python 虚拟环境和 systemd 服务安装。脚本是非交互的，先在当前 shell 导出以下变量，再用 root 执行；变量只写入 `/etc/readori-validator/amd-micro.env`（0600），不会显示在输出中：
-
-```bash
-export READORI_AMD_EXECUTOR_BASE_URL='https://validator.example.com'
-export READORI_AMD_EXECUTOR_TOKEN='same-as-wrangler-EXECUTOR_TOKEN'
-sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN \
-  bash server/install_amd_micro.sh
-```
-
-可选 `READORI_INSTALL_DIR`、`READORI_AMD_EXECUTOR_ID`、`READORI_AMD_WORK_DIR`、`READORI_AMD_POLL_SECONDS` 和 `READORI_SKIP_SYSTEMD=1`。1GB AMD Micro 默认单并发、每域名并发 1、最多两轮复测；脚本不会把 FastAPI/GUI 作为第二个常驻进程启动。
-
-推荐给实例配置 1–2GB swap 作为 OOM 兜底；执行器默认 D1 租约 12 小时、每源单并发、每域名并发 1。完整链路仍要求搜索→详情→目录→正文，不能因为连通性成功就把书源标记为可用。
-
-## Worker API
-
-公共接口（无需 API Key；由 `PUBLIC_CONTROL_PLANE=true` 开启）：
-
-- `POST /api/uploads`：上传 JSON，返回 `inputKey`。
-- `POST /api/jobs`：传 `sources` 或已上传的 `inputKey` 创建任务。
-- `GET /api/jobs/:id`、`/sources`、`/events`、`/result`：查询状态、摘要、事件和结果。
-- `POST /api/jobs/:id/cancel`、`/resume`：取消或断点恢复。
-
-执行器内部接口（`EXECUTOR_TOKEN` + `x-executor-id`）：
-
-- `POST /internal/jobs/:id/claim`：原子租约，防止 Queue 重投导致重复运行。
-- `POST /internal/next`：AMD 执行器原子获取最旧排队任务；同一执行器有未过期租约时返回该任务用于断点恢复。
-- `GET /internal/jobs/:id/input`：读取 R2 输入。
-- `POST /internal/jobs/:id/progress`：批量上报阶段、源摘要和事件并续租。
-- `POST /internal/jobs/:id/result`：流入最终 JSON 到 R2 并完成任务。
-- `POST /internal/jobs/:id/fail`、`/cancelled`：处理失败重试和取消。
-
-## 运行边界
-
-Cloudflare 控制面可以水平扩展，但 AMD Micro 执行器故意不扩容。要提速，只增加第二台执行器并使用独立 `executorId`，不要提高单台 AMD Micro 的线程数。部署后仍需用真实书源抽样检查 iOS 搜索、详情、目录和正文链路。D1 租约接口替代了 Queue HTTP Pull，因此执行器不会因 Queue API 权限或 Token 轮换而停止取任务。
+`test-env-setup` 仓库的部署工作流仍只接受 `workflow_dispatch`。它只部署 Worker/Pages 并写入 `VALIDATOR_SERVER_URL`、`VALIDATOR_SERVER_TOKEN`，不再解析、创建或迁移 D1，也不需要 `CLOUDFLARE_D1_DATABASE_ID`、D1 权限或 Queue 权限。
