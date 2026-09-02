@@ -1,4 +1,4 @@
-name: Readori Source Validator Cloudflare
+name: AA Readori Source Validator Cloudflare
 
 run-name: Source Validator Cloudflare ${{ inputs.mode }} @ ${{ inputs.source_ref }}
 
@@ -42,6 +42,10 @@ jobs:
     name: Pull validator source and deploy Cloudflare control plane
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Keep deployment credentials in the protected environment. Repository
+    # secrets remain supported; environment secrets are also exposed here.
+    environment:
+      name: production
 
     env:
       SOURCE_REPOSITORY: readori/readori-CheckSources
@@ -72,6 +76,9 @@ jobs:
           fi
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Missing deployment secrets/variables: ${missing[*]}"
+            echo "::error::Add the missing values as GitHub Secrets in the production environment (or repository-level Secrets), not Variables."
+            echo "::error::CONTROL_API_KEY is used by the public /api/* endpoints; EXECUTOR_TOKEN must exactly match the AMD Micro executor token."
+            echo "::error::Use mode=dry-run when checking repository/Cloudflare access without deploying; deploy and deploy-and-migrate require both runtime secrets."
             exit 1
           fi
           echo "::add-mask::$TARGET_REPO_PAT"

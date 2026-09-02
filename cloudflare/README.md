@@ -34,15 +34,17 @@ npx wrangler queues consumer http add readori-source-validation
 
 `test-env-setup` 仓库中的 `.github/workflows/deploy-readori-source-validator-cloudflare.yml` 是唯一的自动部署入口，只有 GitHub Actions 页面上的 `workflow_dispatch` 会触发，不响应 push、Pull Request 或定时器。工作流会从 `readori/readori-CheckSources` 拉取指定分支/标签/提交，校验 `cloudflare/` 文件，再执行 Wrangler dry-run；`deploy-and-migrate` 模式会按 `bootstrap_resources` 选项创建缺少的 D1、R2 bucket 和 Queue，应用远程 D1 migration，部署 Worker/Pages 静态控制台并更新加密 Worker secrets。可选 `health_url` 会在部署后执行重试健康检查。
 
-在 `readori/test-env-setup` 的 Actions secrets/variables 中配置：
+工作流的部署 job 绑定 GitHub `production` environment；建议在
+`readori/test-env-setup` → Settings → Environments → `production` → Environment secrets
+中配置敏感值。仓库级 Secrets 也兼容，但不要把这些值放到 Variables：
 
 - `TARGET_REPO_PAT`：只读访问 `readori-CheckSources` 的 fine-grained token；
 - `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`：具备 Worker、D1、R2、Queues 所需权限；
-- `CONTROL_API_KEY`、`EXECUTOR_TOKEN`：分别对应 Worker 的 `wrangler secret put`；
+- `CONTROL_API_KEY`、`EXECUTOR_TOKEN`：分别对应 Worker 的 `wrangler secret put`；前者供 `/api/*` 使用，后者必须与 AMD Micro 的 `READORI_AMD_EXECUTOR_TOKEN` 完全一致；
 - 可选 `CLOUDFLARE_D1_DATABASE_ID`、`FRONTEND_ORIGIN`，不配置时工作流会从 Cloudflare 列表解析；
 - 手动运行时填写 `source_ref`、`mode`、`bootstrap_resources` 和可选 `health_url`。
 
-工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token、Queue token 或 API key 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；AMD Micro 执行器仍需在服务器上单独安装和配置。
+工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token、Queue token 或 API key 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；如果非 dry-run 日志提示 `CONTROL_API_KEY` 或 `EXECUTOR_TOKEN` 缺失，说明该 Secret 未创建、名称拼写不一致，或被放到了未绑定的环境；AMD Micro 执行器仍需在服务器上单独安装和配置。
 
 HTTP Pull token需要账户级 Queues 读写权限。不要把该 Token、`EXECUTOR_TOKEN` 或 API Key 写入 Git、前端文件或日志。
 
