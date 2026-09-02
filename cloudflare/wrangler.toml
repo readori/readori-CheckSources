@@ -15,6 +15,6 @@ not_found_handling = "single-page-application"
 [vars]
 # The Worker is a thin public proxy. All task state, input files, validation,
 # progress and results live on the AMD Micro server; no D1/R2 binding is used.
-VALIDATOR_SERVER_URL = "https://validator.example.com"
+VALIDATOR_SERVER_URL = "https://syyz-api.readori.com"
 PUBLIC_CONTROL_PLANE = "true"
 FRONTEND_ORIGIN = "https://syyz.readori.com"
