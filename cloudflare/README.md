@@ -46,6 +46,8 @@ npx wrangler queues consumer http add readori-source-validation
 
 工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token、Queue token 或 API key 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；如果非 dry-run 日志提示 `CONTROL_API_KEY` 或 `EXECUTOR_TOKEN` 缺失，说明该 Secret 未创建、名称拼写不一致，或被放到了未绑定的环境；AMD Micro 执行器仍需在服务器上单独安装和配置。
 
+资源清单由工作流通过 Cloudflare 官方 API 的 JSON 端点读取，以兼容 Wrangler 4.30+（`wrangler d1/r2/queues list` 不接受 `--json`）；创建和部署仍由 Wrangler 执行。
+
 HTTP Pull token需要账户级 Queues 读写权限。不要把该 Token、`EXECUTOR_TOKEN` 或 API Key 写入 Git、前端文件或日志。
 
 ## AMD Micro 执行器
