@@ -327,16 +327,32 @@ start_service() {
     info "READORI_SKIP_SYSTEMD=1; service file installed but not enabled or started"
     return
   fi
-  command -v systemctl >/dev/null 2>&1 || die "systemd is unavailable; set READORI_SKIP_SYSTEMD=1 and run the executor manually"
+  command -v systemctl >/dev/null 2>&1 || die "systemd is unavailable; set READORI_SKIP_SYSTEMD=1 and run the validator server manually"
   systemctl daemon-reload
   systemctl enable --now "$SERVICE_NAME.service"
   if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
     systemctl --no-pager --full status "$SERVICE_NAME.service" || true
-    die "executor service did not stay active"
+    die "validator service did not stay active"
   fi
   if command -v curl >/dev/null 2>&1; then
-    curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
-      "http://127.0.0.1:${VALIDATOR_PORT}/healthz" >/dev/null || die "validator server health check failed"
+    # ``systemctl enable --now`` returns before uvicorn has finished importing
+    # the validation core.  Poll instead of treating that normal warm-up as a
+    # failed installation (especially on 1 GB AMD Micro instances).
+    local health_url="http://127.0.0.1:${VALIDATOR_PORT}/healthz"
+    local health_attempt
+    for health_attempt in {1..30}; do
+      if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+        "$health_url" >/dev/null; then
+        return
+      fi
+      if ! systemctl is-active --quiet "$SERVICE_NAME.service"; then
+        break
+      fi
+      sleep 1
+    done
+    systemctl --no-pager --full status "$SERVICE_NAME.service" || true
+    journalctl -u "$SERVICE_NAME.service" -n 80 --no-pager || true
+    die "validator server health check failed after waiting for $health_url"
   fi
 }
 
