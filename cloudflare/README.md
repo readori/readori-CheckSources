@@ -46,7 +46,7 @@ npx wrangler secret put VALIDATOR_SERVER_TOKEN
 npx wrangler deploy
 ```
 
-`VALIDATOR_SERVER_URL` 必须是 AMD Micro 的 HTTPS 地址，例如 `https://validator.example.com`；`VALIDATOR_SERVER_TOKEN` 必须等于服务器的 `READORI_VALIDATOR_API_KEY`。Worker 公共页面不要求用户输入 API key，但服务器 token 只保存在 Worker secret 和服务器的 0600 环境文件中。
+`VALIDATOR_SERVER_URL` 必须是 AMD Micro 的 HTTPS 主机名，例如 `https://validator-api.readori.com`，不能填写裸 IPv4/IPv6 地址，也不能填写前端 Worker 的 `syyz.readori.com`；`VALIDATOR_SERVER_TOKEN` 必须等于服务器的 `READORI_VALIDATOR_API_KEY`。Worker 公共页面不要求用户输入 API key，但服务器 token 只保存在 Worker secret 和服务器的 0600 环境文件中。请在 Cloudflare DNS 中为后端主机创建 A/AAAA 记录，并在 AMD Micro 上用 Caddy/Nginx 配置该主机名的公信 TLS 证书后反代到 `127.0.0.1:8787`。
 
 用户访问入口固定为 [`https://syyz.readori.com/`](https://syyz.readori.com/)，接口健康检查为 [`https://syyz.readori.com/api/healthz`](https://syyz.readori.com/api/healthz)。Cloudflare 控制台中已经绑定该 Custom Domain 时，重新部署同一 Worker 即可；不要再为同一主机添加 `/*` Route。
 
