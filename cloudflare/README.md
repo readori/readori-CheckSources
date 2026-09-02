@@ -25,6 +25,8 @@ export READORI_VALIDATOR_PORT='8787'
 bash server/install_amd_micro.sh
 ```
 
+后续升级如果 `/etc/readori-validator/amd-micro.env` 已存在有效 API key，可不再导出变量，安装器会安全复用该文件中的值；如需轮换密钥，再临时导出 `READORI_VALIDATOR_API_KEY` 覆盖它。
+
 如果仍使用旧变量，`READORI_AMD_EXECUTOR_TOKEN` 会兼容地作为 API key；`READORI_AMD_EXECUTOR_BASE_URL` 已不再需要。安装后确认：
 
 ```bash

@@ -230,12 +230,33 @@ create_virtualenv() {
     "$INSTALL_DIR/validator/validate_source_packages.py"
 }
 
+existing_api_key_line() {
+  [ -r "$ENV_FILE" ] || return 1
+  local line value
+  line="$(grep -m1 '^READORI_VALIDATOR_API_KEY=' "$ENV_FILE" || true)"
+  case "$line" in
+    READORI_VALIDATOR_API_KEY=*) ;;
+    *) return 1 ;;
+  esac
+  value="${line#READORI_VALIDATOR_API_KEY=}"
+  case "$value" in
+    ''|'""') return 1 ;;
+  esac
+  printf '%s\n' "$line"
+}
+
 write_env_file() {
   if [ -z "${READORI_VALIDATOR_API_KEY:-}" ] && [ -n "${READORI_AMD_EXECUTOR_TOKEN:-}" ]; then
     READORI_VALIDATOR_API_KEY="$READORI_AMD_EXECUTOR_TOKEN"
     export READORI_VALIDATOR_API_KEY
   fi
-  require_value READORI_VALIDATOR_API_KEY
+  local existing_key_line=""
+  if [ -z "${READORI_VALIDATOR_API_KEY:-}" ]; then
+    existing_key_line="$(existing_api_key_line || true)"
+  fi
+  if [ -z "${READORI_VALIDATOR_API_KEY:-}" ] && [ -z "$existing_key_line" ]; then
+    require_value READORI_VALIDATOR_API_KEY
+  fi
 
   local validator_host="$VALIDATOR_HOST"
   local validator_port="$VALIDATOR_PORT"
@@ -254,7 +275,13 @@ write_env_file() {
   temp_file="$(mktemp "$CONFIG_DIR/amd-micro.env.XXXXXX")"
   trap 'rm -f -- "${temp_file:-}"' RETURN
   {
-    printf 'READORI_VALIDATOR_API_KEY=%s\n' "$(env_quote "$READORI_VALIDATOR_API_KEY")"
+    if [ -n "${READORI_VALIDATOR_API_KEY:-}" ]; then
+      printf 'READORI_VALIDATOR_API_KEY=%s\n' "$(env_quote "$READORI_VALIDATOR_API_KEY")"
+    else
+      # Preserve an existing quoted EnvironmentFile value without evaluating
+      # it as shell code. A new exported key still takes precedence above.
+      printf '%s\n' "$existing_key_line"
+    fi
     printf 'READORI_VALIDATOR_HOST=%s\n' "$(env_quote "$validator_host")"
     printf 'READORI_VALIDATOR_PORT=%s\n' "$(env_quote "$validator_port")"
     printf 'READORI_VALIDATOR_DB=%s\n' "$(env_quote "$WORK_DIR/validator.sqlite3")"
@@ -280,6 +307,10 @@ validate_runtime_configuration() {
   if [ -z "${READORI_VALIDATOR_API_KEY:-}" ] && [ -n "${READORI_AMD_EXECUTOR_TOKEN:-}" ]; then
     READORI_VALIDATOR_API_KEY="$READORI_AMD_EXECUTOR_TOKEN"
     export READORI_VALIDATOR_API_KEY
+  fi
+  if [ -z "${READORI_VALIDATOR_API_KEY:-}" ] && existing_api_key_line >/dev/null 2>&1; then
+    info "READORI_VALIDATOR_API_KEY not exported; reusing the existing $ENV_FILE value"
+    return
   fi
   require_value READORI_VALIDATOR_API_KEY
 }
