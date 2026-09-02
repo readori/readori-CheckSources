@@ -78,7 +78,7 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 
 ### Cloudflare 控制面 + AMD Micro
 
-`cloudflare/` 提供可部署到 Cloudflare Workers/Pages 的控制台和 API。Worker 使用 D1 保存任务状态，R2 保存输入/结果，Queues 只发送任务引用；甲骨云 AMD Micro 运行 `python -m server.amd_micro_executor`，通过 HTTP Pull 一次领取一个任务。AMD Micro 画像会强制 `workers=1`、每域名并发 1、最多两轮稳定性复测，避免 1GB 内存被浏览器参数压垮。部署、D1 迁移、Queue Pull、systemd 和密钥环境变量见 [`cloudflare/README.md`](cloudflare/README.md)。
+`cloudflare/` 提供可部署到 Cloudflare Workers/Pages 的控制台和 API。Worker 使用 D1 保存任务状态，R2 保存输入/结果，并通过 `/internal/next` 原子租约分发任务；甲骨云 AMD Micro 运行 `python -m server.amd_micro_executor`，一次领取一个任务。AMD Micro 画像会强制 `workers=1`、每域名并发 1、最多两轮稳定性复测，避免 1GB 内存被浏览器参数压垮。部署、D1 迁移、D1 租约、systemd 和密钥环境变量见 [`cloudflare/README.md`](cloudflare/README.md)。
 
 专用部署仓库 `readori/test-env-setup` 的 `deploy-readori-source-validator-cloudflare.yml` 仅手动触发，并从 `readori/readori-CheckSources` 拉取源代码后执行 Cloudflare dry-run/迁移/部署；服务器端可直接运行 [`server/install_amd_micro.sh`](server/install_amd_micro.sh) 完成 AMD Micro 的一键安装配置。
 

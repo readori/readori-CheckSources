@@ -151,6 +151,7 @@ function jobView(row) {
     progress: Number(row.progress || 0),
     error: row.error || "",
     cancelRequested: Boolean(row.cancel_requested),
+    attemptCount: Number(row.attempt_count || 0),
     resultCount: Number(row.result_count || 0),
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0),
@@ -159,10 +160,6 @@ function jobView(row) {
 
 async function getJob(env, jobId) {
   return env.DB.prepare("SELECT * FROM jobs WHERE id = ?1").bind(jobId).first();
-}
-
-async function queueJob(env, jobId, inputKey, config) {
-  await env.VALIDATION_QUEUE.send({ version: 1, jobId, inputKey, config, enqueuedAt: now() });
 }
 
 async function createJob(request, env) {
@@ -192,13 +189,8 @@ async function createJob(request, env) {
     `INSERT INTO jobs (id, status, stage, input_key, input_name, config_json, total_sources, created_at, updated_at)
      VALUES (?1, 'queued', 'queued', ?2, ?3, ?4, ?5, ?6, ?6)`,
   ).bind(jobId, inputKey, inputName, JSON.stringify(config), maxInt(payload.sourceCount, 0, 0, 20000), timestamp).run();
-  try {
-    await queueJob(env, jobId, inputKey, config);
-  } catch (error) {
-    await env.DB.prepare("UPDATE jobs SET status='failed', stage='failed', error=?1, updated_at=?2 WHERE id=?3")
-      .bind(`queue enqueue failed: ${String(error).slice(0, 500)}`, now(), jobId).run();
-    return textError(request, env, 503, "validation queue is unavailable");
-  }
+  await env.DB.prepare("INSERT INTO job_events (job_id, level, stage, message, payload_json, created_at) VALUES (?1,'info','queued','job queued for AMD executor','{}',?2)")
+    .bind(jobId, timestamp).run();
   return json(request, env, { job: jobView(await getJob(env, jobId)), deduplicated: 0 }, 201);
 }
 
@@ -290,10 +282,8 @@ async function resumeJob(request, env, jobId) {
   const row = await getJob(env, jobId);
   if (!row) return textError(request, env, 404, "job not found");
   if (!['cancelled', 'failed'].includes(row.status)) return textError(request, env, 409, "job cannot be resumed in its current state");
-  await env.DB.prepare("UPDATE jobs SET status='queued', stage='resuming', cancel_requested=0, error='', updated_at=?1 WHERE id=?2")
+  await env.DB.prepare("UPDATE jobs SET status='queued', stage='resuming', cancel_requested=0, error='', attempt_count=0, updated_at=?1 WHERE id=?2")
     .bind(now(), jobId).run();
-  const config = (() => { try { return JSON.parse(row.config_json || "{}"); } catch { return normalizeConfig({}); } })();
-  await queueJob(env, jobId, row.input_key, normalizeConfig(config));
   return json(request, env, jobView(await getJob(env, jobId)));
 }
 
@@ -302,8 +292,8 @@ async function claimJob(request, env, jobId) {
   if (!executorId) return textError(request, env, 400, "x-executor-id is required");
   const leaseUntil = now() + maxInt(env.QUEUE_VISIBILITY_TIMEOUT_MS, 43200000, 60000, 43200000);
   const result = await env.DB.prepare(
-    `UPDATE jobs SET status='running', stage=CASE WHEN stage='queued' THEN 'claimed' ELSE stage END,
-            executor_id=?1, lease_expires_at=?2, updated_at=?3
+    `UPDATE jobs SET status='running', stage=CASE WHEN stage IN ('queued','resuming') THEN 'claimed' ELSE stage END,
+            executor_id=?1, lease_expires_at=?2, attempt_count=attempt_count+1, updated_at=?3
        WHERE id=?4 AND cancel_requested=0
          AND (status='queued' OR (status='running' AND (executor_id=?1 OR lease_expires_at<?3)))`,
   ).bind(executorId, leaseUntil, now(), jobId).run();
@@ -313,6 +303,49 @@ async function claimJob(request, env, jobId) {
     return textError(request, env, 409, `job is ${row.status}`);
   }
   return json(request, env, jobView(await getJob(env, jobId)));
+}
+
+async function claimNextJob(request, env) {
+  const executorId = String(request.headers.get("x-executor-id") || "").slice(0, 120);
+  if (!executorId) return textError(request, env, 400, "x-executor-id is required");
+  const timestamp = now();
+  const leaseUntil = timestamp + maxInt(env.QUEUE_VISIBILITY_TIMEOUT_MS, 43200000, 60000, 43200000);
+
+  // A restarted executor must resume its own live lease before claiming a
+  // second job. This also makes duplicate polling safe when two requests
+  // overlap during a transient network retry.
+  const active = await env.DB.prepare(
+    "SELECT * FROM jobs WHERE executor_id=?1 AND status='running' AND lease_expires_at>?2 ORDER BY updated_at DESC LIMIT 1",
+  ).bind(executorId, timestamp).first();
+  if (active) return json(request, env, { job: jobView(active), claimed: false, resumed: true });
+
+  // D1 executes this as one SQLite UPDATE. The subquery chooses the oldest
+  // queued job, or an expired lease for crash recovery, while the outer WHERE
+  // protects against a stale candidate being claimed by another executor.
+  const result = await env.DB.prepare(
+    `UPDATE jobs SET status='running',
+            stage=CASE WHEN stage IN ('queued','resuming') THEN 'claimed' ELSE stage END,
+            executor_id=?1, lease_expires_at=?2, attempt_count=attempt_count+1, updated_at=?3
+       WHERE id=(
+         SELECT id FROM jobs
+          WHERE cancel_requested=0 AND (
+            status IN ('queued','resuming') OR
+            (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<?3)
+          )
+          ORDER BY CASE WHEN status='running' THEN 1 ELSE 0 END, created_at, id
+          LIMIT 1
+       )
+         AND cancel_requested=0
+         AND (
+           status IN ('queued','resuming') OR
+           (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<?3)
+         )`,
+  ).bind(executorId, leaseUntil, timestamp).run();
+  if (!result.meta || !result.meta.changes) return json(request, env, { job: null, claimed: false });
+  const job = await env.DB.prepare(
+    "SELECT * FROM jobs WHERE executor_id=?1 AND lease_expires_at=?2 ORDER BY updated_at DESC LIMIT 1",
+  ).bind(executorId, leaseUntil).first();
+  return json(request, env, { job: jobView(job), claimed: Boolean(job), resumed: false });
 }
 
 async function internalJob(request, env, jobId) {
@@ -435,8 +468,9 @@ async function internalFail(request, env, jobId) {
   const status = retryable ? "queued" : "failed";
   const message = String(payload.error || "executor failed").slice(0, 500);
   const timestamp = now();
-  await env.DB.prepare("UPDATE jobs SET status=?1, stage=?2, error=?3, executor_id=NULL, lease_expires_at=NULL, updated_at=?4 WHERE id=?5")
-    .bind(status, retryable ? "retrying" : "failed", message, timestamp, jobId).run();
+  const result = await env.DB.prepare("UPDATE jobs SET status=?1, stage=?2, error=?3, executor_id=NULL, lease_expires_at=NULL, updated_at=?4 WHERE id=?5 AND executor_id=?6")
+    .bind(status, retryable ? "retrying" : "failed", message, timestamp, jobId, executorId).run();
+  if (!result.meta || !result.meta.changes) return textError(request, env, 409, "job lease changed");
   await env.DB.prepare("INSERT INTO job_events (job_id, level, stage, message, payload_json, created_at) VALUES (?1,'error',?2,?3,?4,?5)")
     .bind(jobId, retryable ? "retrying" : "failed", message, boundedJSON({ retryable }), timestamp).run();
   return json(request, env, jobView(await getJob(env, jobId)));
@@ -447,8 +481,9 @@ async function internalCancelled(request, env, jobId) {
   const row = await getJob(env, jobId);
   if (!row) return textError(request, env, 404, "job not found");
   if (!executorId || row.executor_id !== executorId) return textError(request, env, 409, "job is not leased by this executor");
-  await env.DB.prepare("UPDATE jobs SET status='cancelled', stage='cancelled', executor_id=NULL, lease_expires_at=NULL, updated_at=?1 WHERE id=?2")
-    .bind(now(), jobId).run();
+  const result = await env.DB.prepare("UPDATE jobs SET status='cancelled', stage='cancelled', executor_id=NULL, lease_expires_at=NULL, updated_at=?1 WHERE id=?2 AND executor_id=?3")
+    .bind(now(), jobId, executorId).run();
+  if (!result.meta || !result.meta.changes) return textError(request, env, 409, "job lease changed");
   return json(request, env, jobView(await getJob(env, jobId)));
 }
 
@@ -475,7 +510,9 @@ async function routeInternal(request, env, url) {
   const auth = executorAuth(request, env);
   if (auth.response) return auth.response;
   const segments = url.pathname.split("/").filter(Boolean);
-  if (segments[0] !== "internal" || segments[1] !== "jobs" || !segments[2]) return textError(request, env, 404, "route not found");
+  if (segments[0] !== "internal") return textError(request, env, 404, "route not found");
+  if (segments[1] === "next" && segments.length === 2 && request.method === "POST") return claimNextJob(request, env);
+  if (segments[1] !== "jobs" || !segments[2]) return textError(request, env, 404, "route not found");
   const jobId = segments[2];
   if (segments.length === 3 && request.method === "GET") return internalJob(request, env, jobId);
   if (segments[3] === "claim" && request.method === "POST") return claimJob(request, env, jobId);

@@ -1,6 +1,6 @@
 # Readori Cloudflare 控制面 + AMD Micro 执行器
 
-该目录把验证器拆成两个运行平面：Cloudflare Workers/Pages 只处理 Web 控制台、鉴权、任务状态、R2 制品和 Queue；`server/amd_micro_executor.py` 在甲骨云 AMD Micro 上以单并发运行现有 Python/QuickJS/Node 验证核心。AMD Micro 只有 1GB RAM，不能按本地 GUI 的 16 workers 配置运行。
+该目录把验证器拆成两个运行平面：Cloudflare Workers/Pages 只处理 Web 控制台、鉴权、任务状态、D1 租约和 R2 制品；`server/amd_micro_executor.py` 在甲骨云 AMD Micro 上以单并发运行现有 Python/QuickJS/Node 验证核心。AMD Micro 只有 1GB RAM，不能按本地 GUI 的 16 workers 配置运行。
 
 ## Cloudflare 资源
 
@@ -8,8 +8,8 @@
 - D1：`migrations/0001_init.sql` 中的任务、逐源摘要和事件。
 - R2 `INPUTS`：上传的书源 JSON。
 - R2 `RESULTS`：完整通过书源结果 JSON。
-- Queue `readori-source-validation`：每个验证任务只发送 `{jobId,inputKey,config}` 引用，避免超过消息大小限制。
-- 不配置 `[[queues.consumers]]`。执行器使用 HTTP Pull，始终一次拉取一个任务。
+- D1 `jobs` 表：执行器通过单条原子 UPDATE 获取最旧的排队任务，并用租约过期时间恢复崩溃任务。
+- 不再要求 Cloudflare Queue HTTP Pull Token。Queue 可以保留作历史资源，但新任务分发以 D1 租约为唯一来源。
 
 ## 部署
 
@@ -21,34 +21,30 @@ npx wrangler d1 create readori-source-validator
 npx wrangler d1 migrations apply readori-source-validator --remote
 npx wrangler r2 bucket create readori-source-validator-inputs
 npx wrangler r2 bucket create readori-source-validator-results
-npx wrangler queues create readori-source-validation
 npx wrangler secret put CONTROL_API_KEY
 npx wrangler secret put EXECUTOR_TOKEN
 # 可选：限制浏览器来源
 npx wrangler secret put FRONTEND_ORIGIN
 npx wrangler deploy
-npx wrangler queues consumer http add readori-source-validation
 ```
 
 ### 专用部署仓库的一键 CI
 
-`test-env-setup` 仓库中的 `.github/workflows/deploy-readori-source-validator-cloudflare.yml` 是唯一的自动部署入口，只有 GitHub Actions 页面上的 `workflow_dispatch` 会触发，不响应 push、Pull Request 或定时器。工作流会从 `readori/readori-CheckSources` 拉取指定分支/标签/提交，校验 `cloudflare/` 文件，再执行 Wrangler dry-run；`deploy-and-migrate` 模式会按 `bootstrap_resources` 选项创建缺少的 D1、R2 bucket 和 Queue，应用远程 D1 migration，部署 Worker/Pages 静态控制台并更新加密 Worker secrets。可选 `health_url` 会在部署后执行重试健康检查。
+`test-env-setup` 仓库中的 `.github/workflows/deploy-readori-source-validator-cloudflare.yml` 是唯一的自动部署入口，只有 GitHub Actions 页面上的 `workflow_dispatch` 会触发，不响应 push、Pull Request 或定时器。工作流会从 `readori/readori-CheckSources` 拉取指定分支/标签/提交，校验 `cloudflare/` 文件，再执行 Wrangler dry-run；`deploy-and-migrate` 模式会按 `bootstrap_resources` 选项创建缺少的 D1、R2 bucket，应用远程 D1 migration，部署 Worker/Pages 静态控制台并更新加密 Worker secrets。可选 `health_url` 会在部署后执行重试健康检查。
 
 工作流的部署 job 绑定 GitHub `production` environment；建议在
 `readori/test-env-setup` → Settings → Environments → `production` → Environment secrets
 中配置敏感值。仓库级 Secrets 也兼容，但不要把这些值放到 Variables：
 
 - `TARGET_REPO_PAT`：只读访问 `readori-CheckSources` 的 fine-grained token；
-- `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`：具备 Worker、D1、R2、Queues 所需权限；
+- `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`：具备 Worker、D1、R2 所需权限；
 - `CONTROL_API_KEY`、`EXECUTOR_TOKEN`：分别对应 Worker 的 `wrangler secret put`；前者供 `/api/*` 使用，后者必须与 AMD Micro 的 `READORI_AMD_EXECUTOR_TOKEN` 完全一致；
 - 可选 `CLOUDFLARE_D1_DATABASE_ID`、`FRONTEND_ORIGIN`，不配置时工作流会从 Cloudflare 列表解析；
 - 手动运行时填写 `source_ref`、`mode`、`bootstrap_resources` 和可选 `health_url`。
 
 工作流不会调用源仓库的 Actions，也不会把 PAT、Worker token、Queue token 或 API key 写入日志。首次部署前先以 `dry-run` 检查权限和资源名称，再运行 `deploy-and-migrate`；如果非 dry-run 日志提示 `CONTROL_API_KEY` 或 `EXECUTOR_TOKEN` 缺失，说明该 Secret 未创建、名称拼写不一致，或被放到了未绑定的环境；AMD Micro 执行器仍需在服务器上单独安装和配置。
 
-资源清单由工作流通过 Cloudflare 官方 API 的 JSON 端点读取，以兼容 Wrangler 4.30+（`wrangler d1/r2/queues list` 不接受 `--json`）；创建和部署仍由 Wrangler 执行。
-
-HTTP Pull token需要账户级 Queues 读写权限。不要把该 Token、`EXECUTOR_TOKEN` 或 API Key 写入 Git、前端文件或日志。
+资源清单由工作流通过 Cloudflare 官方 API 的 JSON 端点读取，以兼容 Wrangler 4.30+（`wrangler d1/r2/queues list` 不接受 `--json`）；创建和部署仍由 Wrangler 执行。AMD 主机只需要 Worker URL 和 `EXECUTOR_TOKEN`，不需要账户级 Queues Token。
 
 ## AMD Micro 执行器
 
@@ -60,9 +56,6 @@ python3 -m venv /opt/readori-validator/.venv
 export READORI_VALIDATOR_EXECUTOR_PROFILE=amd-micro
 export READORI_AMD_EXECUTOR_BASE_URL=https://validator.example.com
 export READORI_AMD_EXECUTOR_TOKEN='same-as-cloudflare-secret'
-export READORI_CF_ACCOUNT_ID='...'
-export READORI_CF_QUEUE_ID='...'
-export READORI_CF_QUEUE_API_TOKEN='queue-read-write-token'
 export READORI_AMD_EXECUTOR_ID='amd-micro-01'
 /opt/readori-validator/.venv/bin/python -m server.amd_micro_executor --work-dir /var/lib/readori-validator
 ```
@@ -72,16 +65,13 @@ Ubuntu/Debian 可直接运行 `server/install_amd_micro.sh` 完成依赖、专�
 ```bash
 export READORI_AMD_EXECUTOR_BASE_URL='https://validator.example.com'
 export READORI_AMD_EXECUTOR_TOKEN='same-as-wrangler-EXECUTOR_TOKEN'
-export READORI_CF_ACCOUNT_ID='...'
-export READORI_CF_QUEUE_ID='...'
-export READORI_CF_QUEUE_API_TOKEN='...'
-sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN,READORI_CF_ACCOUNT_ID,READORI_CF_QUEUE_ID,READORI_CF_QUEUE_API_TOKEN \
+sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN \
   bash server/install_amd_micro.sh
 ```
 
 可选 `READORI_INSTALL_DIR`、`READORI_AMD_EXECUTOR_ID`、`READORI_AMD_WORK_DIR`、`READORI_AMD_POLL_SECONDS` 和 `READORI_SKIP_SYSTEMD=1`。1GB AMD Micro 默认单并发、每域名并发 1、最多两轮复测；脚本不会把 FastAPI/GUI 作为第二个常驻进程启动。
 
-推荐给实例配置 1–2GB swap 作为 OOM 兜底；执行器默认 `batch_size=1`、Queue 租约 12 小时、每源单并发、每域名并发 1。完整链路仍要求搜索→详情→目录→正文，不能因为连通性成功就把书源标记为可用。
+推荐给实例配置 1–2GB swap 作为 OOM 兜底；执行器默认 D1 租约 12 小时、每源单并发、每域名并发 1。完整链路仍要求搜索→详情→目录→正文，不能因为连通性成功就把书源标记为可用。
 
 ## Worker API
 
@@ -95,6 +85,7 @@ sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN,REA
 执行器内部接口（`EXECUTOR_TOKEN` + `x-executor-id`）：
 
 - `POST /internal/jobs/:id/claim`：原子租约，防止 Queue 重投导致重复运行。
+- `POST /internal/next`：AMD 执行器原子获取最旧排队任务；同一执行器有未过期租约时返回该任务用于断点恢复。
 - `GET /internal/jobs/:id/input`：读取 R2 输入。
 - `POST /internal/jobs/:id/progress`：批量上报阶段、源摘要和事件并续租。
 - `POST /internal/jobs/:id/result`：流入最终 JSON 到 R2 并完成任务。
@@ -102,4 +93,4 @@ sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN,REA
 
 ## 运行边界
 
-Cloudflare 控制面可以水平扩展，但 AMD Micro 执行器故意不扩容。要提速，只增加第二台执行器并使用独立 `executorId`，不要提高单台 AMD Micro 的线程数。部署后仍需用真实书源抽样检查 iOS 搜索、详情、目录和正文链路。
+Cloudflare 控制面可以水平扩展，但 AMD Micro 执行器故意不扩容。要提速，只增加第二台执行器并使用独立 `executorId`，不要提高单台 AMD Micro 的线程数。部署后仍需用真实书源抽样检查 iOS 搜索、详情、目录和正文链路。D1 租约接口替代了 Queue HTTP Pull，因此执行器不会因 Queue API 权限或 Token 轮换而停止取任务。

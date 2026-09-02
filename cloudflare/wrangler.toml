@@ -21,15 +21,14 @@ bucket_name = "readori-source-validator-inputs"
 binding = "RESULTS"
 bucket_name = "readori-source-validator-results"
 
-[[queues.producers]]
-binding = "VALIDATION_QUEUE"
-queue = "readori-source-validation"
-
 [vars]
 MAX_INPUT_BYTES = "33554432"
 MAX_RESULT_BYTES = "33554432"
 MAX_PROGRESS_BYTES = "1048576"
+# D1 leases are renewed by the executor progress endpoint. Keep the lease
+# bounded so a crashed AMD instance can be recovered without Queue Pull.
 QUEUE_VISIBILITY_TIMEOUT_MS = "43200000"
 
 # Set CONTROL_API_KEY, EXECUTOR_TOKEN, and FRONTEND_ORIGIN with `wrangler secret put`.
-# Do not add a queue consumer here: the AMD Micro executor uses HTTP Pull.
+# The AMD Micro executor polls `/internal/next`; no Queue REST token or binding
+# is required on the executor host.

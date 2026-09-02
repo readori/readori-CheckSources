@@ -1,9 +1,10 @@
-"""Single-concurrency Cloudflare Queue Pull executor for an AMD Micro VM.
+"""Single-concurrency D1 lease executor for an AMD Micro VM.
 
-The control plane owns durable task state and artifacts.  This process only
-leases one job, runs the existing local validation service with the AMD-safe
-profile, periodically reports bounded summaries, and acknowledges or retries
-the Queue message.  It deliberately does not start FastAPI or a GUI.
+The control plane owns durable task state and artifacts. This process leases
+one job at a time through the Worker D1 control API, runs the existing local
+validation service with the AMD-safe profile, and periodically reports bounded
+summaries. It deliberately does not start FastAPI, a GUI, or call the
+Cloudflare Queue REST API (which would require a second account-scoped token).
 """
 
 from __future__ import annotations
@@ -65,55 +66,6 @@ def _decode_queue_body(value: Any) -> dict[str, Any] | None:
         return None
 
 
-class QueueClient:
-    def __init__(self, account_id: str, queue_id: str, token: str, session: requests.Session | None = None):
-        if not account_id or not queue_id or not token:
-            raise ValueError("READORI_CF_ACCOUNT_ID, READORI_CF_QUEUE_ID and READORI_CF_QUEUE_API_TOKEN are required")
-        self.endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/queues/{queue_id}/messages"
-        self.session = session or requests.Session()
-        self.headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
-
-    def pull(self, visibility_timeout_ms: int, batch_size: int = 1) -> list[dict[str, Any]]:
-        response = self.session.post(
-            f"{self.endpoint}/pull",
-            headers=self.headers,
-            json={"visibility_timeout_ms": visibility_timeout_ms, "batch_size": max(1, min(1, batch_size))},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("success") is False:
-            raise RuntimeError(f"queue pull failed: {payload.get('errors')}")
-        result = payload.get("result") or {}
-        messages = result.get("messages") or []
-        return [message for message in messages if isinstance(message, dict)]
-
-    def acknowledge(self, lease_ids: list[str]) -> None:
-        if not lease_ids:
-            return
-        response = self.session.post(
-            f"{self.endpoint}/ack",
-            headers=self.headers,
-            json={"acks": [{"lease_id": lease_id} for lease_id in lease_ids], "retries": []},
-            timeout=30,
-        )
-        response.raise_for_status()
-
-    def retry(self, lease_ids: list[str], delay_seconds: int = 30) -> None:
-        if not lease_ids:
-            return
-        response = self.session.post(
-            f"{self.endpoint}/ack",
-            headers=self.headers,
-            json={
-                "acks": [],
-                "retries": [{"lease_id": lease_id, "delay_seconds": max(1, min(86400, delay_seconds))} for lease_id in lease_ids],
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-
-
 class ControlPlaneClient:
     def __init__(self, base_url: str, token: str, executor_id: str, session: requests.Session | None = None):
         self.base_url = base_url.rstrip("/")
@@ -145,13 +97,21 @@ class ControlPlaneClient:
         payload = self._request("GET", f"/internal/jobs/{job_id}")
         return payload if isinstance(payload, dict) else {}
 
+    def next_job(self) -> dict[str, Any] | None:
+        """Atomically lease the next queued job through the Worker control plane."""
+
+        payload = self._request("POST", "/internal/next", json={}, timeout=30)
+        if not isinstance(payload, dict):
+            return None
+        job = payload.get("job")
+        return job if isinstance(job, dict) else None
+
     def claim(self, job_id: str) -> dict[str, Any]:
         try:
             payload = self._request("POST", f"/internal/jobs/{job_id}/claim", json={})
         except RuntimeError as error:
-            # A redelivered Queue message can point at a job already leased by
-            # another executor or completed after a network retry.  Treat the
-            # conflict as a safe no-op instead of retrying a poison message.
+            # Keep the legacy explicit-claim method safe for older control
+            # clients; the current executor obtains jobs through /internal/next.
             if "(409)" in str(error):
                 return {"claimed": False}
             raise
@@ -223,9 +183,8 @@ def source_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class AMDMicroExecutor:
-    def __init__(self, control: ControlPlaneClient, queue: QueueClient, work_dir: Path, poll_seconds: float = 2.0, retain_completed: bool = True):
+    def __init__(self, control: ControlPlaneClient, work_dir: Path, poll_seconds: float = 2.0, retain_completed: bool = True):
         self.control = control
-        self.queue = queue
         self.work_dir = work_dir.expanduser().resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.poll_seconds = max(1.0, min(15.0, poll_seconds))
@@ -290,26 +249,17 @@ class AMDMicroExecutor:
             service.submit(job_id)
         return store, service
 
-    def process_message(self, message: dict[str, Any]) -> str:
-        lease_id = str(message.get("lease_id") or "")
-        job_payload = _decode_queue_body(message.get("body"))
-        if not lease_id or not job_payload:
-            if lease_id:
-                self.queue.acknowledge([lease_id])
-            return "discarded-invalid-message"
-        job_id = str(job_payload.get("jobId") or "").strip()
+    def process_job(self, cloud_job: dict[str, Any]) -> str:
+        """Run one already-leased cloud job and settle it through D1."""
+
+        job_id = str(cloud_job.get("id") or cloud_job.get("jobId") or "").strip()
         if not job_id:
-            self.queue.acknowledge([lease_id])
             return "discarded-missing-job"
-        attempts = max(1, int(message.get("attempts") or 1))
+        attempts = max(1, int(cloud_job.get("attemptCount") or 1))
         max_attempts = _env_int("READORI_AMD_MAX_ATTEMPTS", 3, 1, 10)
         store: JobStore | None = None
         service: ValidationService | None = None
         try:
-            cloud_job = self.control.claim(job_id)
-            if cloud_job.get("claimed") is False:
-                self.queue.acknowledge([lease_id])
-                return "skipped-already-leased"
             sources = self.control.input_sources(job_id)
             store, service = self._run_local_job(job_id, cloud_job, sources)
             last_event = 0
@@ -329,20 +279,14 @@ class AMDMicroExecutor:
                 if status == "completed":
                     result = self._write_result(job_id, service, store)
                     self.control.upload_result(job_id, result, self._result_count(result))
-                    self.queue.acknowledge([lease_id])
                     return "completed"
                 if status == "cancelled":
                     self.control.cancelled(job_id)
-                    self.queue.acknowledge([lease_id])
                     return "cancelled"
                 if status == "failed":
                     error = str(local.get("error") or "local validator failed")
                     retryable = attempts < max_attempts
                     self.control.fail(job_id, error, retryable=retryable)
-                    if retryable:
-                        self.queue.retry([lease_id], delay_seconds=min(300, 30 * attempts))
-                    else:
-                        self.queue.acknowledge([lease_id])
                     return "failed-retry" if retryable else "failed-final"
                 time.sleep(self.poll_seconds)
         except Exception as error:
@@ -351,13 +295,6 @@ class AMDMicroExecutor:
                 self.control.fail(job_id, str(error), retryable=attempts < max_attempts)
             except Exception:
                 LOG.exception("could not report failure for %s", job_id)
-            try:
-                if attempts < max_attempts:
-                    self.queue.retry([lease_id], delay_seconds=min(300, 30 * attempts))
-                else:
-                    self.queue.acknowledge([lease_id])
-            except Exception:
-                LOG.exception("could not settle Queue lease for %s", job_id)
             return "exception-retry" if attempts < max_attempts else "exception-final"
         finally:
             if service is not None:
@@ -381,22 +318,19 @@ class AMDMicroExecutor:
             return 0
 
     def run_forever(self) -> None:
-        visibility = _env_int("READORI_CF_QUEUE_VISIBILITY_TIMEOUT_MS", 43200000, 60000, 43200000)
         idle_sleep = max(1.0, min(30.0, float(os.environ.get("READORI_AMD_IDLE_SLEEP", "3"))))
-        LOG.info("AMD Micro executor %s started; batch_size=1 workers=1", self.control.executor_id)
+        LOG.info("AMD Micro executor %s started; D1 lease mode workers=1", self.control.executor_id)
         while True:
             try:
-                messages = self.queue.pull(visibility, batch_size=1)
+                cloud_job = self.control.next_job()
             except Exception:
-                LOG.exception("Queue pull failed; retrying after %.1fs", idle_sleep)
+                LOG.exception("D1 lease poll failed; retrying after %.1fs", idle_sleep)
                 time.sleep(idle_sleep)
                 continue
-            if not messages:
+            if not cloud_job:
                 time.sleep(idle_sleep)
                 continue
-            # The queue client enforces batch_size=1.  Keep the loop explicit
-            # so a future config change cannot create parallel work on 1 GB.
-            self.process_message(messages[0])
+            self.process_job(cloud_job)
 
 
 def build_executor_from_env(work_dir: Path, poll_seconds: float, retain_completed: bool) -> AMDMicroExecutor:
@@ -406,17 +340,13 @@ def build_executor_from_env(work_dir: Path, poll_seconds: float, retain_complete
         os.environ.get("READORI_AMD_EXECUTOR_TOKEN", ""),
         executor_id,
     )
-    queue = QueueClient(
-        os.environ.get("READORI_CF_ACCOUNT_ID", ""),
-        os.environ.get("READORI_CF_QUEUE_ID", ""),
-        os.environ.get("READORI_CF_QUEUE_API_TOKEN", ""),
-        control.session,
-    )
-    return AMDMicroExecutor(control, queue, work_dir, poll_seconds=poll_seconds, retain_completed=retain_completed)
+    if not control.base_url or not control.token:
+        raise ValueError("READORI_AMD_EXECUTOR_BASE_URL and READORI_AMD_EXECUTOR_TOKEN are required")
+    return AMDMicroExecutor(control, work_dir, poll_seconds=poll_seconds, retain_completed=retain_completed)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run one Cloudflare Queue task at a time on an AMD Micro VM")
+    parser = argparse.ArgumentParser(description="Run one D1-leased task at a time on an AMD Micro VM")
     parser.add_argument("--work-dir", type=Path, default=Path(os.environ.get("READORI_AMD_WORK_DIR", "/var/lib/readori-validator")))
     parser.add_argument("--poll-seconds", type=float, default=float(os.environ.get("READORI_AMD_POLL_SECONDS", "2")))
     parser.add_argument("--retain-completed", action=argparse.BooleanOptionalAction, default=True)

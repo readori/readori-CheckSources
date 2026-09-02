@@ -16,7 +16,7 @@ $env:READORI_VALIDATOR_DB = "D:\Readzen\readori-shuyuan\server\data\validator.sq
 
 ### AMD Micro 一键安装
 
-Cloudflare 控制面方案中的 AMD Micro 只运行 Queue Pull 执行器，不启动 FastAPI、GUI 或多并发任务。Ubuntu/Debian 服务器可使用 `install_amd_micro.sh` 自动安装 Python/Node/7-Zip 依赖、创建低权限 `readori` 用户、建立虚拟环境、写入 0600 环境文件并启用 systemd：
+Cloudflare 控制面方案中的 AMD Micro 只运行 D1 租约执行器，不启动 FastAPI、GUI 或多并发任务。Ubuntu/Debian 服务器可使用 `install_amd_micro.sh` 自动安装 Python/Node/7-Zip 依赖、创建低权限 `readori` 用户、建立虚拟环境、写入 0600 环境文件并启用 systemd：
 
 如果 SSH 端只需要下载 `server/`，安装器会在执行时从同一仓库和分支自动补齐 `validator/`、`requirements-validate-sources.txt` 与 `requirements.txt` 四个最小运行文件，不会检出或复制仓库其它目录。公共仓库无需 GitHub token；私有仓库可额外设置 `READORI_SOURCE_TOKEN`（只通过请求头使用，不写入命令行或日志）。
 
@@ -38,10 +38,7 @@ git sparse-checkout set server
 cd /opt/readori-source-validator
 export READORI_AMD_EXECUTOR_BASE_URL='https://validator.example.com'
 export READORI_AMD_EXECUTOR_TOKEN='same-as-cloudflare-EXECUTOR_TOKEN'
-export READORI_CF_ACCOUNT_ID='cloudflare-account-id'
-export READORI_CF_QUEUE_ID='queue-id-not-name'
-export READORI_CF_QUEUE_API_TOKEN='queue-http-pull-token'
-sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN,READORI_CF_ACCOUNT_ID,READORI_CF_QUEUE_ID,READORI_CF_QUEUE_API_TOKEN \
+sudo --preserve-env=READORI_AMD_EXECUTOR_BASE_URL,READORI_AMD_EXECUTOR_TOKEN \
   bash server/install_amd_micro.sh
 ```
 

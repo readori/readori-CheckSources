@@ -622,8 +622,6 @@ def _source_url_part(url: str) -> tuple[str, dict[str, Any]]:
     """Extract the network URL from a Legado serialized source identity."""
 
     raw = normalize_book_source_url(url)
-    # Some exports prepend a display marker (for example ``[图片]``) before
-    # the actual URL.  It is not part of the source identity or request URL.
     match = re.search(r"https?://", raw, flags=re.I)
     if match and match.start() > 0:
         raw = raw[match.start():]
@@ -635,14 +633,7 @@ def _source_url_part(url: str) -> tuple[str, dict[str, Any]]:
 
 
 def canonical_source_site_key(source_or_url: dict[str, Any] | str) -> str:
-    """Return a cosmetic-insensitive site key without changing serialized URLs.
-
-    Fragments used as export labels, trailing slashes, host case, default ports,
-    and query ordering are ignored.  Query values remain part of the key because
-    some sources use them as a real API/base selector.  The scheme is omitted so
-    HTTP/HTTPS exports of the same site can share one validation group; the
-    selected source keeps its original URL in output.
-    """
+    """Return a cosmetic-insensitive site key without changing source URLs."""
 
     raw = source_or_url if isinstance(source_or_url, str) else str(source_or_url.get("bookSourceUrl") or "")
     url_part, _ = _source_url_part(raw)
@@ -677,38 +668,26 @@ def canonical_source_site_key(source_or_url: dict[str, Any] | str) -> str:
 
 
 _RULE_FINGERPRINT_FIELDS = (
-    "bookSourceType",
-    "searchUrl",
-    "exploreUrl",
-    "bookUrlPattern",
-    "ruleSearch",
-    "ruleExplore",
-    "ruleBookInfo",
-    "ruleToc",
-    "ruleContent",
-    "header",
-    "loginUrl",
-    "loginUi",
-    "loginCheckJs",
-    "jsLib",
-    "enabledCookieJar",
-    "enabledExplore",
-    "concurrentRate",
+    "bookSourceType", "searchUrl", "exploreUrl", "bookUrlPattern", "ruleSearch", "ruleExplore",
+    "ruleBookInfo", "ruleToc", "ruleContent", "header", "loginUrl", "loginUi",
+    "loginCheckJs", "jsLib", "enabledCookieJar", "enabledExplore", "concurrentRate",
 )
 
 
 def _stable_rule_value(value: Any) -> Any:
-    """Canonicalize JSON values while preserving rule/list ordering."""
-
     if isinstance(value, dict):
         return {str(key): _stable_rule_value(value[key]) for key in sorted(value, key=lambda item: str(item))}
     if isinstance(value, list):
         return [_stable_rule_value(item) for item in value]
     if isinstance(value, str):
         text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+        # URL cosmetics inside search/explore/login rules should not produce
+        # a different fingerprint.  Keep templates and all non-URL rule text
+        # untouched while canonicalizing embedded HTTP(S) endpoints.
         def normalize_embedded_url(match: re.Match[str]) -> str:
             site = canonical_source_site_key(match.group(0))
             return f"https://{site}" if site else match.group(0)
+
         return re.sub(r"https?://[^\s'\"<>`]+", normalize_embedded_url, text, flags=re.I)
     return value
 
@@ -730,15 +709,10 @@ def source_rule_fingerprint(source: dict[str, Any]) -> str:
 
 
 def source_dedupe_key(source: dict[str, Any]) -> str:
-    """Combine normalized site identity and behavior fingerprint."""
-
-    site = canonical_source_site_key(source)
-    return f"site:{site}|rule:{source_rule_fingerprint(source)}"
+    return f"site:{canonical_source_site_key(source)}|rule:{source_rule_fingerprint(source)}"
 
 
 def normalize_book_identity(value: Any) -> str:
-    """Normalize title/author text for post-validation aggregation."""
-
     text = html_unescape(unicodedata.normalize("NFKC", str(value or ""))).strip().casefold()
     text = re.sub(r"^(?:作者|author)\s*[:：]\s*", "", text)
     return "".join(char for char in text if char.isalnum())
@@ -752,22 +726,13 @@ def _detail_book_identity(record: dict[str, Any], detail: dict[str, Any] | None)
         return None
     author = normalize_book_identity(metadata.get("bookAuthor") or detail.get("detailBookAuthor"))
     sample = canonical_source_site_key(str(metadata.get("sampleBookUrl") or detail.get("sampleBookUrl") or ""))
-    # If no author was extracted, only collapse a same-site variant when its
-    # sampled detail URL is also the same.  This avoids deleting two different
-    # books that happen to share a title.
     return title, author, sample
 
 
 def aggregate_validated_sources(
     entries: Iterable[tuple[str, dict[str, Any], dict[str, Any] | None]],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Collapse same-site validated variants by normalized title and author.
-
-    Distinct sites are intentionally retained: the validator's sample keyword
-    can return the same book from many independent providers, and deleting
-    those providers would reduce Readori coverage.  The book/author layer only
-    removes variants from one canonical site that resolve to the same book.
-    """
+    """Collapse same-site validated variants by normalized title and author."""
 
     groups: dict[tuple[str, str, str, str], list[tuple[str, dict[str, Any], dict[str, Any] | None]]] = {}
     passthrough: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
@@ -783,28 +748,15 @@ def aggregate_validated_sources(
             passthrough.append((group_key, record, detail))
             continue
         groups.setdefault((canonical_source_site_key(record), title, author, "" if author else sample), []).append((group_key, record, detail))
-
     selected: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = list(passthrough)
     duplicate_groups = 0
     for candidates in groups.values():
         if len(candidates) > 1:
             duplicate_groups += 1
-        candidates.sort(
-            key=lambda item: (
-                -score_candidate(item[1]),
-                int(item[1].get("respondTime") or 0),
-                str(item[1].get("bookSourceName") or "").casefold(),
-                str(item[1].get("bookSourceUrl") or ""),
-            )
-        )
+        candidates.sort(key=lambda item: (-score_candidate(item[1]), int(item[1].get("respondTime") or 0), str(item[1].get("bookSourceName") or "").casefold(), str(item[1].get("bookSourceUrl") or "")))
         selected.append(candidates[0])
     selected.sort(key=lambda item: (canonical_source_site_key(item[1]), str(item[1].get("bookSourceName") or "").casefold()))
-    return [record for _, record, _ in selected], {
-        "input": input_count,
-        "output": len(selected),
-        "removed": max(0, input_count - len(selected)),
-        "duplicateGroups": duplicate_groups,
-    }
+    return [record for _, record, _ in selected], {"input": input_count, "output": len(selected), "removed": max(0, input_count - len(selected)), "duplicateGroups": duplicate_groups}
 
 
 def normalized_book_candidate_url_for_comparison(url: str) -> str:
@@ -1016,9 +968,6 @@ def group_sources(sources: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
     for src in sources:
         if not normalize_book_source_url(str(src.get("bookSourceUrl") or "")):
             continue
-        # A source URL is only the serialized identity.  Group cosmetic URL
-        # variants by canonical site and keep genuinely different rules as
-        # separate candidates via the behavior fingerprint.
         groups.setdefault(source_dedupe_key(src), []).append(src)
     for items in groups.values():
         items.sort(key=score_candidate, reverse=True)
@@ -11981,9 +11930,7 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             runtime2.book_name = name
     if str(info_rule.get("author") or "").strip():
         author_values = evaluate_rule(
-            str(info_rule.get("author")),
-            html,
-            runtime2,
+            str(info_rule.get("author")), html, runtime2,
             "json" if is_json_content(html) else "html",
         )
         if author_values:
@@ -13314,8 +13261,6 @@ def _empty_detail(src: dict[str, Any]) -> dict[str, Any]:
 
 
 def _group_source_url(group_key: str, candidates: list[dict[str, Any]]) -> str:
-    """Return a serialized source URL for diagnostics, not a composite key."""
-
     for candidate in candidates:
         value = normalize_book_source_url(str(candidate.get("bookSourceUrl") or ""))
         if value:
@@ -14004,7 +13949,7 @@ def run_staged_pipeline(
     idle_timeout: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Execute dedupe → quick scan → full chain → stability re-test."""
-    print(f"Pipeline dedupe: {len(urls)} unique source URLs (deterministic, single pass).", flush=True)
+    print(f"Pipeline dedupe: {len(urls)} unique source groups (canonical site + rule fingerprint).", flush=True)
     quick_passed, quick_seeds, quick_details, quick_timed_out = run_parallel_stage(
         "quick-scan",
         sorted(urls),
@@ -14075,47 +14020,20 @@ def run_staged_pipeline(
         final_urls = {url for url, count in pass_counts.items() if count >= min_pass_rounds}
     else:
         final_urls = candidate_urls
-    final_entries = [
-        (url, best_records[url], all_details.get(url))
-        for url in urls
-        if url in final_urls and url in best_records
-    ]
+    final_entries = [(url, best_records[url], all_details.get(url)) for url in urls if url in final_urls and url in best_records]
     passed, book_aggregation = aggregate_validated_sources(final_entries)
-    # Internal metadata is used to aggregate server/CLI results but is not a
-    # Legado source field and must never leak into the App-ready JSON export.
     for record in passed:
         record.pop("__readoriValidation", None)
     passed.sort(key=lambda item: (canonical_source_site_key(item), str(item.get("bookSourceName") or "")))
     report_results = list(all_details.values())
     report_results.sort(key=lambda item: (normalize_book_source_url(str(item.get("bookSourceUrl") or "")), str(item.get("bookSourceName") or "")))
-    canonical_sites = {
-        canonical_source_site_key(candidates[0])
-        for candidates in groups.values()
-        if candidates and canonical_source_site_key(candidates[0])
-    }
-    rule_fingerprints = {
-        source_rule_fingerprint(candidates[0])
-        for candidates in groups.values()
-        if candidates
-    }
+    canonical_sites = {canonical_source_site_key(candidates[0]) for candidates in groups.values() if candidates and canonical_source_site_key(candidates[0])}
+    rule_fingerprints = {source_rule_fingerprint(candidates[0]) for candidates in groups.values() if candidates}
     pipeline = {
-        "dedupe": {
-            "records": total_records,
-            "uniqueSourceUrls": len(urls),
-            "uniqueSourceGroups": len(urls),
-            "canonicalSites": len(canonical_sites),
-            "ruleFingerprints": len(rule_fingerprints),
-        },
+        "dedupe": {"records": total_records, "uniqueSourceUrls": len(urls), "uniqueSourceGroups": len(urls), "canonicalSites": len(canonical_sites), "ruleFingerprints": len(rule_fingerprints)},
         "quickScan": {"candidates": len(urls), "passed": len(quick_passed), "timeoutSeconds": max(0, quick_timeout), "workers": max_workers},
         "fullValidation": {"candidates": len(quick_passed), "passed": len(full_passed), "timeoutSeconds": max(0, source_timeout), "workers": max_workers},
-        "stabilityRetest": {
-            "roundsRequested": rounds,
-            "roundsCompleted": stability_completed_rounds,
-            "initialCandidates": len(full_passed),
-            "finalPassed": len(final_urls),
-            "timedOut": stability_timed_out,
-            "workers": max_workers,
-        },
+        "stabilityRetest": {"roundsRequested": rounds, "roundsCompleted": stability_completed_rounds, "initialCandidates": len(full_passed), "finalPassed": len(final_urls), "timedOut": stability_timed_out, "workers": max_workers},
         "bookAggregation": book_aggregation,
     }
     summary = {
@@ -14182,16 +14100,8 @@ def main() -> int:
         urls = urls[: args.limit]
         groups = {u: groups[u] for u in urls}
 
-    canonical_sites = {
-        canonical_source_site_key(candidates[0])
-        for candidates in groups.values()
-        if candidates and canonical_source_site_key(candidates[0])
-    }
-    print(
-        f"Loaded {len(sources)} records from {len(input_files)} file(s), "
-        f"{len(urls)} unique source groups ({len(canonical_sites)} canonical sites).",
-        flush=True,
-    )
+    canonical_sites = {canonical_source_site_key(candidates[0]) for candidates in groups.values() if candidates and canonical_source_site_key(candidates[0])}
+    print(f"Loaded {len(sources)} records from {len(input_files)} file(s), {len(urls)} unique source groups ({len(canonical_sites)} canonical sites).", flush=True)
     if input_files:
         for name in input_files[:12]:
             print(f"  - {name}", flush=True)

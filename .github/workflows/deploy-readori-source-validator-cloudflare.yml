@@ -156,7 +156,6 @@ jobs:
           worker_name = str(data.get("name", "")).strip()
           d1 = (data.get("d1_databases") or [{}])[0]
           r2 = data.get("r2_buckets") or []
-          queue = (data.get("queues", {}).get("producers") or [{}])[0]
           input_r2 = next((item for item in r2 if str(item.get("binding", "")).upper() == "INPUTS"), None)
           result_r2 = next((item for item in r2 if str(item.get("binding", "")).upper() == "RESULTS"), None)
           input_r2 = input_r2 or (r2[0] if r2 else {})
@@ -167,9 +166,8 @@ jobs:
               "D1_DATABASE_ID_FROM_SOURCE": str(d1.get("database_id", "")).strip(),
               "INPUT_BUCKET_NAME": str(input_r2.get("bucket_name", "")).strip(),
               "RESULT_BUCKET_NAME": str(result_r2.get("bucket_name", "")).strip(),
-              "QUEUE_NAME": str(queue.get("queue", "")).strip(),
           }
-          required = ("WORKER_NAME", "D1_DATABASE_NAME", "INPUT_BUCKET_NAME", "RESULT_BUCKET_NAME", "QUEUE_NAME")
+          required = ("WORKER_NAME", "D1_DATABASE_NAME", "INPUT_BUCKET_NAME", "RESULT_BUCKET_NAME")
           missing = [name for name in required if not values[name]]
           if missing:
               raise SystemExit("::error::wrangler.toml is missing: " + ", ".join(missing))
@@ -185,7 +183,7 @@ jobs:
           cat "$RUNNER_TEMP/readori-source-validator-config.env" >> "$GITHUB_ENV"
           while IFS='=' read -r key value; do
             case "$key" in
-              WORKER_NAME|D1_DATABASE_NAME|INPUT_BUCKET_NAME|RESULT_BUCKET_NAME|QUEUE_NAME)
+              WORKER_NAME|D1_DATABASE_NAME|INPUT_BUCKET_NAME|RESULT_BUCKET_NAME)
                 [[ "$value" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || {
                   echo "::error::Invalid $key from wrangler.toml; only letters, digits, dot, underscore and hyphen are allowed"
                   exit 1
@@ -197,7 +195,6 @@ jobs:
           echo "D1: ${D1_DATABASE_NAME:-unknown}"
           echo "R2 input: ${INPUT_BUCKET_NAME:-unknown}"
           echo "R2 result: ${RESULT_BUCKET_NAME:-unknown}"
-          echo "Queue: ${QUEUE_NAME:-unknown}"
 
       - name: Resolve and optionally bootstrap Cloudflare resources
         working-directory: ${{ github.workspace }}/source-validator/cloudflare
@@ -288,18 +285,8 @@ jobs:
           [ -n "$INPUT_BUCKET_EXISTS" ] || { echo "::error::R2 bucket '$INPUT_BUCKET_NAME' was not found."; exit 1; }
           [ -n "$RESULT_BUCKET_EXISTS" ] || { echo "::error::R2 bucket '$RESULT_BUCKET_NAME' was not found."; exit 1; }
 
-          cloudflare_api_get "/queues" "$RUNNER_TEMP/readori-queues.json"
-          QUEUE_ID="$(resource_value queue "$RUNNER_TEMP/readori-queues.json" "$QUEUE_NAME")"
-          if [ -z "$QUEUE_ID" ] && [ "$DEPLOY_MODE" != "dry-run" ] && [ "$BOOTSTRAP_RESOURCES" = "true" ]; then
-            npx wrangler queues create "$QUEUE_NAME"
-            cloudflare_api_get "/queues" "$RUNNER_TEMP/readori-queues.json"
-            QUEUE_ID="$(resource_value queue "$RUNNER_TEMP/readori-queues.json" "$QUEUE_NAME")"
-          fi
-          [ -n "$QUEUE_ID" ] || { echo "::error::Queue '$QUEUE_NAME' was not found."; exit 1; }
-
           {
             echo "RESOLVED_D1_DATABASE_ID=$RESOLVED_D1_DATABASE_ID"
-            echo "QUEUE_ID=$QUEUE_ID"
           } >> "$GITHUB_ENV"
           echo "Resolved Cloudflare resource identifiers (secret values are not printed)."
 
@@ -395,7 +382,6 @@ jobs:
             echo "- Worker: \`${WORKER_NAME:-unresolved}\`"
             echo "- D1: \`${D1_DATABASE_NAME:-unresolved}\`"
             echo "- R2 input/result: \`${INPUT_BUCKET_NAME:-unresolved}\`, \`${RESULT_BUCKET_NAME:-unresolved}\`"
-            echo "- Queue: \`${QUEUE_NAME:-unresolved}\`"
             echo "- Private repository Actions invoked: **No**"
             echo "- Secret values copied to GitHub logs: **No**"
             echo "- AMD Micro executor remains a separate systemd service; this job deploys only the Cloudflare control plane."

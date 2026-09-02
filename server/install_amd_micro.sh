@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Readori source-validator Queue executor on a small Ubuntu/Debian VM.
+# Install the Readori source-validator D1 lease executor on a small Ubuntu/Debian VM.
 #
 # The script is intentionally non-interactive: provide Cloudflare values through
 # environment variables (or source an untracked env file) so credentials never
@@ -7,9 +7,6 @@
 # Required variables:
 #   READORI_AMD_EXECUTOR_BASE_URL  Cloudflare Worker URL (https://...)
 #   READORI_AMD_EXECUTOR_TOKEN     same value as Worker EXECUTOR_TOKEN
-#   READORI_CF_ACCOUNT_ID          Cloudflare account id
-#   READORI_CF_QUEUE_ID            Queue id, not the queue name
-#   READORI_CF_QUEUE_API_TOKEN     account Queue HTTP Pull read/write token
 #
 # Optional variables:
 #   READORI_SOURCE_REPOSITORY (default readori/readori-CheckSources)
@@ -223,9 +220,6 @@ create_virtualenv() {
 write_env_file() {
   require_value READORI_AMD_EXECUTOR_BASE_URL
   require_value READORI_AMD_EXECUTOR_TOKEN
-  require_value READORI_CF_ACCOUNT_ID
-  require_value READORI_CF_QUEUE_ID
-  require_value READORI_CF_QUEUE_API_TOKEN
 
   local executor_id="${READORI_AMD_EXECUTOR_ID:-amd-micro-$(hostname -s 2>/dev/null || hostname)}"
   local poll_seconds="${READORI_AMD_POLL_SECONDS:-3}"
@@ -248,21 +242,24 @@ write_env_file() {
   {
     printf 'READORI_AMD_EXECUTOR_BASE_URL=%s\n' "$(env_quote "$READORI_AMD_EXECUTOR_BASE_URL")"
     printf 'READORI_AMD_EXECUTOR_TOKEN=%s\n' "$(env_quote "$READORI_AMD_EXECUTOR_TOKEN")"
-    printf 'READORI_CF_ACCOUNT_ID=%s\n' "$(env_quote "$READORI_CF_ACCOUNT_ID")"
-    printf 'READORI_CF_QUEUE_ID=%s\n' "$(env_quote "$READORI_CF_QUEUE_ID")"
-    printf 'READORI_CF_QUEUE_API_TOKEN=%s\n' "$(env_quote "$READORI_CF_QUEUE_API_TOKEN")"
     printf 'READORI_AMD_EXECUTOR_ID=%s\n' "$(env_quote "$executor_id")"
     printf 'READORI_VALIDATOR_EXECUTOR_PROFILE=amd-micro\n'
     printf 'READORI_AMD_WORK_DIR=%s\n' "$(env_quote "$WORK_DIR")"
     printf 'READORI_AMD_POLL_SECONDS=%s\n' "$(env_quote "$poll_seconds")"
     printf 'READORI_AMD_MAX_ATTEMPTS=%s\n' "$(env_quote "$max_attempts")"
-    printf 'READORI_CF_QUEUE_VISIBILITY_TIMEOUT_MS=43200000\n'
     printf 'PYTHONUNBUFFERED=1\n'
   } > "$temp_file"
   chown root:root "$temp_file"
   chmod 0600 "$temp_file"
   mv -f "$temp_file" "$ENV_FILE"
   trap - RETURN
+}
+
+validate_runtime_configuration() {
+  # Fail before apt/pip work so a missing secret cannot waste time or leave a
+  # partially prepared host after a disconnected SSH session.
+  require_value READORI_AMD_EXECUTOR_BASE_URL
+  require_value READORI_AMD_EXECUTOR_TOKEN
 }
 
 write_systemd_unit() {
@@ -320,6 +317,7 @@ start_service() {
 main() {
   require_root
   [ -f "$SOURCE_ROOT/server/amd_micro_executor.py" ] || die "server/amd_micro_executor.py is missing; sparse checkout must include server/"
+  validate_runtime_configuration
   install_os_dependencies
   bootstrap_minimal_runtime_files
   copy_project

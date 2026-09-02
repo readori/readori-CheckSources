@@ -17,7 +17,6 @@ configure ``READORI_VALIDATOR_API_KEY`` and ``READORI_VALIDATOR_DB``.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import hmac
 import json
 import logging
@@ -128,26 +127,16 @@ def _model_dump(value: Any) -> dict[str, Any]:
 
 
 def canonical_source_key(source: dict[str, Any]) -> str:
-    """Build the three-layer source key without changing serialized URLs.
-
-    The shared validator core normalizes cosmetic site URL differences and
-    appends a behavior fingerprint, so identical rules from historical exports
-    become one group while genuinely different rules remain available as
-    separate candidates.
-    """
+    """Combine canonical site identity and behavior rule fingerprint."""
 
     return core.source_dedupe_key(source)
 
 
 def canonical_source_site_key(source: dict[str, Any]) -> str:
-    """Expose the normalized site portion for API/report diagnostics."""
-
     return core.canonical_source_site_key(source)
 
 
 def source_rule_fingerprint(source: dict[str, Any]) -> str:
-    """Expose the behavior fingerprint for API/report diagnostics."""
-
     return core.source_rule_fingerprint(source)
 
 
@@ -167,7 +156,7 @@ def source_domain(source: dict[str, Any]) -> str:
 
 
 def prepare_source_groups(sources: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Dedupe imports while retaining only same-site/same-rule variants."""
+    """Dedupe imports by canonical site plus rule fingerprint."""
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for source in sources:
@@ -968,12 +957,7 @@ def create_app(settings: ServerSettings | None = None) -> Any:
         if job.get("status") != "completed":
             raise HTTPException(status_code=409, detail="job is not completed")
         sources = service.result(job_id)
-        return {
-            "jobId": job_id,
-            "sourceCount": len(sources),
-            "sourceGroupCount": job["passed_count"],
-            "sources": sources,
-        }
+        return {"jobId": job_id, "sourceCount": len(sources), "sourceGroupCount": job["passed_count"], "sources": sources}
 
     @app.post("/v1/jobs/{job_id}/cancel", dependencies=[Depends(authorize)])
     def cancel_job(job_id: str) -> Any:
