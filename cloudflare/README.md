@@ -38,6 +38,52 @@ journalctl -u readori-source-validator.service -n 50 --no-pager
 
 服务器必须通过 HTTPS 对 Worker 可访问。可用 Caddy/Nginx 反代 `127.0.0.1:8787`，只开放反代端口，不要直接暴露 SQLite 或工作目录。
 
+## 升级已部署的 AMD Micro + Worker
+
+顺序固定：**先升级服务器，再部署 Worker**。只更新 Worker 时，新接口（如 `/api/debug/*`）会拿到服务器的 404。
+
+### 1. 升级 AMD Micro
+
+SSH 登录服务器，进入当初克隆的目录（默认 `/opt/readori-source-validator`）：
+
+```bash
+cd /opt/readori-source-validator
+git pull --ff-only
+sudo bash server/install_amd_micro.sh
+```
+
+- API key 自动复用 `/etc/readori-validator/amd-micro.env` 里的值，无需再导出；要轮换时临时导出 `READORI_VALIDATOR_API_KEY`，并同步更新 Worker 的 `VALIDATOR_SERVER_TOKEN`。
+- 监听地址 / 端口**不会**从旧环境文件读取：如果当初改过 `READORI_VALIDATOR_HOST` / `READORI_VALIDATOR_PORT`，升级时要重新导出并用 `sudo --preserve-env=READORI_VALIDATOR_HOST,READORI_VALIDATOR_PORT` 传入，否则恢复默认 `0.0.0.0:8787`。
+- 只检出 `server/` 的目录里，`validator/` 是安装脚本下载的，`git pull` 不会更新它。安装脚本发现 `.readori-runtime-bootstrapped` 标记或稀疏检出不含 `validator/` 时会自动重新下载最新的 `validator/` 与依赖清单；需要时可设 `READORI_REFRESH_RUNTIME=1` 强制刷新。
+- 脚本会更新虚拟环境依赖、`py_compile` 校验所有模块、重启服务并轮询健康检查；失败时直接报错并打印 `journalctl` 日志。
+
+确认：
+
+```bash
+systemctl is-active readori-source-validator.service
+curl --fail http://127.0.0.1:8787/healthz
+journalctl -u readori-source-validator.service -n 50 --no-pager
+```
+
+### 2. 部署 Worker 与页面
+
+在本机 `readori-CheckSources` 检出目录拉取最新代码后，进入 `cloudflare/`：
+
+```bash
+openssl rand -hex 32                                       # 生成访问令牌（不要与服务器 API key 相同）
+npx wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN     # 首次升级到带访问令牌的版本时必做
+npx wrangler deploy
+```
+
+- 未设置 `READORI_VALIDATOR_ACCESS_TOKEN` 时 Worker 对受保护接口一律返回 503；已设置过则无需重复写入（轮换时重新 `secret put` 即可，立即生效）。
+- 使用 `test-env-setup` 的手动部署工作流时，先在 production 环境配置同名 secret，否则部署前检查失败。
+
+### 3. 上线验证
+
+1. 打开 [`https://syyz.readori.com/api/healthz`](https://syyz.readori.com/api/healthz)，应返回服务状态。
+2. 打开 [`https://syyz.readori.com/`](https://syyz.readori.com/)，在「访问令牌」输入框填入访问令牌，创建一个小任务确认能跑完。
+3. 打开 `https://syyz.readori.com/debug.html`，对任意书源点一次调试，确认日志实时流式输出（SSE）。
+
 ## Worker 配置
 
 `wrangler.toml` 不含任何 D1/R2 配置，并将 `syyz.readori.com` 声明为 Worker Custom Domain。部署前设置：
