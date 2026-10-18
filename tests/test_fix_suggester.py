@@ -740,8 +740,12 @@ class StubEngine:
 
     def debug_source(self, src: dict, key: str, on_event: Any, **kwargs: Any) -> None:
         self.calls.append((src, key, kwargs))
-        for event in self.decide(src, key):
-            on_event(event)
+        try:
+            for event in self.decide(src, key):
+                on_event(event)
+        except BaseException as exc:  # the real engine ends the run on DebugCancelled (R146 WP-A)
+            if type(exc).__name__ != "DebugCancelled":
+                raise
 
 
 def _search_run(count: int) -> list[dict]:
@@ -908,6 +912,120 @@ def test_run_rule_never_raises() -> None:
     assert unsupported["ok"] is False and "不支持" in unsupported["error"]
 
 
-def test_fixture_online_preview_with_real_engine_is_skipped_until_wp_a_lands() -> None:
-    engine = pytest.importorskip("validator.debug_engine")
-    assert callable(engine.debug_source)
+# -- end to end: real debug engine against the local fixture site (WP-A) ---------------------------
+
+@pytest.fixture(scope="module")
+def fixture_site_env() -> Any:
+    import debug_fixture_site as site
+
+    patch = pytest.MonkeyPatch()
+    patch.setenv("READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK", "1")
+    base, alt, stop = site.start()
+    try:
+        yield dataclasses.make_dataclass("Env", ["base", "alt", "sources"])(base, alt, site.sources(base))
+    finally:
+        stop()
+        patch.undo()
+
+
+def _real_run(src: dict, key: str, version: str = "1.1.1") -> Any:
+    from validator import debug_engine
+
+    return debug_engine.debug_source(copy.deepcopy(src), key, None, app_version=version)
+
+
+def _validates(src: dict, version: str = "1.1.1") -> bool:
+    from validator import debug_engine
+
+    return bool(debug_engine.validate_one(copy.deepcopy(src), app_version=version)["passed"])
+
+
+def _apply(src: dict, suggestion: fs.Suggestion) -> dict:
+    doc = se.SourceDocument(copy.deepcopy(src))
+    fs.apply_suggestion(doc, suggestion)
+    return doc.working
+
+
+def test_f1_domain_migration_end_to_end(fixture_site_env: Any) -> None:
+    src = fixture_site_env.sources["moved"]
+    run = _real_run(src, "我的")
+    assert run.status == "pass"  # the old address redirects, the chain still works
+    f1 = by_code(fs.suggest(src, run.session), "F1")
+    assert f1.preview_kind == "online" and f1.patch
+    outcome = fs.preview(src, f1, run.session, online=True)
+    assert outcome["ok"] is True and outcome["apply_allowed"] is True
+    assert (outcome["after"]["bookListCount"] or 0) > 0
+    assert _validates(_apply(src, f1))
+
+
+def test_f2_gbk_charset_end_to_end(fixture_site_env: Any) -> None:
+    src = fixture_site_env.sources["gbk_missing_charset"]
+    run = _real_run(src, "我的")
+    assert run.status == "fail" and run.message == "︽未获取到书籍"
+    (f2,) = fs.suggest(src, run.session)
+    assert f2.code == "F2" and f2.confidence == "high" and f2.patch[0]["new"].endswith('{"charset":"gbk"}')
+    outcome = fs.preview(src, f2, run.session, online=True)
+    assert outcome["ok"] is True and outcome["before"]["bookListCount"] == 0 and outcome["after"]["bookListCount"] == 2
+    assert _validates(_apply(src, f2))
+    assert not _validates(src)  # the unpatched source really is broken
+
+
+def test_f3_referer_end_to_end(fixture_site_env: Any) -> None:
+    src = fixture_site_env.sources["referer_missing"]
+    run = _real_run(src, "我的")
+    assert run.status == "fail"
+    f3 = by_code(fs.suggest(src, run.session), "F3")
+    assert f3.preview_kind == "online" and "Referer" in f3.patch[0]["new"]
+    outcome = fs.preview(src, f3, run.session, online=True)
+    assert outcome["ok"] is True and outcome["before"]["outcome"] == "fail" and outcome["after"]["outcome"] == "pass"
+    assert _validates(_apply(src, f3))
+
+
+def test_online_preview_does_not_bless_a_patch_that_does_not_help(fixture_site_env: Any) -> None:
+    src = fixture_site_env.sources["ua_missing"]  # lower-case "user-agent" with a UA the site refuses
+    run = _real_run(src, "我的")
+    suggestions = [s for s in fs.suggest(src, run.session) if s.code == "F3"]
+    assert suggestions, "F3 should notice the 403 and the lower-case key"
+    outcome = fs.preview(src, suggestions[0], run.session, online=True)
+    assert outcome["ok"] is False and outcome["apply_allowed"] is False
+
+
+def test_online_preview_search_key_stops_after_the_list(fixture_site_env: Any) -> None:
+    """The preview raises DebugCancelled from on_event at the first bookList event: the engine must return a result."""
+    from validator import debug_engine, debug_trace
+
+    src = fixture_site_env.sources["good"]
+    seen: list[dict] = []
+
+    def on_event(event: dict) -> None:
+        seen.append(event)
+        if event.get("kind") == "list" and event.get("field") == "bookList":
+            raise debug_trace.DebugCancelled()
+
+    result = debug_engine.debug_source(copy.deepcopy(src), "我的", on_event, app_version="1.1.1", timeout=30)
+    assert result.status == "cancelled" and result.message == "■ 已停止"
+    lists = [e for e in seen if e["kind"] == "list"]
+    assert len(lists) == 1 and lists[0]["count"] == 2 and seen[-1]["kind"] == "verdict"
+    assert not any(e.get("stage") == "info" for e in seen)
+
+
+def test_suggest_on_a_healthy_run_offers_nothing_unsafe(fixture_site_env: Any) -> None:
+    run = _real_run(fixture_site_env.sources["good"], "我的")
+    assert run.status == "pass"
+    unsafe = [s for s in fs.suggest(fixture_site_env.sources["good"], run.session) if fs.is_safe(s)]
+    assert all(s.code in ("F5", "F6", "F7") for s in unsafe)
+
+
+def test_session_contract_for_the_suggester(fixture_site_env: Any) -> None:
+    """The duck-typed contract WP-B reads from a real ``DebugSession``."""
+    run = _real_run(fixture_site_env.sources["good"], "我的")
+    session = run.session
+    assert isinstance(session.events, list) and all(isinstance(e, dict) for e in session.events)
+    assert session.raw is session.raw_store and session.raw.get(1) is not None and session.raw.latest("search")
+    assert isinstance(session.raw.entries, list) and isinstance(session.variables, dict)
+    fetch = next(e for e in session.events if e["kind"] == "fetch")
+    for name in ("attempt", "history", "response_headers", "charset"):
+        assert name in fetch["data"], name
+    assert fetch["raw_id"] == 1 and fetch["data"]["attempt"] == 0 and fetch["data"]["charset"] == "utf-8"
+    keyword = next(e for e in session.events if e["kind"] == "keyword")
+    assert keyword["value"] == "我的"

@@ -138,3 +138,25 @@ def test_allow_private_from_env_reads_process_environment(monkeypatch) -> None:
     assert net_guard.allow_private_from_env() is False
     monkeypatch.setenv(net_guard.ALLOW_PRIVATE_ENV, "1")
     assert net_guard.allow_private_from_env() is True
+
+
+def test_blocked_address_error_carries_the_stable_reason_text() -> None:
+    error = net_guard.BlockedAddressError("http://127.0.0.1/x", "blocked-address:127.0.0.1")
+    assert net_guard.BLOCKED_REASON_TEXT == "blocked: non-public address"
+    assert str(error).startswith(net_guard.BLOCKED_REASON_TEXT)
+    assert "127.0.0.1" in str(error) and isinstance(error, OSError)
+
+
+def test_network_policy_defaults_to_allowing_private_and_nests() -> None:
+    previous = net_guard.network_allows_private()
+    try:
+        net_guard.set_network_policy(True)
+        assert net_guard.network_allows_private() is True
+        with net_guard.network_policy_scope(False):
+            assert net_guard.network_allows_private() is False
+        net_guard.set_network_policy(False)
+        assert net_guard.network_allows_private() is False
+        with net_guard.network_policy_scope(True):
+            assert net_guard.network_allows_private() is True
+    finally:
+        net_guard.set_network_policy(previous)

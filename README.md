@@ -158,9 +158,17 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 
 - Cloudflare Worker 对除 `/api/healthz` 以外的所有 `/api/*` 接口要求 `Authorization: Bearer <READORI_VALIDATOR_ACCESS_TOKEN>`；只有鉴权通过才会给转发请求注入服务器 token。Worker 未配置该 secret 时返回 503（fail closed）。上线前必须先 `wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN`，并在 GitHub 的 production 环境配置同名 secret（手动 workflow 才会部署，见 `cloudflare/README.md`）。
 - 服务器 `input_path` 永远限定在 `READORI_VALIDATOR_INPUT_ROOT`；未设置时为服务数据目录（SQLite 所在目录）下的 `inputs/` 子目录，`..` 与符号链接都会按真实位置判定。
-- 服务器拒绝首个请求地址落在私网 / 回环 / 链路本地 / 云元数据地址的书源（解析 DNS 后检查所有地址）；本地开发需要访问 127.0.0.1 夹具时设置 `READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1`。`validator/net_guard.py` 是可复用的纯函数模块（`is_public_address` / `check_url_allowed`）。验证引擎自己发出的请求（`fetch_text`、JS `ajax`、重定向）目前还没有接入该过滤，仍需后续在引擎里调用。
+- 服务器拒绝首个请求地址落在私网 / 回环 / 链路本地 / 云元数据地址的书源（解析 DNS 后检查所有地址）；本地开发需要访问 127.0.0.1 夹具时设置 `READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1`。`validator/net_guard.py` 是可复用的纯函数模块（`is_public_address` / `check_url_allowed`）。验证引擎自己发出的请求见下一小节（R145b）。
 - 设备兼容性门槛 `detail_is_device_compatible` 只在服务器的 `device` profile 下生效；命令行与 GUI 没有这道门槛，三条路径对同一书源的结果可能不同。
-- 书源 JS 在 Node `vm` 中执行，不是安全沙箱，仍需依赖服务器隔离（低权限用户、systemd 限制、无内网出口）。
+- 书源 JS 在 Node `vm` 中执行；R145b 起外层加了 Node 权限模型等多道防线（见下一小节），但 `vm` 本身仍不是安全边界，服务器部署仍应叠加隔离（低权限用户、systemd 限制、无内网出口）。
+
+### 引擎网络过滤与 Node 沙箱（R145b）
+
+- 引擎内所有出站请求（`fetch_text` / `fetch_bytes`、JS `java.ajax` / `connect` / `get` / `post` / `webView` 等经 Python 桥发出的请求、JS 请求日志重放）都经过 `net_guard.GuardedSession`：请求发出前检查目标，**重定向的每一跳**都重新检查（requests 每一跳都会重新进入适配器），被拒绝时不发请求，`failureReason` 为 `network error: blocked: non-public address`，`detail.networkError.category` 为 `blocked: non-public address`。连接直接拨向「检查时解析出的、已验证为公网」的地址（Host 头 / TLS 主机名不变），因此检查与连接之间没有再次解析的窗口（DNS 重绑定）；经 HTTP 代理访问时由代理解析，只能检查解析结果。
+- 策略：命令行 / GUI 默认**允许**私网（本机运行时书源可能在局域网，App 同样能访问）；`--block-private-network` 禁止。服务器每个任务都在 `network_policy_scope(False)` 内运行，进程默认也设为禁止，只有 `READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1` 才放开。代码里用 `validator.set_network_policy(bool)`（进程默认）或 `network_policy_scope(bool)`（上下文；新线程需 `copy_context().run` 绑定）。
+- Node 子进程：环境变量只保留 `PATH`、`SYSTEMROOT` 等启动必需项（不继承服务器 token / API key，`NODE_OPTIONS` 也不继承）；Node >= 23.5（本机 v24 已验证）加 `--permission` 且不授予 fs 写 / `child_process` / worker / addon，fs 读只开放运行器脚本所在的私有临时目录；旧版本 Node 不支持时降级并向 stderr 警告一次，仅剩环境变量最小化与运行器内的加固。
+- 运行器在执行书源代码前去掉宿主域的逃逸入口：宿主 `Function.prototype.constructor`（`constructor.constructor('return process')()`）、`process`、`require`、`console`、`fetch`、`WebSocket`、`Error.prepareStackTrace` 等。Node 权限模型不限制网络，所以这一步同时堵住逃逸后直连内网。
+- 残余风险：`vm` 与宿主共用同一进程与 V8 堆，未知的 V8 / Node 逃逸仍可能执行任意 JS（但无 fs 写 / 子进程 / 环境变量，网络入口已移除）；Node 子进程仍可使用本机 CPU / 内存（每次有超时）；`--block-private-network` 之外的 DNS 解析发生在本机解析器，需要出口防火墙作为最后一道防线。
 
 ## 与 iOS 验证器的关系
 

@@ -16,15 +16,20 @@ the guard off for local development against 127.0.0.1 fixtures.
 Limits worth knowing about: a check followed by a separate connect is still a
 time-of-check/time-of-use race (DNS rebinding).  Callers that need to be strict
 should pass the resolved address they validated to the HTTP client, and must
-re-run the check on every redirect hop.
+re-run the check on every redirect hop.  The validation engine does both: see
+``guarded_session_class`` (per-hop check + connection pinned to a validated
+address) and ``network_policy_scope`` / ``set_network_policy`` (R145b).
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import ipaddress
 import os
 import socket
-from typing import Callable, Iterable, Mapping
+import threading
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 ALLOW_PRIVATE_ENV = "READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK"
@@ -232,3 +237,188 @@ def check_url_allowed(
         resolver=resolver,
         fail_closed_on_dns_error=fail_closed_on_dns_error,
     )
+
+
+# ---------------------------------------------------------------------------
+# R145b: network policy for the validation engine + guarded requests session.
+# ---------------------------------------------------------------------------
+# The engine (validate_source_packages) makes every outbound request through a requests.Session.  A GuardedSession
+# re-checks the target on every hop (initial request and every redirect, because requests re-enters the adapter for
+# each hop) and pins the TCP connection to an address that was validated at connect time, which closes the
+# check-then-connect (DNS rebinding) window for direct connections.
+#
+# Policy: CLI / GUI runs on the user's own machine, where a source on the LAN is legitimate (the App can reach it too),
+# so the default allows private networks.  The server scopes every job with ``network_policy_scope(False)`` and the
+# server entry point sets the process default to blocked, unless READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1.
+
+BLOCKED_REASON_TEXT = "blocked: non-public address"
+
+_policy_lock = threading.Lock()
+_default_allow_private = True
+_scoped_allow_private: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "readori_net_allow_private", default=None
+)
+
+
+class BlockedAddressError(OSError):
+    """Raised before any bytes are sent when a request target is not a public address."""
+
+    def __init__(self, target: str, reason: str = ""):
+        self.target = target
+        self.reason = reason
+        detail = f" ({reason})" if reason else ""
+        super().__init__(f"{BLOCKED_REASON_TEXT}: {target}{detail}")
+
+
+def set_network_policy(allow_private: bool) -> None:
+    """Process-wide default.  ``True`` (initial value) = LAN / loopback targets are allowed."""
+
+    global _default_allow_private
+    with _policy_lock:
+        _default_allow_private = bool(allow_private)
+
+
+def network_allows_private() -> bool:
+    """Policy in force for the calling context: the innermost ``network_policy_scope``, else the process default."""
+
+    scoped = _scoped_allow_private.get()
+    if scoped is not None:
+        return bool(scoped)
+    with _policy_lock:
+        return _default_allow_private
+
+
+@contextlib.contextmanager
+def network_policy_scope(allow_private: bool) -> Iterator[None]:
+    """Override the policy for this context.  Threads started from it must bind the context (copy_context().run)."""
+
+    token = _scoped_allow_private.set(bool(allow_private))
+    try:
+        yield
+    finally:
+        _scoped_allow_private.reset(token)
+
+
+def resolve_public_addresses(
+    host: str,
+    *,
+    resolver: Resolver | None = None,
+    limit: int = 4,
+) -> list[str]:
+    """Resolve ``host`` and return the validated addresses to connect to (at most ``limit``).
+
+    Raises ``BlockedAddressError`` when the name, an IP literal or ANY resolved address is not public, and
+    ``socket.gaierror`` when the name does not resolve (so the caller reports an ordinary DNS failure).
+    """
+
+    name = _strip_host(host)
+    if not name:
+        raise BlockedAddressError(host or "", "empty-host")
+    literal = _parse_ip_literal(name)
+    if literal is not None:
+        if not is_public_ip(literal):
+            raise BlockedAddressError(name, f"blocked-address:{literal}")
+        return [str(literal)]
+    if is_blocked_host_name(name):
+        raise BlockedAddressError(name, "blocked-name")
+    try:
+        addresses = list((resolver or default_resolver)(name))
+    except (OSError, UnicodeError) as exc:
+        raise socket.gaierror(socket.EAI_NONAME, f"name resolution failed for {name}") from exc
+    if not addresses:
+        raise socket.gaierror(socket.EAI_NONAME, f"name resolution failed for {name}")
+    for address in addresses:
+        if not is_public_ip(address):
+            raise BlockedAddressError(name, f"blocked-address:{address}")
+    return addresses[: max(1, limit)]
+
+
+_guarded_cache: dict[str, Any] = {}
+_guarded_cache_lock = threading.Lock()
+
+
+def _build_guarded_classes() -> dict[str, Any]:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from requests.utils import select_proxy
+    from urllib3 import connectionpool
+    from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
+
+    class _PinnedConnectionMixin:
+        """Dial a validated address instead of re-resolving the name (TLS name / Host header stay unchanged)."""
+
+        def _new_conn(self):  # noqa: D401 - urllib3 hook
+            if network_allows_private() or not hasattr(self, "_dns_host"):
+                return super()._new_conn()  # type: ignore[misc]
+            original = self._dns_host
+            addresses = resolve_public_addresses(original)
+            last_error: Exception | None = None
+            for address in addresses:
+                self._dns_host = address
+                try:
+                    return super()._new_conn()  # type: ignore[misc]
+                except (NewConnectionError, ConnectTimeoutError) as exc:
+                    last_error = exc
+                finally:
+                    self._dns_host = original
+            assert last_error is not None
+            raise last_error
+
+    class _GuardedHTTPConnection(_PinnedConnectionMixin, connectionpool.HTTPConnection):
+        pass
+
+    class _GuardedHTTPSConnection(_PinnedConnectionMixin, connectionpool.HTTPSConnection):
+        pass
+
+    class _GuardedHTTPPool(connectionpool.HTTPConnectionPool):
+        ConnectionCls = _GuardedHTTPConnection
+
+    class _GuardedHTTPSPool(connectionpool.HTTPSConnectionPool):
+        ConnectionCls = _GuardedHTTPSConnection
+
+    class GuardedHTTPAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {"http": _GuardedHTTPPool, "https": _GuardedHTTPSPool}
+
+        def send(self, request: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: D401 - requests hook, runs per hop
+            if not network_allows_private():
+                proxied = bool(select_proxy(request.url, kwargs.get("proxies")))
+                # Direct connections are validated at connect time (pinned); the name is only checked statically
+                # here.  Through a proxy the proxy resolves the name, so resolve and check it now.
+                ok, reason = check_url_allowed(
+                    request.url,
+                    False,
+                    resolver=None if proxied else (lambda _host: []),
+                    fail_closed_on_dns_error=False,
+                )
+                if not ok:
+                    raise requests.exceptions.ConnectionError(
+                        BlockedAddressError(request.url, reason), request=request
+                    )
+            return super().send(request, *args, **kwargs)
+
+    class GuardedSession(requests.Session):
+        """requests.Session whose every hop obeys the active network policy."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            adapter = GuardedHTTPAdapter()
+            self.mount("http://", adapter)
+            self.mount("https://", adapter)
+
+    return {"GuardedSession": GuardedSession, "GuardedHTTPAdapter": GuardedHTTPAdapter}
+
+
+def guarded_session_class() -> Any:
+    """The (lazily built, so this module stays import-light) ``requests.Session`` subclass that enforces the policy."""
+
+    with _guarded_cache_lock:
+        if not _guarded_cache:
+            _guarded_cache.update(_build_guarded_classes())
+        return _guarded_cache["GuardedSession"]
+
+
+def guarded_adapter_class() -> Any:
+    guarded_session_class()
+    return _guarded_cache["GuardedHTTPAdapter"]

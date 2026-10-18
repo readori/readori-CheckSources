@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import base64
 import copy
 import hashlib
@@ -23,6 +24,7 @@ import re
 import shutil
 import sys
 import subprocess
+import tempfile
 import time
 import threading
 import unicodedata
@@ -38,7 +40,7 @@ from urllib.parse import parse_qs, quote, quote_plus, unquote, unquote_to_bytes,
 from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfoNotFoundError
 
-import requests
+import requests as _requests_lib
 from bs4 import BeautifulSoup
 from bs4 import MarkupResemblesLocatorWarning
 from bs4 import XMLParsedAsHTMLWarning
@@ -73,6 +75,54 @@ try:
     from . import app_profiles  # type: ignore[attr-defined]
 except ImportError:
     import app_profiles  # type: ignore[no-redef]
+
+# R146: opt-in debug trace channel (validator/debug_trace.py). Every hook is `if _dbg.active(): ...`, so a normal
+# validation run only pays one ContextVar.get() per hook and behaves exactly as before.
+try:
+    from . import debug_trace as _dbg  # type: ignore[attr-defined]
+except ImportError:
+    import debug_trace as _dbg  # type: ignore[no-redef]
+
+# R145b: every outbound request of the engine goes through net_guard's GuardedSession (per-hop SSRF check, connection
+# pinned to a validated address, policy from net_guard.network_policy_scope / set_network_policy).
+try:
+    from . import net_guard  # type: ignore[attr-defined]
+except ImportError:
+    import net_guard  # type: ignore[no-redef]
+
+set_network_policy = net_guard.set_network_policy
+network_policy_scope = net_guard.network_policy_scope
+network_allows_private = net_guard.network_allows_private
+
+
+class _GuardedRequests:
+    """Drop-in for the `requests` module inside this file: `requests.Session()` and the module-level helpers build a
+    policy-enforcing session, everything else (exceptions, utils, Response) is the real requests module. A new
+    `requests.Session()` added anywhere in the engine is therefore guarded without further edits."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_requests_lib, name)
+
+    @property
+    def Session(self) -> Any:  # noqa: N802 - mirrors requests.Session
+        return net_guard.guarded_session_class()
+
+    def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        with net_guard.guarded_session_class()() as session:
+            return session.request(method=method, url=url, **kwargs)
+
+    def get(self, url: str, params: Any = None, **kwargs: Any) -> Any:
+        return self.request("get", url, params=params, **kwargs)
+
+    def head(self, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("allow_redirects", False)
+        return self.request("head", url, **kwargs)
+
+    def post(self, url: str, data: Any = None, json: Any = None, **kwargs: Any) -> Any:
+        return self.request("post", url, data=data, json=json, **kwargs)
+
+
+requests = _GuardedRequests()
 
 DEFAULT_APP_VERSION = app_profiles.DEFAULT_APP_VERSION
 app_profile_scope = app_profiles.app_profile_scope
@@ -5794,6 +5844,42 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { URL, URLSearchParams } = require('node:url');
 
+// R145b: source scripts run in a vm context whose objects/functions come from this (host) realm, so
+// `constructor.constructor('return process')()` used to reach the host. Capture what the runner itself needs, then strip
+// the host realm before any untrusted code runs. Main defences are outside: the Node permission model
+// (no fs / child_process / worker / addons) and a minimal environment, both set by the Python launcher.
+const __hostProcess = process;
+const __hostConsole = console;
+const __hostStdout = process.stdout;
+const __debugNode = !!(process.env && process.env.READORI_DEBUG_NODE_JS);
+function __readoriHardenHostRealm() {
+  const blocked = function constructorBlocked() { throw new TypeError('blocked: host constructors are not available to source scripts'); };
+  const prototypes = [Function.prototype];
+  for (const make of [() => async function () {}, () => function* () {}, () => async function* () {}]) {
+    try { prototypes.push(Object.getPrototypeOf(make())); } catch (error) {}
+  }
+  for (const proto of prototypes) {
+    try { Object.defineProperty(proto, 'constructor', { value: blocked, writable: false, configurable: false }); } catch (error) {}
+  }
+  try {
+    Object.defineProperty(Error, 'prepareStackTrace', { get() { return undefined; }, set() {}, configurable: false });
+  } catch (error) {}
+  // The permission model does not restrict the network, so remove every host-realm door to it (and to process).
+  for (const name of [
+    'process', 'require', 'module', 'exports', '__filename', '__dirname', 'console', 'fetch', 'Request', 'Response',
+    'Headers', 'FormData', 'WebSocket', 'EventSource', 'XMLHttpRequest', 'Worker', 'MessageChannel', 'MessagePort',
+    'BroadcastChannel', 'navigator', 'Navigator',
+  ]) {
+    try { delete globalThis[name]; } catch (error) {}
+    try {
+      if (Object.prototype.hasOwnProperty.call(globalThis, name)) {
+        Object.defineProperty(globalThis, name, { value: undefined, writable: false, configurable: false });
+      }
+    } catch (error) {}
+  }
+}
+__readoriHardenHostRealm();
+
 // R143: App globals (btoa/atob/md5/sha256, UTF-8 semantics) and the native bridges behind the App's CryptoJS
 // (hex in, hex out, failures come back as "!" + reason). Single DES runs as 3DES with K||K||K because OpenSSL 3's
 // default provider has no single DES.
@@ -5910,14 +5996,14 @@ function __readoriAppNatives() {
   try {
     data = JSON.parse(payload || '{}');
   } catch (error) {
-    if (process.env.READORI_DEBUG_NODE_JS) {
-      console.error('JSON_PARSE_FAIL', error && error.message, payload.slice(0, 120));
+    if (__debugNode) {
+      __hostConsole.error('JSON_PARSE_FAIL', error && error.message, payload.slice(0, 120));
     }
-    console.log('');
-    process.exit(0);
+    __hostConsole.log('');
+    __hostProcess.exit(0);
   }
-  if (process.env.READORI_DEBUG_NODE_JS) {
-    console.error('NODE_RUN_CODE', (data.code || '').slice(0, 120));
+  if (__debugNode) {
+    __hostConsole.error('NODE_RUN_CODE', (data.code || '').slice(0, 120));
   }
   const inputText = data.inputText || '';
   let parsedInputResult;
@@ -6450,16 +6536,16 @@ function __readoriAppNatives() {
   try {
     value = vm.runInContext(data.code || '', context, { timeout: 1200, filename: 'readori-source.js' });
   } catch (error) {
-    if (process.env.READORI_DEBUG_NODE_JS) {
-      console.error('NODE_DIRECT_FAIL', error && error.message);
+    if (__debugNode) {
+      __hostConsole.error('NODE_DIRECT_FAIL', error && error.message);
     }
     const directText = __readoriErrorText(error);
     if (directText && !__readoriIsTopLevelReturn(directText)) scriptError = directText;
     try {
       value = vm.runInContext(`(function(){ ${data.code || ''} })()`, context, { timeout: 1200, filename: 'readori-source.js' });
     } catch (inner) {
-      if (process.env.READORI_DEBUG_NODE_JS) {
-        console.error('NODE_WRAP_FAIL', inner && inner.message);
+      if (__debugNode) {
+        __hostConsole.error('NODE_WRAP_FAIL', inner && inner.message);
       }
       if (!scriptError && directText) scriptError = __readoriErrorText(inner);
       value = context.result !== initialResult ? context.result : '';
@@ -6481,7 +6567,7 @@ function __readoriAppNatives() {
     text = '';
   }
   try {
-    process.stdout.write(JSON.stringify({
+    __hostStdout.write(JSON.stringify({
       value: text,
       scriptError: scriptError,
       variables: context.variables || {},
@@ -6489,7 +6575,7 @@ function __readoriAppNatives() {
       interactions: suppressedInteractions
     }));
   } catch (error) {
-    process.stdout.write(JSON.stringify({ value: '', variables: {} }));
+    __hostStdout.write(JSON.stringify({ value: '', variables: {} }));
   }
 }
 """
@@ -6566,6 +6652,101 @@ def install_quickjs_app_cryptojs(ctx: Any, plan: dict[str, bool], phase: str) ->
         ctx.eval(source)
     except Exception:
         pass
+
+
+# R145b: Node sandbox for source JS. Source scripts are untrusted; the validator may run on a server whose environment
+# holds the API key. Defences, outermost first:
+#   1. minimal environment (only what node needs to start; nothing from the parent's secrets),
+#   2. the Node permission model (`--permission`, Node >= 23.5): no fs read/write (the runner is passed with -e and
+#      reads only stdin), no child_process, no worker, no addons, no wasi. It does NOT restrict the network,
+#   3. inside the runner (NODE_JS_RUNNER): before untrusted code runs the host realm is stripped - host
+#      `Function.prototype.constructor` (the `constructor.constructor('return process')()` escape), `process`,
+#      `require`, `console`, `fetch`, `WebSocket`, ... are removed - so the escape cannot reach a socket either.
+NODE_ENV_KEEP = (
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "TZ",
+    "READORI_DEBUG_NODE_JS",
+)
+NODE_OPENSSL_LEGACY_OPTION = "--openssl-legacy-provider"
+_node_permission_support: dict[str, bool] = {}
+_node_permission_lock = threading.Lock()
+
+
+def node_sandbox_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The only environment variables a node child gets (case-insensitive match, so Windows `SystemRoot` is kept)."""
+    source = os.environ if environ is None else environ
+    keep = {name.upper() for name in NODE_ENV_KEEP}
+    env = {str(key): str(value) for key, value in source.items() if str(key).upper() in keep}
+    env["NODE_OPTIONS"] = NODE_OPENSSL_LEGACY_OPTION
+    return env
+
+
+def node_supports_permission_model(node: str) -> bool:
+    """Whether `node --permission` is accepted (Node >= 23.5; v24 verified). Probed once per binary."""
+    with _node_permission_lock:
+        cached = _node_permission_support.get(node)
+    if cached is not None:
+        return cached
+    try:
+        probe = subprocess.run(
+            [node, "--permission", "-e", "process.exit(process.permission && !process.permission.has('child') ? 0 : 3)"],
+            capture_output=True,
+            timeout=15,
+            env=node_sandbox_env(),
+        )
+        supported = probe.returncode == 0
+    except Exception:
+        supported = False
+    with _node_permission_lock:
+        _node_permission_support[node] = supported
+    if not supported:
+        print(
+            f"[source-validator] WARNING: {node} does not support --permission (needs Node >= 23.5); source JS runs "
+            "without the Node permission model (environment minimisation + in-runner host-realm hardening only). "
+            "Install Node 24 or newer.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return supported
+
+
+_node_runner_lock = threading.Lock()
+_node_runner_dir: str | None = None
+
+
+def _cleanup_node_runner_dir() -> None:
+    directory = _node_runner_dir
+    if directory:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def node_runner_script() -> str | None:
+    """Path of the runner script. It is ~33 KB, more than the Windows 32767-char command line allows for `-e`, so it
+    lives in a private per-process temp directory (mkdtemp: owner-only) that is the only path node may read."""
+    global _node_runner_dir
+    digest = hashlib.sha1(NODE_JS_RUNNER.encode("utf-8")).hexdigest()[:12]
+    with _node_runner_lock:
+        try:
+            if not _node_runner_dir or not Path(_node_runner_dir).is_dir():
+                _node_runner_dir = tempfile.mkdtemp(prefix="readori-node-")
+                atexit.register(_cleanup_node_runner_dir)
+            script = Path(_node_runner_dir) / f"readori-runner-{digest}.cjs"
+            if not script.is_file():
+                script.write_bytes(NODE_JS_RUNNER.encode("utf-8"))
+            return str(script)
+        except OSError:
+            return None
+
+
+def node_launch_command(node: str) -> list[str]:
+    """argv for one sandboxed node run. With the permission model: `--permission` and no `--allow-*` grant except
+    read access to the runner directory (deny fs write, child_process, worker, addons, wasi, inspector)."""
+    script = node_runner_script()
+    flags: list[str] = []
+    if node_supports_permission_model(node):
+        flags.append("--permission")
+        if script:
+            flags.append("--allow-fs-read=" + str(Path(script).parent))
+    return [node, *flags, script] if script else [node, *flags, "-e", NODE_JS_RUNNER]
 
 
 def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, extra_vars: dict[str, Any] | None = None) -> str:
@@ -6654,13 +6835,11 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
     }
     def run_node(current_payload: dict[str, Any]) -> dict[str, Any] | None:
         node_timeout = remaining_source_validation_seconds(4)
-        env = os.environ.copy()
-        node_options = env.get("NODE_OPTIONS", "")
-        if "--openssl-legacy-provider" not in node_options:
-            env["NODE_OPTIONS"] = (node_options + " --openssl-legacy-provider").strip()
+        # R145b: minimal environment (no server token / API key reaches source scripts) + Node permission model.
+        env = node_sandbox_env()
         try:
             proc = subprocess.run(
-                [node, "-e", NODE_JS_RUNNER],
+                node_launch_command(node),
                 input=json.dumps(current_payload, ensure_ascii=True),
                 text=True,
                 capture_output=True,
@@ -11745,11 +11924,15 @@ NETWORK_ERROR_REASON_PREFIX = "network error: "
 
 def classify_network_error(exc: BaseException | str) -> tuple[str, str]:
     """Map a transport exception to (category, message). Categories: dns, tls, timed out, connection refused,
-    connection reset, too many redirects, connection failed, other. (Never contains the substring "timeout":
+    connection reset, too many redirects, connection failed, other, and `blocked: non-public address` (R145b SSRF
+    guard; the request was never sent). (Never contains the substring "timeout":
     app_verdict() reserves that word for the App's whole-chain 校验超时.)"""
     message = str(exc) if not isinstance(exc, str) else exc
     lowered = message.lower()
     exc_name = type(exc).__name__.lower() if not isinstance(exc, str) else ""
+    # R145b: net_guard refused the target (or a redirect hop / resolved address) before any request was sent.
+    if net_guard.BLOCKED_REASON_TEXT in lowered:
+        return net_guard.BLOCKED_REASON_TEXT, message
     if isinstance(exc, requests.exceptions.SSLError) or "ssl" in exc_name or "certificate verify" in lowered or "sslerror" in lowered:
         return "tls", message
     if isinstance(exc, requests.exceptions.Timeout) or "timed out" in lowered or "timeout" in lowered:
@@ -11857,6 +12040,14 @@ def make_source_session(src: dict[str, Any] | None = None) -> requests.Session:
     return session
 
 
+def reset_thread_session(src: dict[str, Any] | None = None) -> requests.Session:
+    """R146: a clean per-thread Session (no cookies of an earlier run) for debug / single-source validation.
+    Same as `make_source_session`, additionally remembered on the thread for callers that want to inspect it."""
+    session = make_source_session(src)
+    _thread_local.session = session
+    return session
+
+
 class _NoStoreCookiePolicy(http.cookiejar.DefaultCookiePolicy):
     """Cookie policy that refuses to store any cookie a response sets (cookies sent explicitly still work)."""
 
@@ -11877,6 +12068,11 @@ def fetch_text(
     retry_with_default_headers: bool = True,
 ) -> tuple[str, str, int]:
     timeout = remaining_source_validation_seconds(timeout)
+    if _dbg.network_blocked():
+        # R146: offline replay (rule tester) - answer like a transport failure, never touch the network.
+        if _dbg.active():
+            _dbg.emit("blocked", url=url)
+        return "", url or "", 0
     data_response = decode_data_url_as_hex_response(url)
     if data_response is not None:
         hex_body, final_url, _response_type = data_response
@@ -11897,11 +12093,12 @@ def fetch_text(
             data = body.encode("utf-8", errors="ignore")
 
     last_error: Exception | None = None
-    for candidate_url in _candidate_retry_urls(url):
+    for _dbg_attempt, candidate_url in enumerate(_candidate_retry_urls(url)):
         # R144a (F9): exactly one attempt with the headers the source configured. The App never retries with a
         # replacement browser header set, so the validator no longer "rescues" a source whose headers are wrong
         # (`retry_with_default_headers` is accepted for call compatibility and ignored).
         req_headers = dict(base_headers)
+        _dbg_started = time.perf_counter() if _dbg.active() else 0.0
         try:
             if method == "POST":
                 resp = session.post(
@@ -11926,6 +12123,9 @@ def fetch_text(
                     allow_redirects=allow_redirects,
                 )
             text = decode_response_text(resp, charset_override=charset)
+            if _dbg.active():
+                _dbg.emit_fetch(resp, url=candidate_url, method=method, attempt=_dbg_attempt, started=_dbg_started,
+                                request_headers=req_headers, request_body=body, charset=charset, text=text)
             if response_meta is not None:
                 response_meta["headers"] = {
                     str(key): str(value)
@@ -11938,8 +12138,13 @@ def fetch_text(
             verify_redirect_url = loading_verify_redirect_url(text, str(resp.url))
             if allow_redirects and verify_redirect_url and method == "GET":
                 try:
+                    _dbg_verify_started = time.perf_counter() if _dbg.active() else 0.0
                     verify_resp = session.get(verify_redirect_url, headers=req_headers, timeout=request_timeout, allow_redirects=True)
                     verify_text = decode_response_text(verify_resp, charset_override=charset)
+                    if _dbg.active():
+                        _dbg.emit_fetch(verify_resp, url=verify_redirect_url, method="GET", attempt="verify",
+                                        started=_dbg_verify_started, request_headers=req_headers, charset=charset,
+                                        text=verify_text)
                     if verify_text and not contains_http_error_page_signals(verify_text):
                         if response_meta is not None:
                             response_meta["headers"] = {
@@ -11958,9 +12163,13 @@ def fetch_text(
             raise
         except requests.RequestException as exc:
             last_error = exc
+            if _dbg.active():
+                _dbg.emit_fetch_error(url=candidate_url, method=method, attempt=_dbg_attempt, exc=exc)
             continue
         except Exception as exc:
             last_error = exc
+            if _dbg.active():
+                _dbg.emit_fetch_error(url=candidate_url, method=method, attempt=_dbg_attempt, exc=exc)
             continue
 
     if last_error is not None:
@@ -11971,22 +12180,34 @@ def fetch_text(
 
 def fetch_bytes(session: requests.Session, url: str, headers: dict[str, str] | None = None, timeout: int = REQUEST_TIMEOUT) -> tuple[bytes, str, int]:
     timeout = remaining_source_validation_seconds(timeout)
+    if _dbg.network_blocked():
+        if _dbg.active():
+            _dbg.emit("blocked", url=url)
+        return b"", (url or ""), 0
     request_timeout = (min(REQUEST_CONNECT_TIMEOUT, max(1, timeout)), timeout)
     base_headers = dict(headers or {})
     last_error: Exception | None = None
-    for candidate_url in _candidate_retry_urls(url):
+    for _dbg_attempt, candidate_url in enumerate(_candidate_retry_urls(url)):
         # R144a (F9): single attempt with the source's own headers (no replacement browser header retry).
         req_headers = dict(base_headers)
+        _dbg_started = time.perf_counter() if _dbg.active() else 0.0
         try:
             resp = session.get(candidate_url, headers=req_headers, timeout=request_timeout, allow_redirects=True)
+            if _dbg.active():
+                _dbg.emit_fetch(resp, url=candidate_url, method="GET", attempt=_dbg_attempt, started=_dbg_started,
+                                request_headers=req_headers, content=bytes(resp.content or b""))
             return bytes(resp.content or b""), str(resp.url), int(resp.status_code)
         except SourceValidationDeadlineExceeded:
             raise
         except requests.RequestException as exc:
             last_error = exc
+            if _dbg.active():
+                _dbg.emit_fetch_error(url=candidate_url, method="GET", attempt=_dbg_attempt, exc=exc)
             continue
         except Exception as exc:
             last_error = exc
+            if _dbg.active():
+                _dbg.emit_fetch_error(url=candidate_url, method="GET", attempt=_dbg_attempt, exc=exc)
             continue
     if last_error is not None:
         record_network_event(url, last_error)
@@ -13506,6 +13727,7 @@ def collect_app_book_candidates(
     book_urls: list[str] = []
     selected_variables: dict[str, str] | None = None
     selected_author = ""
+    dbg_skipped = 0
     for item in items:
         item_runtime = RuleRuntime(**{**runtime2.__dict__, "variables": dict(runtime2.variables or {})})
         name = "" if name_rule_blank else first_result_to_text(item, name_rule, item_runtime)
@@ -13513,9 +13735,13 @@ def collect_app_book_candidates(
         if not name.strip() and name_rule_blank:
             name = fallback_name_from_item(item)
             name_recovered = bool(name.strip())
+        if _dbg.active() and item is items[0]:
+            _dbg.emit("field", field="name", rule=name_rule, value=name)
         if not name.strip():
+            dbg_skipped += 1
             continue
         if name_recovered and not is_usable_search_book_title(name):
+            dbg_skipped += 1
             continue
         if url_rule_blank:
             book_url = fallback_url_from_item(item, runtime2.base_url, item_runtime)
@@ -13523,17 +13749,35 @@ def collect_app_book_candidates(
             book_url = first_result_to_book_url(src, item, url_rule, item_runtime, str(rule.get("kind") or ""))
         if not str(book_url or "").strip():
             book_url = runtime2.base_url
+        if _dbg.active() and item is items[0]:
+            _dbg.emit("field", field="bookUrl", rule=url_rule, value=book_url)
         if not str(book_url or "").strip() or not is_usable_rule_extracted_book_url(book_url, item, name, item_runtime):
+            dbg_skipped += 1
             continue
         item_author = capture_search_item_rule_variables(rule, item, item_runtime)
         book_urls.append(book_url)
+        if _dbg.active() and len(book_urls) <= 50:
+            _dbg.emit("item", index=len(book_urls) - 1, name=name, value=book_url)
         if selected_variables is None:
             selected_variables = dict(item_runtime.variables or {})
             selected_author = item_author
+    if _dbg.active() and dbg_skipped:
+        _dbg.emit("warn", code="items_skipped", count=dbg_skipped,
+                  value=f"列表 {len(items)} 项中 {dbg_skipped} 项因书名为空或详情链接不可用被跳过")
     return book_urls, selected_variables, selected_author
 
 
-def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime) -> tuple[list[str], str]:
+def fetch_book_candidates(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    *,
+    keywords: list[str] | None = None,
+    modes: tuple[str, ...] = ("search", "explore"),
+    explore_url: str | None = None,
+) -> tuple[list[str], str]:
+    """Search / discovery stage. R146 (debug): `keywords` replaces the validation keyword list, `modes` limits the
+    stage to search and / or explore, `explore_url` replaces the first `exploreUrl` entry. Defaults = batch behavior."""
     begin_network_stage()
     search_rule = src.get("ruleSearch") or {}
     explore_rule = src.get("ruleExplore") or {}
@@ -13542,15 +13786,22 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
     has_search = bool(str(src.get("searchUrl") or "").strip()) and isinstance(search_rule, dict) and bool(str(search_rule.get("bookList") or "").strip())
     has_explore = bool(str(src.get("exploreUrl") or "").strip()) and isinstance(explore_rule, dict) and bool(str(explore_rule.get("bookList") or "").strip())
     check_keyword = normalized_validation_keyword(search_rule.get("checkKeyWord") if isinstance(search_rule, dict) else None)
-    keywords = candidate_validation_keywords(check_keyword)
+    custom_keywords = [str(item) for item in (keywords or []) if str(item) != ""]
+    keywords = custom_keywords or candidate_validation_keywords(check_keyword)
+    if explore_url and isinstance(explore_rule, dict) and str(explore_rule.get("bookList") or "").strip():
+        has_explore = True
 
     def try_mode(mode: str) -> tuple[list[str], str]:
+        if mode not in modes:
+            return [], ""
         if mode == "search" and not has_search:
             return [], ""
         if mode == "explore" and not has_explore:
             return [], ""
+        if _dbg.active():
+            _dbg.set_stage(mode)
         if mode == "explore":
-            template = build_first_explore_url(str(src.get("exploreUrl") or ""), runtime)
+            template = explore_url or build_first_explore_url(str(src.get("exploreUrl") or ""), runtime)
             if not template:
                 return [], ""
             url = template
@@ -13571,6 +13822,8 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             if status == 0 and not html:
                 return [], final_url
             if app_http_failure(base_url, status, html, "explore", src):
+                if _dbg.active():
+                    _dbg.emit("warn", code="http_error", url=base_url, status=status)
                 return [], final_url
             login_ok, html, final_url = apply_login_check_js(
                 src, runtime, html, final_url, base_url, status,
@@ -13579,23 +13832,34 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
                 response_cookies=response_meta.get("cookies", {}),
             )
             if not login_ok:
+                if _dbg.active():
+                    _dbg.emit("warn", code="login_check", url=final_url)
                 return [], final_url
             if is_likely_search_or_explore_landing_url(final_url, runtime):
+                if _dbg.active():
+                    _dbg.emit("warn", code="landing", url=final_url)
                 return [], final_url
             # Match Legado BookList: explicit rules see the fetched body before
             # generic marker classification. Search pages often bundle dormant
             # captcha/404/empty-state templates while still containing books.
             error_page = contains_http_error_page_signals(html)
             if is_likely_empty_search_json(html):
+                if _dbg.active():
+                    _dbg.emit("warn", code="empty_json", url=final_url)
                 return [], final_url
             runtime2 = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url})
             # R144a (F4): bookList has a rule here (has_explore), and the App's list heuristics (JSON wrapper
             # recovery, JSON key lists, HTML selector guesses) run only when the bookList rule is blank.
             items = evaluate_book_list(str(explore_rule.get("bookList") or ""), html, runtime2)
+            if _dbg.active():
+                _dbg.emit("list", field="bookList", rule=str(explore_rule.get("bookList") or ""), count=len(items),
+                          value=items[0][:2000] if items else "")
             if not items:
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
+                    if _dbg.active():
+                        _dbg.emit("warn", code="challenge", url=final_url)
                 return [], ""
             book_urls, selected_variables, selected_author = collect_app_book_candidates(src, explore_rule, items, runtime2)
             if selected_variables:
@@ -13605,12 +13869,18 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             if not book_urls and error_page:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables["__searchChallenge"] = "1"
+                if _dbg.active():
+                    _dbg.emit("warn", code="challenge", url=final_url)
             return book_urls, final_url
 
         # search
         for kw in keywords:
+            if _dbg.active():
+                _dbg.emit("keyword", value=kw)
             req = request_search_or_explore(session, src, runtime, kw, mode="search")
             if not req:
+                if _dbg.active():
+                    _dbg.emit("warn", code="no_request", value=kw)
                 continue
             url, method, params = req
             response_meta = {}
@@ -13626,6 +13896,8 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             if status == 0 and not html:
                 return [], final_url
             if app_http_failure(url, status, html, "search", src):
+                if _dbg.active():
+                    _dbg.emit("warn", code="http_error", url=url, status=status)
                 return [], final_url
             login_ok, html, final_url = apply_login_check_js(
                 src, runtime, html, final_url, url, status,
@@ -13636,6 +13908,8 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
                 response_cookies=response_meta.get("cookies", {}),
             )
             if not login_ok:
+                if _dbg.active():
+                    _dbg.emit("warn", code="login_check", url=final_url)
                 continue
             # R144a (#12): ruleSearch.init runs after the login check and before the redirect guard (App E:236-244).
             search_init_rule = str(search_rule.get("init") or search_rule.get("initJs") or "").strip()
@@ -13646,23 +13920,37 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
                 )
                 if transformed_html:
                     html = transformed_html
+                if _dbg.active():
+                    _dbg.emit("field", field="init", rule=search_init_rule,
+                              value=transformed_html[:2000] if transformed_html else "")
             if is_likely_search_or_explore_landing_url(final_url, runtime):
+                if _dbg.active():
+                    _dbg.emit("warn", code="landing", url=final_url)
                 continue
             # Rule-first parity with the iOS runtime and Legado. Only classify
             # the response as a challenge/error page if no usable rule result
             # survives below.
             error_page = contains_http_error_page_signals(html)
             if is_likely_empty_search_json(html):
+                if _dbg.active():
+                    _dbg.emit("warn", code="empty_json", url=final_url)
                 continue
             if matches_book_url_pattern(src, final_url):
+                if _dbg.active():
+                    _dbg.emit("info", code="detail_page", url=final_url)
                 return [final_url], final_url
             runtime2 = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url})
             # R144a (F4): no list heuristics after a rule-driven bookList (App: blank bookList only).
             items = evaluate_book_list(str(search_rule.get("bookList") or ""), html, runtime2)
+            if _dbg.active():
+                _dbg.emit("list", field="bookList", rule=str(search_rule.get("bookList") or ""), count=len(items),
+                          value=items[0][:2000] if items else "")
             if not items:
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
+                    if _dbg.active():
+                        _dbg.emit("warn", code="challenge", url=final_url)
                 continue
             book_urls, selected_variables, selected_author = collect_app_book_candidates(src, search_rule, items, runtime2)
             if book_urls:
@@ -13674,12 +13962,14 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             if error_page:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables["__searchChallenge"] = "1"
+                if _dbg.active():
+                    _dbg.emit("warn", code="challenge", url=final_url)
         return [], ""
 
     search_urls, search_base = try_mode("search")
     if search_urls:
         return search_urls, search_base
-    if has_search:
+    if has_search and "search" in modes:
         # R144a (F4): the App's batch validation runs search and discovery as independent checks
         # (BookSourceValidator.doCheckSource 2226-2317); an empty search is a `搜索失效` failure on its own and
         # a working discovery does not rescue it. A real search failure also means any interaction blocked from
@@ -13724,6 +14014,15 @@ def is_heuristic_http_error_page(html: str, status: int) -> bool:
 
 
 def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str) -> tuple[bool, str, str, str]:
+    if _dbg.active():
+        _dbg.set_stage("info")
+    result = _fetch_book_info(session, src, runtime, book_url)
+    if _dbg.active() and not result[0]:
+        _dbg.emit("error", value=result[3] or "详情页没有解析出书名，也没有目录链接")
+    return result
+
+
+def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str) -> tuple[bool, str, str, str]:
     begin_network_stage()
     info_rule = src.get("ruleBookInfo") or {}
     if not isinstance(info_rule, dict):
@@ -13817,6 +14116,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             transformed = evaluate_rule(init_rule, next_data_json, runtime2, "json")
         if transformed:
             html = transformed[0]
+        if _dbg.active():
+            _dbg.emit("field", field="init", rule=init_rule, value=transformed[0] if transformed else "")
     name = ""
     toc_url = ""
     if str(info_rule.get("name") or "").strip():
@@ -13826,6 +14127,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             if name and not is_usable_search_book_title(name):
                 name = ""
             runtime2.book_name = name
+    if _dbg.active() and str(info_rule.get("name") or "").strip():
+        _dbg.emit("field", field="name", rule=str(info_rule.get("name")), value=name)
     kind = ""
     if str(info_rule.get("kind") or "").strip():
         kind_values = evaluate_rule(str(info_rule.get("kind")), html, runtime2, "json" if is_json_content(html) else "html")
@@ -13842,6 +14145,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
                 "data.kind", "data.category", "data.resourceID", "data.resourceId",
                 "result.kind", "result.category", "result.resourceID", "result.resourceId",
             ])
+    if _dbg.active() and str(info_rule.get("kind") or "").strip():
+        _dbg.emit("field", field="kind", rule=str(info_rule.get("kind")), value=kind)
     if kind:
         runtime2.book_kind = kind
         runtime2.variables = runtime2.variables or {}
@@ -13864,6 +14169,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             if candidate_toc_url and not is_unusable_toc_url_candidate(candidate_toc_url, book_url) and not is_likely_single_chapter_toc_fallback(candidate_toc_url, book_url):
                 toc_url = candidate_toc_url
                 break
+        if _dbg.active():
+            _dbg.emit("field", field="tocUrl", rule=toc_rule_text, value=toc_url)
 
     json_obj: Any | None = None
     if is_json_content(html) or extract_json(html):
@@ -13910,6 +14217,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             or clean_recovered_book_name(fallback_name_from_item(html))
         )
 
+    if _dbg.active() and name_rule_blank and name.strip():
+        _dbg.emit("fallback", what="书名规则为空，由详情页 JSON 键 / meta / title 兜底取得", value=name)
     rejected_recovered_name = False
     if name.strip() and not is_usable_search_book_title(name):
         name = ""
@@ -13950,6 +14259,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
                         break
         except Exception:
             pass
+        if _dbg.active() and toc_url.strip():
+            _dbg.emit("fallback", what="目录规则缺失，由详情页链接兜底取得目录地址", value=toc_url)
 
     # R144a (F3): the book source's own name is never a book name (the App has no such fallback).
 
@@ -14669,6 +14980,8 @@ def fallback_search_items_from_content(html: str) -> list[str]:
 def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str, toc_url: str) -> tuple[bool, str, str, str, int, int, int]:
     """返回: ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages_walked, first_page_item_count"""
     begin_network_stage()
+    if _dbg.active():
+        _dbg.set_stage("toc")
     # App getChapterList: `ruleToc == nil` throws noTocRule (E:2576-2578); an existing ruleToc without a
     # chapterList rule is NOT an error - the page is read by the raw-link / dynamic-catalog heuristics (R144a F15).
     toc_rule = src.get("ruleToc")
@@ -14757,6 +15070,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
         if app_http_failure(request_url, status, html, "toc", src):
             # App E:2793-2809: a page reached through a nextTocUrl rule that answers with an HTTP error counts as an
             # empty page; any other request error fails the whole table of contents.
+            if _dbg.active():
+                _dbg.emit("warn", code="http_error", url=request_url, status=status)
             if pages == 0 or not has_next_toc_rule:
                 return False, "", "", "", pages, first_page_item_count, len(seen_chapter_urls)
             pages += 1
@@ -14770,6 +15085,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             response_cookies=response_meta.get("cookies", {}),
         )
         if not login_ok:
+            if _dbg.active():
+                _dbg.emit("warn", code="login_check", url=final_url)
             pages += 1
             continue
         if heuristic_toc and not is_json_content(html) and is_heuristic_http_error_page(html, status):
@@ -14812,6 +15129,10 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
         if pages == 0:
             first_page_item_count = len(items)
         pages += 1
+        if _dbg.active():
+            _dbg.emit("page", index=pages, url=final_url, count=len(items))
+            _dbg.emit("list", field="chapterList", rule=chapter_list_rule or "(无规则，自动识别)", count=len(items),
+                      value=items[0][:2000] if items else "", page=pages)
 
         current_toc_keys = {
             normalized_book_candidate_url_for_comparison(abs_url),
@@ -14823,6 +15144,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             all_chapters_key = normalized_book_candidate_url_for_comparison(all_chapters_url)
             if all_chapters_url and all_chapters_key not in current_toc_keys and f"GET {all_chapters_url} " not in visited and all_chapters_url not in queue:
                 queue.insert(0, all_chapters_url)
+                if _dbg.active():
+                    _dbg.emit("fallback", what="guess_all_chapters_url_from_html（校验器自己猜的「全部章节」页，App 不会）", value=all_chapters_url)
                 continue
             if len(items) < 15:
                 for range_url in guess_toc_range_option_urls_from_html(html, final_url):
@@ -14831,6 +15154,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                         continue
                     if f"GET {range_url} " not in visited and range_url not in queue:
                         queue.append(range_url)
+                        if _dbg.active():
+                            _dbg.emit("fallback", what="guess_toc_range_option_urls_from_html（校验器自己猜的分页下拉，App 不会）", value=range_url)
                 if queue:
                     continue
 
@@ -14878,6 +15203,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 attr_or_tag = chapter_name_rule.split("@", 1)[0]
                 title = child_tag_text_from_item(item, attr_or_tag) or root_attr_from_item(item, attr_or_tag)
             item_runtime.chapter_title = title
+            if _dbg.active() and pages == 1 and item_index == 0:
+                _dbg.emit("field", field="chapterName", rule=chapter_name_rule, value=title)
             item_runtime.variables = dict(item_runtime.variables or {})
             item_runtime.variables["__chapter.title"] = title
             # Extract chapter URL - use rule or fallback
@@ -14921,6 +15248,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             if heuristic_toc and chapter_url:
                 chapter_url = normalize_chapter_url_to_book_host(chapter_url, book_url)
             item_runtime.chapter_url = chapter_url
+            if _dbg.active() and pages == 1 and item_index == 0:
+                _dbg.emit("field", field="chapterUrl", rule=chapter_url_rule, value=chapter_url)
             item_runtime.variables = dict(item_runtime.variables or {})
             item_runtime.variables["__chapter.url"] = chapter_url
 
@@ -14986,6 +15315,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             if chapter_url:
                 if chapter_url not in seen_chapter_urls:
                     seen_chapter_urls.add(chapter_url)
+                    if _dbg.active() and len(seen_chapter_urls) <= 200:
+                        _dbg.emit("item", index=len(seen_chapter_urls) - 1, name=title, value=chapter_url, volume=False)
                     if not first_chapter_url:
                         first_chapter_final_url = final_url
                         first_chapter_url = chapter_url
@@ -15004,6 +15335,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
         next_rule = str(toc_rule.get("nextTocUrl") or "").strip()
         if next_rule:
             next_values = legado_string_list_values(evaluate_rule(next_rule, html, runtime2, content_type))
+            if _dbg.active():
+                _dbg.emit("field", field="nextTocUrl", rule=next_rule, value="\n".join(next_values))
             for raw in next_values:
                 if not raw or not raw.strip():
                     continue
@@ -15037,6 +15370,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
 
 def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, chapter_url: str, chapter_title: str, book_name: str) -> tuple[bool, str, int]:
     begin_network_stage()
+    if _dbg.active():
+        _dbg.set_stage("content")
     content_rule = src.get("ruleContent")
     content_expr_raw = str(content_rule.get("content") or "") if isinstance(content_rule, dict) else ""
     if not isinstance(content_rule, dict) or content_expr_raw == "":
@@ -15052,6 +15387,8 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
             return True, chapter_url, 0
         runtime.variables = dict(runtime.variables or {})
         runtime.variables["__contentRuleEmpty"] = "1"
+        if _dbg.active():
+            _dbg.emit("error", value="ruleContent.content 为空：App 会把章节链接本身当作正文显示")
         return False, chapter_url, 0
     content_expr = content_expr_raw.strip()
     # Only a whitespace-only content rule reaches the App's fallbacks (`contentRuleIsBlank`, E:9726-9751); a rule
@@ -15130,6 +15467,8 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         if app_http_failure(request_url, status, html, "content", src):
             # App E:9601-9638: a failed request throws when nothing has been collected yet, otherwise the parsed
             # pages are kept.
+            if _dbg.active():
+                _dbg.emit("warn", code="http_error", url=request_url, status=status)
             if chunks:
                 break
             return False, "", page_count
@@ -15168,6 +15507,8 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
             response_cookies=response_meta.get("cookies", {}),
         )
         if not login_ok:
+            if _dbg.active():
+                _dbg.emit("warn", code="login_check", url=final_url)
             return False, final_url, page_count
         runtime3 = RuleRuntime(**{
             **runtime2.__dict__,
@@ -15200,15 +15541,24 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                     resolved_chapter_title = parsed_title
                     runtime2.chapter_title = parsed_title
                     runtime3.chapter_title = parsed_title
+                if _dbg.active():
+                    _dbg.emit("field", field="title", rule=title_expr, value=parsed_title)
         if str(content_rule.get("webJs") or "").strip():
             transformed = evaluate_rule(str(content_rule.get("webJs") or ""), page_html, runtime3, "json" if is_json_content(page_html) else "html")
             if transformed:
                 page_html = transformed[0]
+            if _dbg.active():
+                _dbg.emit("field", field="webJs", rule=str(content_rule.get("webJs") or ""),
+                          value=transformed[0][:2000] if transformed else "")
         content_type = "json" if is_json_content(page_html) else "html"
         if content_type == "json" and is_likely_content_error_json(page_html):
+            if _dbg.active():
+                _dbg.emit("warn", code="content_error_json", url=final_url)
             page_count += 1
             break
         if content_type == "html" and contains_browser_deferred_content_signals(page_html):
+            if _dbg.active():
+                _dbg.emit("warn", code="webview_deferred", url=final_url)
             page_count += 1
             if not chunks:
                 return False, "webView deferred content", page_count
@@ -15247,7 +15597,11 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                     recovered_content = recover_deferred_chapter_api_content(session, final_url, request_headers, page_html)
                     if recovered_content:
                         page_content = recovered_content
+        if _dbg.active():
+            _dbg.emit("field", field="content", rule=content_expr, value=page_content[:2000], count=len(page_content))
         if is_likely_access_gated_content_preview(page_content):
+            if _dbg.active():
+                _dbg.emit("warn", code="access_gated", url=final_url)
             page_count += 1
             if not chunks:
                 return False, page_content, page_count
@@ -15259,6 +15613,8 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
             chunks.append(page_content)
         last_html = page_html
         page_count += 1
+        if _dbg.active():
+            _dbg.emit("page", index=page_count, url=final_url)
 
         if not should_follow_next:
             continue
@@ -15266,6 +15622,8 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         next_rule = str(content_rule.get("nextContentUrl") or "").strip()
         if next_rule:
             next_values = legado_string_list_values(evaluate_rule(next_rule, page_html, runtime3, content_type))
+            if _dbg.active():
+                _dbg.emit("field", field="nextContentUrl", rule=next_rule, value="\n".join(next_values))
         else:
             next_values = derive_paged_chapter_urls(abs_url, page_html, page_content)
         pending_url_values = {url for url, _ in pending_urls}
@@ -15312,6 +15670,10 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                 merged, str(content_rule.get("replaceRegex") or ""), runtime2
             )
             replaced = replaced.strip()
+            if _dbg.active():
+                _dbg.emit("field", field="replaceRegex", rule=str(content_rule.get("replaceRegex") or ""),
+                          value=replaced[:2000], count=len(replaced),
+                          data={"before": len(pre_replace), "after": len(replaced)})
             # R144a (F8): the App shows the replaced text (BookSourceEngine.swift:9947-9952); a replaceRegex that
             # empties the chapter leaves it empty instead of silently falling back to the pre-replace text.
             merged = replaced
@@ -15514,7 +15876,14 @@ def _quick_scan_detail(src: dict[str, Any], stage: str = "quick-scan") -> dict[s
 
 def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] | None, dict[str, Any]]:
     holder: dict[str, Any] = {}
+    if _dbg.active():
+        _dbg.set_stage("quick-scan")
+        _dbg.emit("begin")
     passed, seed, detail = _quick_scan_single_source(src, holder)
+    if _dbg.active():
+        _dbg.set_stage("quick-scan")
+        _dbg.emit("end", ok=bool(passed), value=str(detail.get("failureReason") or ""),
+                  data={"failureReason": str(detail.get("failureReason") or ""), "error": str(detail.get("error") or "")})
     state = holder.get("state")
     apply_interaction_state_to_detail(detail, state)
     if seed is not None and isinstance(state, dict):
@@ -15582,9 +15951,14 @@ def _quick_scan_single_source(
         # retained for diagnostics; the search check below decides usability.
         detail["quickScan"]["connectivity"] = True
         detail["quickScan"]["statusCode"] = int(response.status_code or 0)
+        if _dbg.active():
+            _dbg.emit("info", code="connectivity", url=runtime.base_url, status=int(response.status_code or 0),
+                      value=f"站点首页可连通（HTTP {int(response.status_code or 0)}）")
     except SourceValidationDeadlineExceeded:
         raise
     except Exception as exc:
+        if _dbg.active():
+            _dbg.emit("warn", code="connectivity", url=runtime.base_url, value=f"站点首页不可连通：{type(exc).__name__}: {exc}")
         detail["error"] = str(exc)
         # Sources with an absolute search/explore endpoint may intentionally
         # use a non-HTTP bookSourceUrl (for example a JS/data endpoint). Keep
@@ -15680,7 +16054,14 @@ def validate_single_source(
     quick_seed: dict[str, Any] | None = None,
 ) -> tuple[ValidationOutcome, dict[str, Any] | None, dict[str, Any]]:
     holder: dict[str, Any] = {}
+    if _dbg.active():
+        _dbg.set_stage("full-validation")
+        _dbg.emit("begin")
     outcome, merged, detail = _validate_single_source(src, quick_seed, holder)
+    if _dbg.active():
+        _dbg.set_stage("full-validation")
+        _dbg.emit("end", ok=bool(outcome.passed), value=str(detail.get("failureReason") or ""),
+                  data={"failureReason": str(detail.get("failureReason") or ""), "error": str(detail.get("error") or "")})
     apply_interaction_state_to_detail(detail, holder.get("state"))
     return outcome, merged, detail
 
@@ -15756,6 +16137,10 @@ def _validate_single_source(
                 if isinstance(quick_scan, dict):
                     detail["quickScan"] = dict(quick_scan)
             detail["stages"]["search"] = True
+            if _dbg.active():
+                _dbg.set_stage("search")
+                _dbg.emit("info", code="seeded", count=len(book_urls),
+                          value=f"沿用快速扫描的搜索结果（{len(book_urls)} 本），不再重复搜索")
         else:
             try:
                 initial_timeout = remaining_source_validation_seconds(CONNECT_TIMEOUT)
@@ -15768,9 +16153,14 @@ def _validate_single_source(
             except Exception:
                 pass
             # Legado ScriptException in searchUrl/exploreUrl/bookList/item rules fails the stage.
+            if _dbg.active():
+                _dbg.set_stage("search")
+                _dbg.emit("begin")
             stage_sink = begin_script_error_stage(runtime)
             book_urls, search_base = fetch_book_candidates(session, src, runtime)
             finish_script_error_stage(runtime, stage_sink, detail, "search")
+            if _dbg.active():
+                _dbg.emit("end", ok=bool(book_urls), count=len(book_urls))
         if not book_urls:
             if (runtime.variables or {}).get("__searchChallenge") == "1":
                 detail["failureReason"] = "webView/paid content"
@@ -15792,9 +16182,14 @@ def _validate_single_source(
             first_book_url = recovered_detail_url
             detail["sampleBookUrl"] = first_book_url
         ensure_source_validation_time_remaining()
+        if _dbg.active():
+            _dbg.set_stage("info")
+            _dbg.emit("begin", url=first_book_url)
         stage_sink = begin_script_error_stage(runtime)
         ok, name, toc_url, detail_error = fetch_book_info(session, src, runtime, first_book_url)
         finish_script_error_stage(runtime, stage_sink, detail, "detail")
+        if _dbg.active():
+            _dbg.emit("end", ok=bool(ok), value=name or "")
         normalized_toc_url = (toc_url or "").strip()
         if not ok:
             detail["failureReason"] = "detail failed"
@@ -15813,6 +16208,9 @@ def _validate_single_source(
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
             return ValidationOutcome(False, reason="download-only source", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         ensure_source_validation_time_remaining()
+        if _dbg.active():
+            _dbg.set_stage("toc")
+            _dbg.emit("begin", url=normalized_toc_url or first_book_url)
         stage_sink = begin_script_error_stage(runtime)
         toc_ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages, toc_first_page, toc_unique_chapters = resolve_toc_source(
             session,
@@ -15822,6 +16220,8 @@ def _validate_single_source(
             normalized_toc_url or first_book_url,
         )
         finish_script_error_stage(runtime, stage_sink, detail, "toc")
+        if _dbg.active():
+            _dbg.emit("end", ok=bool(toc_ok), count=toc_unique_chapters, value=first_chapter_title or "")
         detail["tocFirstPageItemCount"] = toc_first_page
         detail["tocPagesWalked"] = toc_pages
         detail["tocUniqueChapterCount"] = toc_unique_chapters
@@ -15833,6 +16233,9 @@ def _validate_single_source(
         detail["stages"]["toc"] = True
         detail["firstChapterTitle"] = first_chapter_title
         ensure_source_validation_time_remaining()
+        if _dbg.active():
+            _dbg.set_stage("content")
+            _dbg.emit("begin", url=first_chapter_url)
         stage_sink = begin_script_error_stage(runtime)
         content_ok, content_preview, content_pages = resolve_chapter_content(
             session,
@@ -15843,6 +16246,8 @@ def _validate_single_source(
             name or str(src.get("bookSourceName") or ""),
         )
         finish_script_error_stage(runtime, stage_sink, detail, "content")
+        if _dbg.active():
+            _dbg.emit("end", ok=bool(content_ok), count=len(content_preview or ""))
         detail["contentPages"] = content_pages
         detail["contentPreviewChars"] = min(len(content_preview), 50_000) if content_preview else 0
         if content_ok and is_browser_deferred_content_source(src):
@@ -16526,15 +16931,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--idle-timeout", type=int, default=180, help="单轮无任何书源完成的最长等待秒数；超时后剩余源判失败，避免坏源拖死整批")
     parser.add_argument("--source-timeout", type=int, default=60, help="单个书源完整搜索/详情/目录/正文链路的硬截止秒数；0 表示不限制")
     parser.add_argument("--app-version", choices=("1.1.1", "1.1.2", "both"), default=DEFAULT_APP_VERSION, help="模拟的 App 版本：1.1.1=当前公开版（默认）；1.1.2=下一版；both=两版对比（只重跑受版本影响的书源，额外输出 *.app-1.1.2.json）")
+    parser.add_argument("--block-private-network", action="store_true", help="拒绝向私网 / 回环 / 链路本地 / 云元数据地址发请求（含重定向每一跳）；默认允许，因为本机运行时书源可能在局域网内")
     args = parser.parse_args(argv)
 
     if args.app_version == "both":
         if args.pipeline == "legacy":
             print("--app-version both requires --pipeline staged.", file=sys.stderr, flush=True)
             return 2
-        return _run_main(args, "both")
-    with app_profiles.app_profile_scope(args.app_version):
-        return _run_main(args, args.app_version)
+    previous_allow_private = net_guard.network_allows_private()
+    if args.block_private_network:
+        net_guard.set_network_policy(False)
+    try:
+        if args.app_version == "both":
+            return _run_main(args, "both")
+        with app_profiles.app_profile_scope(args.app_version):
+            return _run_main(args, args.app_version)
+    finally:
+        if args.block_private_network:
+            net_guard.set_network_policy(previous_allow_private)
 
 
 def _app_112_output_path(path: Path) -> Path:

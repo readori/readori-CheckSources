@@ -772,7 +772,12 @@ class ValidationService:
         job = self.store.job(job_id)
         if not job:
             return
-        with app_profiles.app_profile_scope(self._load_config(job)["app_version"]):
+        # R145b: the engine's outbound requests refuse private / loopback / link-local targets (every redirect hop,
+        # connection pinned to a validated address) unless the operator opted out with
+        # READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1. The scope is copied into the stage worker threads.
+        with core.network_policy_scope(self.settings.allow_private_network), app_profiles.app_profile_scope(
+            self._load_config(job)["app_version"]
+        ):
             self._run_job_in_profile(job_id)
 
     def _stage_failure_verdict(self, config: dict[str, Any], row: dict[str, Any], result: StageResult) -> str:
@@ -1227,6 +1232,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     import uvicorn
 
+    # R145b: process default for any engine call that is not inside a job scope (debug / rule-test endpoints).
+    net_guard.set_network_policy(settings.allow_private_network)
     uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level="info")
     return 0
 

@@ -128,7 +128,7 @@ install_os_dependencies() {
 
 bootstrap_minimal_runtime_files() {
   [ -f "$SOURCE_ROOT/validator/__init__.py" ] && \
-    [ -f "$SOURCE_ROOT/validator/validate_source_packages.py" ] &&     [ -f "$SOURCE_ROOT/validator/app_profiles.py" ] &&     [ -f "$SOURCE_ROOT/validator/net_guard.py" ] && \
+    [ -f "$SOURCE_ROOT/validator/validate_source_packages.py" ] &&     [ -f "$SOURCE_ROOT/validator/app_profiles.py" ] &&     [ -f "$SOURCE_ROOT/validator/net_guard.py" ] &&     [ -f "$SOURCE_ROOT/validator/debug_trace.py" ] && \
     [ -f "$SOURCE_ROOT/requirements-validate-sources.txt" ] && \
     [ -f "$SOURCE_ROOT/requirements.txt" ] && return
 
@@ -162,6 +162,7 @@ bootstrap_minimal_runtime_files() {
   fetch_runtime_file validator/validate_source_packages.py
   fetch_runtime_file validator/app_profiles.py
   fetch_runtime_file validator/net_guard.py
+  fetch_runtime_file validator/debug_trace.py
   fetch_runtime_file requirements-validate-sources.txt
   fetch_runtime_file requirements.txt
   mkdir -p "$SOURCE_ROOT/validator"
@@ -229,7 +230,7 @@ create_virtualenv() {
     -r "$INSTALL_DIR/server/requirements.txt"
   "$INSTALL_DIR/.venv/bin/python" -m py_compile \
     "$INSTALL_DIR/server/source_validator_server.py" \
-    "$INSTALL_DIR/validator/validate_source_packages.py"     "$INSTALL_DIR/validator/app_profiles.py"     "$INSTALL_DIR/validator/net_guard.py"
+    "$INSTALL_DIR/validator/validate_source_packages.py"     "$INSTALL_DIR/validator/app_profiles.py"     "$INSTALL_DIR/validator/net_guard.py"     "$INSTALL_DIR/validator/debug_trace.py"
 }
 
 existing_api_key_line() {

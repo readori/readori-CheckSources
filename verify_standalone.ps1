@@ -13,6 +13,12 @@ if (-not $Python) { throw "Python 3.12+ was not found. Pass -Python path." }
     (Join-Path $root "source_validator_cli.py") `
     (Join-Path $root "validator\validate_source_packages.py") `
     (Join-Path $root "validator\app_profiles.py") `
+    (Join-Path $root "validator\net_guard.py") `
+    (Join-Path $root "validator\debug_trace.py") `
+    (Join-Path $root "validator\debug_engine.py") `
+    (Join-Path $root "validator\rule_tester.py") `
+    (Join-Path $root "validator\fix_suggester.py") `
+    (Join-Path $root "validator\source_edit.py") `
     (Join-Path $root "static-tools\capture.py")
 & $Python -c "import sys; sys.path.insert(0, r'$root'); import source_validator_gui; print('GUI_IMPORT_OK')"
 Write-Host "Standalone static checks passed. Install requirements-validate-sources.txt before network validation."
