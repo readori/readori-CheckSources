@@ -25,6 +25,9 @@
 #   READORI_VALIDATOR_HOST (default 0.0.0.0)
 #   READORI_SKIP_APT=1 skips apt package installation (use only on prepared hosts)
 #   READORI_SKIP_SYSTEMD=1 installs files and the virtualenv without starting it
+#   READORI_REFRESH_RUNTIME=1 re-downloads the validator runtime files even when
+#     they already exist (upgrades of a server/-only checkout refresh them
+#     automatically; see bootstrap_minimal_runtime_files)
 
 set -Eeuo pipefail
 
@@ -133,6 +136,19 @@ bootstrap_minimal_runtime_files() {
   for module in $runtime_modules; do
     [ -f "$SOURCE_ROOT/validator/$module.py" ] || missing=1
   done
+  # Upgrades: in a server/-only (sparse) checkout `git pull` updates server/ but
+  # never the validator/ files an earlier run downloaded, so their presence is
+  # no proof they are current. Re-download them whenever this checkout was
+  # bootstrapped before (marker), is a sparse checkout without validator/, or
+  # the operator asks for it.
+  local bootstrap_marker="$SOURCE_ROOT/.readori-runtime-bootstrapped"
+  if [ -f "$bootstrap_marker" ] || [ "${READORI_REFRESH_RUNTIME:-0}" = "1" ]; then
+    missing=1
+  elif [ -d "$SOURCE_ROOT/.git" ] && command -v git >/dev/null 2>&1 && \
+    [ "$(git -c safe.directory="$SOURCE_ROOT" -C "$SOURCE_ROOT" config --bool core.sparseCheckout 2>/dev/null || true)" = "true" ] && \
+    ! git -c safe.directory="$SOURCE_ROOT" -C "$SOURCE_ROOT" sparse-checkout list 2>/dev/null | grep -qx 'validator'; then
+    missing=1
+  fi
   [ "$missing" -eq 0 ] && \
     [ -f "$SOURCE_ROOT/requirements-validate-sources.txt" ] && \
     [ -f "$SOURCE_ROOT/requirements.txt" ] && return
@@ -173,6 +189,7 @@ bootstrap_minimal_runtime_files() {
   cp -f "$bootstrap_dir/requirements-validate-sources.txt" "$SOURCE_ROOT/requirements-validate-sources.txt"
   cp -f "$bootstrap_dir/requirements.txt" "$SOURCE_ROOT/requirements.txt"
   rm -rf -- "$bootstrap_dir"
+  : > "$bootstrap_marker"
 }
 
 copy_project() {

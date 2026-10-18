@@ -151,6 +151,8 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 - 最快首轮筛选：`--quick-timeout 8 --rounds 1 --min-pass-rounds 1 --source-timeout 30`。
 - 稳定复测：只对快速扫描和首次完整验证均通过的源运行 `--rounds 3 --min-pass-rounds 2`；后续复测会重新执行搜索、详情、目录、正文。每轮只复测上一轮通过的源，所以 `--min-pass-rounds` 小于 `--rounds` 时的含义是“连续通过前 N 轮即可交付，之后的复测失败不再扣除”；中途失败的源不会再复测，也不会因为之后“恢复”而被计入。
 - 搜索关键词与 App 一致（R147）：只搜一个词，`ruleSearch.checkKeyWord` 非空白时原样使用，否则用 App 默认词“我的”；不会再轮换其他关键词。搜索通过后，只要 `exploreUrl` 有分类链接，发现页也会按 App 的 `发现失效` 规则检查（发现页没有书，整个书源判失败，失败原因 `explore failed`）；没有搜索、只有发现的源由发现页单独判定；分类列表里没有任何链接只是 App 的信息标签 `发现规则为空`，不算失败。
+- 发现候选的深度校验（R151，对齐 App `validateCandidate`）：搜索和发现都给出书时，发现页第一本书也要走详情 → 首个目录页 → 首章正文（与搜索候选同一套逻辑），任一失败整个书源判失败：详情失败 `explore detail failed`（脚本错误 `js失效`，其余 `网站失效`）、目录为空 `explore toc failed`（`发现目录失效`）、正文为空 `explore content failed`（`发现正文失效`）；明细 `stages` 仍描述搜索候选，发现候选结果在 `exploreCandidate`（`stages` / `failureReason` / `detailBookName` / `firstChapterTitle` / `contentPreviewChars`）。发现书与搜索书是同一本（URL 部分去空白、不分大小写、忽略 `,{options}`）时复用搜索结果，`exploreCandidate.reused` 为 true，不再多发请求。每个同时有搜索和发现的书源因此多约 3 个请求。
+- 发现链接构建完仍是 `@js:` / `<js>…</js>` 时（App `explore()` 的 `isJsExplore`）本地执行脚本、不发网络请求，脚本输出当作发现页内容；脚本抛错判 `js失效`。发现页内容是 JSONP（`callback({…})`）时先解包再解析书单。
 - 同站同书的多个通过变体聚合时，优先保留各阶段都真实通过、首章正文更完整、目录章节更多的变体（再按原有评分与响应时间）。
 - 无进度超时（idle timeout）后仍在运行的线程不会被强杀；它们计入后续阶段的并发预算（下一阶段会先等待一小段时间，再按剩余名额启动 worker），报告 `summary.abandonedWorkers` / `abandonedWorkersStillRunning` 记录被放弃的 worker 数。
 - 判定路径上被吞掉的异常（请求重试、规则求值、loginCheckJs 结果、CSS / XPath / JSONPath 解析等）会写入明细 `debugErrors`（最多 20 条，每条截断），只用于诊断，不改变判定。

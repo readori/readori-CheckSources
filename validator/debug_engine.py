@@ -55,6 +55,11 @@ KEY_KIND_ZH = {"auto": "完整校验", "search": "关键词", "explore": "发现
 STAGE_ZH = {"search": "搜索页", "explore": "发现页", "info": "详情页", "toc": "目录页", "content": "正文页"}
 
 _FAILURE_GROUPS: list[tuple[str, str]] = [
+    # R151: the discovery candidate's own detail / TOC / content chain (these must precede the plain `detail failed` /
+    # `toc failed` / `content failed` entries, which they contain as substrings).
+    ("explore detail failed", "网站失效"),
+    ("explore toc failed", "发现目录失效"),
+    ("explore content failed", "发现正文失效"),
     ("no search/explore result", "搜索失效"),
     ("explore failed", "发现失效"),
     ("detail failed", "网站失效"),

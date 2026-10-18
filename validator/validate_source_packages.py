@@ -405,6 +405,10 @@ class RuleRuntime:
     # {"kinds": [...], "failuresAtFirst": int | None, "failures": int}.
     allows_user_interaction: bool = True
     interaction_state: dict | None = None
+    # R151: the discovery candidate fetch_book_candidates() selected after a passing search (App doCheckSource's
+    # `.discovery` candidate): {"bookUrl", "base", "variables", "author", "reused"}. Report/validation metadata only;
+    # it is never read by rule evaluation. Serialisable, so the quick-scan seed can carry it.
+    explore_candidate: dict | None = None
 
 
 class RuleScriptError(RuntimeError):
@@ -14250,6 +14254,72 @@ def evaluate_init_rule_nonthrowing(rule: str, html: str, runtime: RuleRuntime, c
     return text if str(text).strip() else ""
 
 
+def candidate_url_key(book_url: str) -> str:
+    """BookSourceValidator.appendCandidate key: `UrlWithOptions.parse(bookUrl).url` trimmed and lower-cased (R151)."""
+    return parse_url_options(str(book_url or ""))[0].strip().lower()
+
+
+def explore_js_url_script(built_url: str) -> str | None:
+    """App explore() `isJsExplore` (BookSourceEngine+Flagship.swift:151-152): after the URL build the trimmed URL still
+    starts with `@js:` (case-sensitive), or is a `<js>…</js>` block. Returns the script (`dropFirst(4)` / `dropFirst(4)
+    .dropLast(5)`), else None (R151, E2)."""
+    trimmed = (built_url or "").strip()
+    if trimmed.startswith("@js:"):
+        return trimmed[4:]
+    if trimmed.startswith("<js>") and trimmed.endswith("</js>"):
+        return trimmed[4:-5]
+    return None
+
+
+def evaluate_explore_js_url(runtime: RuleRuntime, script: str, headers: dict[str, str]) -> tuple[str, str, int]:
+    """Run an `@js:` / `<js>` explore URL locally (no request): input "", the merged request headers, a response of
+    (script output, the source's effective base URL, 200). Variables the script puts stay visible to the list parse; a
+    script error is recorded like every other source-script error (the stage's finish_script_error_stage throws it,
+    App: RuleScriptError -> js失效)."""
+    base = runtime.base_url
+    script_runtime = RuleRuntime(**{
+        **runtime.__dict__,
+        "headers": dict(headers or {}),
+        "source_url": base,
+        "base_url": base,
+        "book_binding": "unbound",
+    })
+    result = evaluate_js(script, "", script_runtime)
+    if script_runtime.variables is not None and script_runtime.variables is not runtime.variables:
+        runtime.variables = script_runtime.variables
+    if script_runtime.script_error and not runtime.script_error:
+        runtime.script_error = script_runtime.script_error
+    return str(result if result is not None else ""), base, 200
+
+
+def detect_content_is_json(content: str) -> bool:
+    """BookSourceEngine.detectContentType == .json: a `{` / `[` body, or JSONP `callback({…})` (R151)."""
+    text = (content or "")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    text = text.strip()
+    if text.startswith(("{", "[")):
+        return True
+    match = re.match(r"\w+\s*\(", text)
+    if match:
+        return text[match.end():].lstrip(" \t\u00a0\u3000").startswith(("{", "["))
+    return False
+
+
+def extract_jsonp_body(content: str) -> str | None:
+    """BookSourceEngine.extractJSONPBody (BookSourceEngine.swift:2120): the text between the first `(` and the last `)`
+    when it is a JSON object / array; None for a plain JSON body or anything else (R151)."""
+    text = (content or "").strip()
+    if text.startswith(("{", "[")):
+        return None
+    open_index = text.find("(")
+    close_index = text.rfind(")")
+    if open_index < 0 or close_index < open_index:
+        return None
+    inner = text[open_index + 1:close_index].strip()
+    return inner if inner.startswith(("{", "[")) else None
+
+
 def collect_app_book_candidates(
     src: dict[str, Any],
     rule: dict[str, Any],
@@ -14324,6 +14394,7 @@ def fetch_book_candidates(
     """Search / discovery stage. R146 (debug): `keywords` replaces the validation keyword list, `modes` limits the
     stage to search and / or explore, `explore_url` replaces the first `exploreUrl` entry. Defaults = batch behavior."""
     begin_network_stage()
+    runtime.explore_candidate = None
     search_rule = src.get("ruleSearch") or {}
     explore_rule = src.get("ruleExplore") or {}
     if isinstance(search_rule, dict) and isinstance(explore_rule, dict) and not str(explore_rule.get("bookList") or "").strip():
@@ -14339,6 +14410,11 @@ def fetch_book_candidates(
     # R147 (task 2): App doCheckSource records `发现规则为空` (an info label, NOT a failure) when the exploreUrl yields no
     # category link; only a link that returns no book is `发现失效`.
     explore_link_empty = [False]
+    # R151 (E1): the source-level variable state (before any search / discovery item bound its own `@put` values).
+    source_level_variables = dict(runtime.variables or {})
+    # R151 (E1): variables / author / base of the first discovery item, filled by try_mode("explore") (the explore pass
+    # that follows a passing search turns it into `runtime.explore_candidate`).
+    explore_capture: dict[str, Any] = {}
 
     def try_mode(mode: str) -> tuple[list[str], str]:
         if mode not in modes:
@@ -14364,34 +14440,43 @@ def fetch_book_candidates(
                 explore_link_empty[0] = True
                 return [], ""
             base_url, explore_method, explore_params = req
-            response_meta: dict[str, Any] = {}
-            html, final_url, status = fetch_text(
-                session,
-                base_url,
-                method=explore_method,
-                headers=explore_params["headers"],
-                body=explore_params["body"],
-                charset=explore_params["charset"],
-                response_meta=response_meta,
-            )
-            if status == 0 and not html:
-                return [], final_url
-            if app_http_failure(base_url, status, html, "explore", src):
+            explore_js = explore_js_url_script(base_url)
+            if explore_js is not None:
+                # R151 (E2): the built URL is still `@js:` / `<js>…</js>` (App explore(): isJsExplore) - the script is
+                # evaluated locally, there is no request, no HTTP-status check and no login check.
+                html, final_url, status = evaluate_explore_js_url(runtime, explore_js, explore_params["headers"])
                 if _dbg.active():
-                    _dbg.emit("warn", code="http_error", url=base_url, status=status)
-                return [], final_url
-            login_ok, html, final_url = apply_login_check_js(
-                src, runtime, html, final_url, base_url, status,
-                request_method=explore_method,
-                request_body=str(explore_params["body"] or ""),
-                request_headers=explore_params["headers"],
-                response_headers=response_meta.get("headers", {}),
-                response_cookies=response_meta.get("cookies", {}),
-            )
-            if not login_ok:
-                if _dbg.active():
-                    _dbg.emit("warn", code="login_check", url=final_url)
-                return [], final_url
+                    _dbg.emit("info", code="explore_js", url=final_url, count=len(html),
+                              value="发现链接构建后仍是 @js:/<js> 脚本：本地执行，不发请求，结果当作发现页内容")
+            else:
+                response_meta: dict[str, Any] = {}
+                html, final_url, status = fetch_text(
+                    session,
+                    base_url,
+                    method=explore_method,
+                    headers=explore_params["headers"],
+                    body=explore_params["body"],
+                    charset=explore_params["charset"],
+                    response_meta=response_meta,
+                )
+                if status == 0 and not html:
+                    return [], final_url
+                if app_http_failure(base_url, status, html, "explore", src):
+                    if _dbg.active():
+                        _dbg.emit("warn", code="http_error", url=base_url, status=status)
+                    return [], final_url
+                login_ok, html, final_url = apply_login_check_js(
+                    src, runtime, html, final_url, base_url, status,
+                    request_method=explore_method,
+                    request_body=str(explore_params["body"] or ""),
+                    request_headers=explore_params["headers"],
+                    response_headers=response_meta.get("headers", {}),
+                    response_cookies=response_meta.get("cookies", {}),
+                )
+                if not login_ok:
+                    if _dbg.active():
+                        _dbg.emit("warn", code="login_check", url=final_url)
+                    return [], final_url
             # R149 (B7): no landing-page guard here. The App's explore() (BookSourceEngine+Flagship.swift:100-263) only
             # applies it to search (BookSourceEngine.swift:250-268), so a category such as "首页" (/) is judged by
             # whether the explore bookList rule finds books.
@@ -14406,7 +14491,12 @@ def fetch_book_candidates(
             runtime2 = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url})
             # R144a (F4): bookList has a rule here (has_explore), and the App's list heuristics (JSON wrapper
             # recovery, JSON key lists, HTML selector guesses) run only when the bookList rule is blank.
-            items = evaluate_book_list(str(explore_rule.get("bookList") or ""), html, runtime2)
+            # R151 (E2): App explore() unwraps a JSONP body (`callback({...})`) before parseExploreResult, for both the
+            # request and the `@js:` branch (BookSourceEngine+Flagship.swift:224-227, BookSourceEngine.extractJSONPBody).
+            explore_body = html
+            if detect_content_is_json(html):
+                explore_body = extract_jsonp_body(html) or html
+            items = evaluate_book_list(str(explore_rule.get("bookList") or ""), explore_body, runtime2)
             if _dbg.active():
                 _dbg.emit("list", field="bookList", rule=str(explore_rule.get("bookList") or ""), count=len(items),
                           value=items[0][:2000] if items else "")
@@ -14418,6 +14508,10 @@ def fetch_book_candidates(
                         _dbg.emit("warn", code="challenge", url=final_url)
                 return [], ""
             book_urls, selected_variables, selected_author = collect_app_book_candidates(src, explore_rule, items, runtime2)
+            if book_urls:
+                # R151 (E1): the first selected item is the App's `.discovery` candidate (its own variables / author).
+                explore_capture.clear()
+                explore_capture.update({"base": final_url, "variables": dict(selected_variables or {}), "author": selected_author})
             if selected_variables:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables.update(selected_variables)
@@ -14533,15 +14627,42 @@ def fetch_book_candidates(
             # App's effectiveExploreRule()). The explore candidate must not replace the search candidate's variables.
             saved_variables = dict(runtime.variables or {})
             saved_author = runtime.validation_book_author
+            explore_sink = runtime.script_error_sink
+            explore_sink_mark = len(explore_sink) if explore_sink is not None else 0
+            # R151 (E1): the App's discovery candidate is an independent SearchBook (own request context), so the explore
+            # pass starts from the source-level variables, not from the search item's `@put` state.
+            runtime.variables = dict(source_level_variables)
+            explore_capture.clear()
             try:
                 explore_ok_urls, _explore_ok_base = try_mode("explore")
             finally:
                 runtime.variables = saved_variables
                 runtime.validation_book_author = saved_author
+            if explore_ok_urls:
+                # BookSourceValidator.appendCandidate: candidates are keyed by the lower-cased trimmed URL part of
+                # `url,{options}`; a discovery book equal to the search book reuses its result (no second chain).
+                explore_book_url = str(explore_ok_urls[0])
+                runtime.explore_candidate = {
+                    "bookUrl": explore_book_url,
+                    "base": str(explore_capture.get("base") or _explore_ok_base or ""),
+                    "variables": dict(explore_capture.get("variables") or {}),
+                    "author": str(explore_capture.get("author") or ""),
+                    "reused": bool(candidate_url_key(explore_book_url))
+                    and candidate_url_key(explore_book_url) == candidate_url_key(str(search_urls[0])),
+                }
             if not explore_ok_urls and not explore_link_empty[0]:
                 note_app_validation_failure(runtime)
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables["__exploreFailed"] = "1"
+                # R151 (E2): a script error thrown while building / evaluating the discovery request is the App's
+                # `js失效` (explore() rethrows RuleScriptError), not a silent empty list.
+                explore_script_errors = [
+                    str(entry.get("message") or "")
+                    for entry in (explore_sink[explore_sink_mark:] if explore_sink is not None else [])
+                    if entry.get("kind") == "error"
+                ]
+                if explore_script_errors:
+                    runtime.variables["__exploreScriptError"] = explore_script_errors[0]
                 if _dbg.active():
                     _dbg.set_stage("explore")
                     _dbg.emit("warn", code="explore_failed", value="发现失效：搜索通过，但发现页没有可用的书（App 判整个书源失效）")
@@ -16554,7 +16675,15 @@ def _quick_scan_single_source(
             detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
             return False, None, detail
         if book_urls and (runtime.variables or {}).get("__exploreFailed") == "1":
-            _mark_explore_failed(detail)
+            explore_script_error = str((runtime.variables or {}).get("__exploreScriptError") or "")
+            if explore_script_error:
+                detail["error"] = explore_script_error
+                detail["scriptError"] = explore_script_error
+                detail["failureReason"] = "js error"
+                detail["failureGroup"] = "js失效"
+                detail["failedStage"] = "explore"
+            else:
+                _mark_explore_failed(detail)
             detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
             return False, None, detail
         if not book_urls:
@@ -16582,6 +16711,8 @@ def _quick_scan_single_source(
             "variables": dict(runtime.variables or {}),
             "cookies": requests.utils.dict_from_cookiejar(session.cookies),
             "searchBookAuthor": runtime.validation_book_author,
+            # R151 (E1): the discovery candidate (App `.discovery`), so the full chain runs it without re-fetching discovery.
+            "exploreCandidate": copy.deepcopy(runtime.explore_candidate) if isinstance(runtime.explore_candidate, dict) else None,
             "quickDetail": detail,
         }
         detail["ok"] = True
@@ -16593,6 +16724,169 @@ def _quick_scan_single_source(
         detail["failureReason"] = "exception"
         detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
         return False, None, detail
+
+
+def _run_detail_stage(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    detail: dict[str, Any],
+    book_url: str,
+    *,
+    stage: str = "detail",
+    label: str = "",
+) -> tuple[bool, str, str, str]:
+    """Detail stage of one candidate: deadline check, debug trace, per-stage script-error sink (`stage` names it)."""
+    ensure_source_validation_time_remaining()
+    begin_extra = {"value": label} if label else {}
+    if _dbg.active():
+        _dbg.set_stage("info")
+        _dbg.emit("begin", url=book_url, **begin_extra)
+    stage_sink = begin_script_error_stage(runtime)
+    result = fetch_book_info(session, src, runtime, book_url)
+    finish_script_error_stage(runtime, stage_sink, detail, stage)
+    if _dbg.active():
+        _dbg.emit("end", ok=bool(result[0]), value=result[1] or "")
+    return result
+
+
+def _run_toc_stage(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    detail: dict[str, Any],
+    book_url: str,
+    toc_url: str,
+    *,
+    stage: str = "toc",
+    label: str = "",
+) -> tuple[bool, str, str, str, int, int, int]:
+    """First-TOC stage of one candidate (same wrapper as `_run_detail_stage`)."""
+    ensure_source_validation_time_remaining()
+    begin_extra = {"value": label} if label else {}
+    if _dbg.active():
+        _dbg.set_stage("toc")
+        _dbg.emit("begin", url=toc_url or book_url, **begin_extra)
+    stage_sink = begin_script_error_stage(runtime)
+    result = resolve_toc_source(session, src, runtime, book_url, toc_url or book_url)
+    finish_script_error_stage(runtime, stage_sink, detail, stage)
+    if _dbg.active():
+        _dbg.emit("end", ok=bool(result[0]), count=result[6], value=result[3] or "")
+    return result
+
+
+def _run_content_stage(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    detail: dict[str, Any],
+    chapter_url: str,
+    chapter_title: str,
+    book_name: str,
+    *,
+    stage: str = "content",
+    label: str = "",
+) -> tuple[bool, str, int]:
+    """First-chapter content stage of one candidate (same wrapper as `_run_detail_stage`)."""
+    ensure_source_validation_time_remaining()
+    begin_extra = {"value": label} if label else {}
+    if _dbg.active():
+        _dbg.set_stage("content")
+        _dbg.emit("begin", url=chapter_url, **begin_extra)
+    stage_sink = begin_script_error_stage(runtime)
+    result = resolve_chapter_content(session, src, runtime, chapter_url, chapter_title, book_name)
+    finish_script_error_stage(runtime, stage_sink, detail, stage)
+    if _dbg.active():
+        _dbg.emit("end", ok=bool(result[0]), count=len(result[1] or ""))
+    return result
+
+
+EXPLORE_CANDIDATE_LABEL = "发现候选"
+
+
+def _run_explore_candidate_chain(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    candidate: dict[str, Any],
+    detail: dict[str, Any],
+) -> bool:
+    """R151 (E1): the App validates EVERY candidate (search AND discovery) through detail -> first TOC -> first chapter
+    (BookSourceValidator.validateCandidate); a failing discovery candidate fails the whole source. Returns True when the
+    discovery candidate FAILED (the failure is already written into `detail`).
+
+    * Dedupe (appendCandidate): a discovery book whose lower-cased URL part equals the search book reuses its result.
+    * The candidate runs on its own runtime built from the source (not the search book's bound state) with the
+      variables / author its list item produced; the session (cookies) and the interaction state are shared.
+    * Failures: detail -> `explore detail failed` (App classifyError: script error `js失效`, else `网站失效`);
+      empty TOC -> `explore toc failed` / `发现目录失效`; empty content -> `explore content failed` / `发现正文失效`.
+      A request-level network error replaces the reason the way the search chain does (`network error: …`).
+    """
+    book_url = str(candidate.get("bookUrl") or "").strip()
+    if not book_url:
+        return False
+    if candidate.get("reused"):
+        detail["exploreCandidate"] = {"bookUrl": book_url, "reused": True}
+        return False
+    info: dict[str, Any] = {
+        "bookUrl": book_url,
+        "stages": {"detail": False, "toc": False, "content": False},
+        "failureReason": "",
+        "detailBookName": "",
+        "firstChapterTitle": "",
+        "contentPreviewChars": 0,
+    }
+    detail["exploreCandidate"] = info
+    ex_runtime = make_runtime(src)
+    ex_runtime.interaction_state = runtime.interaction_state
+    variables = candidate.get("variables")
+    ex_runtime.variables = {str(key): str(value) for key, value in variables.items()} if isinstance(variables, dict) else {}
+    ex_runtime.validation_book_author = str(candidate.get("author") or "")
+    ensure_source_validation_time_remaining()
+    recovered_url = recover_book_detail_url_from_reader_candidate(session, ex_runtime, book_url)
+    if recovered_url:
+        info["originalBookUrl"] = book_url
+        book_url = recovered_url
+        info["bookUrl"] = book_url
+
+    def fail(reason: str, group: str, stage: str, error: str = "") -> bool:
+        info["failureReason"] = reason
+        detail["failureReason"] = reason
+        detail["failureGroup"] = group
+        if error:
+            detail["error"] = error
+        if attach_network_error(detail, stage):
+            # a transport / HTTP error is a site failure (App classifyError), not the discovery TOC / content group
+            detail.pop("failureGroup", None)
+            info["failureReason"] = str(detail.get("failureReason") or reason)
+        return True
+
+    ok, name, toc_url, detail_error = _run_detail_stage(
+        session, src, ex_runtime, detail, book_url, stage="explore detail", label=EXPLORE_CANDIDATE_LABEL
+    )
+    if not ok:
+        return fail("explore detail failed", "网站失效", "explore detail", detail_error or "")
+    info["stages"]["detail"] = True
+    info["detailBookName"] = name
+    normalized_toc_url = (toc_url or "").strip()
+    ex_runtime.book_name = name
+    ex_runtime.book_url = book_url
+    toc_ok, _toc_final_url, chapter_url, chapter_title, _pages, _first_page, _unique = _run_toc_stage(
+        session, src, ex_runtime, detail, book_url, normalized_toc_url, stage="explore toc", label=EXPLORE_CANDIDATE_LABEL
+    )
+    if not toc_ok:
+        return fail("explore toc failed", "发现目录失效", "explore toc")
+    info["stages"]["toc"] = True
+    info["firstChapterTitle"] = chapter_title
+    content_ok, content_preview, _content_pages = _run_content_stage(
+        session, src, ex_runtime, detail, chapter_url, chapter_title, name or str(src.get("bookSourceName") or ""),
+        stage="explore content", label=EXPLORE_CANDIDATE_LABEL,
+    )
+    info["contentPreviewChars"] = min(len(content_preview), 50_000) if content_preview else 0
+    if not content_ok:
+        return fail("explore content failed", "发现正文失效", "explore content")
+    info["stages"]["content"] = True
+    return False
 
 
 def _mark_explore_failed(detail: dict[str, Any]) -> None:
@@ -16710,6 +17004,8 @@ def _validate_single_source(
                 if isinstance(quick_scan, dict):
                     detail["quickScan"] = dict(quick_scan)
             detail["stages"]["search"] = True
+            seeded_explore = quick_seed.get("exploreCandidate")
+            explore_candidate = seeded_explore if isinstance(seeded_explore, dict) else None
             if _dbg.active():
                 _dbg.set_stage("search")
                 _dbg.emit("info", code="seeded", count=len(book_urls),
@@ -16723,6 +17019,7 @@ def _validate_single_source(
             stage_sink = begin_script_error_stage(runtime)
             book_urls, search_base = fetch_book_candidates(session, src, runtime)
             finish_script_error_stage(runtime, stage_sink, detail, "search")
+            explore_candidate = runtime.explore_candidate if isinstance(runtime.explore_candidate, dict) else None
             if _dbg.active():
                 _dbg.emit("end", ok=bool(book_urls), count=len(book_urls))
         if book_urls and (runtime.variables or {}).get("__exploreFailed") == "1":
@@ -16749,15 +17046,7 @@ def _validate_single_source(
             detail["originalSampleBookUrl"] = first_book_url
             first_book_url = recovered_detail_url
             detail["sampleBookUrl"] = first_book_url
-        ensure_source_validation_time_remaining()
-        if _dbg.active():
-            _dbg.set_stage("info")
-            _dbg.emit("begin", url=first_book_url)
-        stage_sink = begin_script_error_stage(runtime)
-        ok, name, toc_url, detail_error = fetch_book_info(session, src, runtime, first_book_url)
-        finish_script_error_stage(runtime, stage_sink, detail, "detail")
-        if _dbg.active():
-            _dbg.emit("end", ok=bool(ok), value=name or "")
+        ok, name, toc_url, detail_error = _run_detail_stage(session, src, runtime, detail, first_book_url)
         normalized_toc_url = (toc_url or "").strip()
         if not ok:
             detail["failureReason"] = "detail failed"
@@ -16775,21 +17064,9 @@ def _validate_single_source(
             detail["failureReason"] = "download-only source"
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
             return ValidationOutcome(False, reason="download-only source", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
-        ensure_source_validation_time_remaining()
-        if _dbg.active():
-            _dbg.set_stage("toc")
-            _dbg.emit("begin", url=normalized_toc_url or first_book_url)
-        stage_sink = begin_script_error_stage(runtime)
-        toc_ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages, toc_first_page, toc_unique_chapters = resolve_toc_source(
-            session,
-            src,
-            runtime,
-            first_book_url,
-            normalized_toc_url or first_book_url,
+        toc_ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages, toc_first_page, toc_unique_chapters = _run_toc_stage(
+            session, src, runtime, detail, first_book_url, normalized_toc_url
         )
-        finish_script_error_stage(runtime, stage_sink, detail, "toc")
-        if _dbg.active():
-            _dbg.emit("end", ok=bool(toc_ok), count=toc_unique_chapters, value=first_chapter_title or "")
         detail["tocFirstPageItemCount"] = toc_first_page
         detail["tocPagesWalked"] = toc_pages
         detail["tocUniqueChapterCount"] = toc_unique_chapters
@@ -16800,22 +17077,9 @@ def _validate_single_source(
             return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         detail["stages"]["toc"] = True
         detail["firstChapterTitle"] = first_chapter_title
-        ensure_source_validation_time_remaining()
-        if _dbg.active():
-            _dbg.set_stage("content")
-            _dbg.emit("begin", url=first_chapter_url)
-        stage_sink = begin_script_error_stage(runtime)
-        content_ok, content_preview, content_pages = resolve_chapter_content(
-            session,
-            src,
-            runtime,
-            first_chapter_url,
-            first_chapter_title,
-            name or str(src.get("bookSourceName") or ""),
+        content_ok, content_preview, content_pages = _run_content_stage(
+            session, src, runtime, detail, first_chapter_url, first_chapter_title, name or str(src.get("bookSourceName") or "")
         )
-        finish_script_error_stage(runtime, stage_sink, detail, "content")
-        if _dbg.active():
-            _dbg.emit("end", ok=bool(content_ok), count=len(content_preview or ""))
         detail["contentPages"] = content_pages
         detail["contentPreviewChars"] = min(len(content_preview), 50_000) if content_preview else 0
         if content_ok and is_browser_deferred_content_source(src):
@@ -16842,6 +17106,11 @@ def _validate_single_source(
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
             return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         detail["stages"]["content"] = True
+        # R151 (E1): the discovery candidate runs the same chain (App validateCandidate for `.discovery`); `stages` keeps
+        # describing the search candidate, the discovery result is in `detail["exploreCandidate"]`.
+        if explore_candidate and _run_explore_candidate_chain(session, src, runtime, explore_candidate, detail):
+            detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
+            return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         elapsed = int((time.perf_counter() - start) * 1000)
         detail["ok"] = True
         detail["failureReason"] = ""

@@ -138,3 +138,14 @@ sudo --preserve-env=READORI_VALIDATOR_API_KEY,READORI_VALIDATOR_HOST,READORI_VAL
 ### 升级
 
 新增了 `validator/debug_engine.py`、`rule_tester.py`、`fix_suggester.py`、`source_edit.py` 与 `server/debug_api.py`，**服务器必须重跑 `install_amd_micro.sh`**（或把这些文件一并同步）并重启服务，否则服务无法启动；安装脚本在只检出 `server/` 时会把这些 `validator/` 模块一起下载。安装完成后的 `verify_runtime` 会 `import server.debug_api`，缺文件时安装失败而不是服务起不来。
+
+升级已有服务器（SSH 登录 AMD Micro 后执行；`/etc/readori-validator/amd-micro.env` 里的 API key 会被复用，无需再导出）：
+
+```bash
+cd /opt/readori-source-validator
+git pull --ff-only
+sudo bash server/install_amd_micro.sh
+curl --fail http://127.0.0.1:8787/healthz
+```
+
+只检出 `server/` 的目录里，`validator/` 是安装脚本下载的，`git pull` 不会更新它；脚本会根据 `.readori-runtime-bootstrapped` 标记或稀疏检出状态自动重新下载最新的 `validator/` 与依赖清单（也可设 `READORI_REFRESH_RUNTIME=1` 强制）。安装脚本会重建虚拟环境依赖、`py_compile` 校验并重启服务，健康检查不过会直接报错并打印日志。服务器升级完成后再部署 Worker（见 `cloudflare/README.md`）。
