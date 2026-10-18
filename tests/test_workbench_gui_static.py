@@ -105,9 +105,11 @@ def test_entry_point_and_build_scripts_know_the_workbench() -> None:
 
 
 def test_new_files_use_lf_line_endings() -> None:
+    # Checkouts may convert to CRLF (core.autocrlf on Windows); only mixed endings are a defect.
     for path in (ROOT / "workbench_gui.py", ROOT / "validator" / "workbench_cli.py", ROOT / "source_validator_cli.py",
                  Path(__file__)):
-        assert b"\r\n" not in path.read_bytes(), path.name
+        raw = path.read_bytes()
+        assert raw.count(b"\r\n") in (0, raw.count(b"\n")), path.name
 
 
 def test_self_test_builds_the_control_tree_without_a_window() -> None:
