@@ -1013,7 +1013,9 @@ def test_search_failure_before_interaction_stays_invalid(book_pages) -> None:
         "bookSourceUrl": "https://a.example",
         "searchUrl": "/s?q={{key}}",
         "ruleSearch": {"bookList": ".b", "name": "a@text", "bookUrl": "a@href"},
-        "exploreUrl": "/c/1",
+        # R149: a segment without `::` is a title-only header in the App (BookSource.parseExploreUrlField), so the
+        # category needs a title for the discovery request (and its interaction) to exist at all.
+        "exploreUrl": "分类::/c/1",
         "ruleExplore": {
             "bookList": "<js>java.startBrowserAwait(baseUrl,'v');result</js>",
             "name": "a@text",

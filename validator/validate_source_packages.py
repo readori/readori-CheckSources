@@ -33,6 +33,8 @@ import zlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+import html.entities as _html_entities
+import html.parser as _html_parser_module
 from html import escape as html_escape, unescape as html_unescape
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -194,6 +196,45 @@ NODE_DYNAMIC_REQUESTS_PER_REPLAY = 8
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+
+# R149 (B10): attribute values of `BeautifulSoup(..., "html.parser")` come out of CPython's `html.parser`, which runs
+# `html.unescape` on them: `href="/c?id=1&section_slot=0"` turns `&sect` into `§` (`§ion_slot=0`, a 404 for the
+# chapter). Jsoup / SwiftSoup (Tokeniser.consumeCharacterReference with inAttribute) leave a semicolon-less named
+# reference alone when a letter, digit, `=`, `-` or `_` follows it, and text nodes are untouched (bs4 sets
+# convert_charrefs=False, so html.parser's `unescape` is only reached for attribute values).
+_ATTRIBUTE_CHARREF_RE = re.compile(r"&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[^\t\n\f <&#;]{1,32};?)")
+
+
+def jsoup_unescape_attribute(value: str) -> str:
+    if "&" not in value:
+        return value
+
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token[0] == "#":
+            return html_unescape(match.group(0))
+        if token.endswith(";"):
+            return html_unescape(match.group(0))
+        if token in _html_entities.html5:
+            return html_unescape(match.group(0))
+        for end in range(len(token) - 1, 1, -1):
+            if token[:end] in _html_entities.html5:
+                following = token[end]
+                if following.isalnum() or following in "=-_":
+                    return match.group(0)
+                return html_unescape(match.group(0))
+        return match.group(0)
+
+    return _ATTRIBUTE_CHARREF_RE.sub(replace, value)
+
+
+def install_jsoup_attribute_unescape() -> None:
+    if getattr(_html_parser_module, "unescape", None) is not None:
+        _html_parser_module.unescape = jsoup_unescape_attribute
+
+
+install_jsoup_attribute_unescape()
 
 _thread_local = threading.local()
 
@@ -9226,6 +9267,128 @@ def execute_trailing_url_js_block_if_needed(text: str, runtime: RuleRuntime, ext
     return url_part
 
 
+def split_explore_url_entries(text: str) -> list[str]:
+    """BookSource.splitExploreUrlEntries (BookSource.swift:1190-1196): split on newlines first, then on `&&`."""
+    return [
+        piece.strip()
+        for line in (text or "").splitlines()
+        for piece in line.split("&&")
+        if piece.strip()
+    ]
+
+
+def is_explore_action_url(text: str) -> bool:
+    """BookSource.isExploreActionURL: `{{js}}` entries are button actions, never a requestable category."""
+    value = (text or "").strip()
+    return value.startswith("{{") and value.endswith("}}")
+
+
+def is_script_explore_text(text: str) -> bool:
+    """BookSource.isScriptExploreUrlField: the first line starts with `@js:` / `<js>` / is exactly `@js`."""
+    stripped = (text or "").strip()
+    first_line = (stripped.splitlines() or [""])[0].strip().lower()
+    return first_line.startswith(("@js:", "<js>")) or first_line == "@js"
+
+
+def parse_explore_kinds_app(text: str, source_name: str) -> list[tuple[str, str]]:
+    """BookSource.parseExploreUrlField (BookSource.swift:1104-1180) for the OUTPUT of an `@js:` / `<js>` category script.
+
+    Unlike `parse_explore_urls` a plain segment without `::` is a title-only header (url ""), and `action` objects become
+    `{{action}}` entries; the caller picks the first entry whose url is neither empty nor an action."""
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return []
+    if trimmed.startswith("["):
+        try:
+            array = json.loads(trimmed)
+        except Exception:
+            array = None
+        if isinstance(array, list) and all(isinstance(item, dict) for item in array):
+            kinds: list[tuple[str, str]] = []
+            for item in array:
+                title = explore_object_value(item, ["title", "name", "label", "group", "type"])
+                url = explore_object_value(item, ["url", "href", "link", "value"])
+                if url:
+                    kinds.append((title or source_name, url))
+                    continue
+                action = explore_object_value(item, ["action"])
+                if action:
+                    kinds.append((title or source_name, "{{" + action + "}}"))
+                    continue
+                header = explore_object_value(item, ["title"])
+                if header:
+                    kinds.append((header, ""))
+            return kinds
+        loose = parse_loose_explore_objects(trimmed, source_name)
+        if loose:
+            return loose
+    if is_script_explore_text(trimmed):
+        return [(source_name, trimmed)]
+    kinds = []
+    for line in split_explore_url_entries(trimmed):
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                url = explore_object_value(obj, ["url", "href", "link", "value"])
+                if url:
+                    kinds.append((explore_object_value(obj, ["title", "name", "label", "group", "type"]) or source_name, url))
+                    continue
+            loose = parse_loose_explore_objects(line, source_name)
+            if loose:
+                kinds.append(loose[0])
+                continue
+        parts = line.split("::")
+        title = parts[0].strip()
+        url = parts[1].strip() if len(parts) >= 2 else ""
+        if not url:
+            if title:
+                kinds.append((title, ""))
+        else:
+            kinds.append((title or source_name, url))
+    return kinds
+
+
+def extract_explore_kinds_script(text: str) -> str | None:
+    """BookSourceEngine+Flagship.swift extractExploreKindsScript."""
+    trimmed = (text or "").strip()
+    lowered = trimmed.lower()
+    if lowered.startswith("@js:"):
+        return trimmed[4:]
+    if lowered.startswith("@js"):
+        return trimmed[3:]
+    if lowered.startswith("<js>") and lowered.endswith("</js>"):
+        return trimmed[4:-5]
+    return None
+
+
+def run_explore_kinds_script(explore_text: str, runtime: RuleRuntime) -> tuple[str | None, bool]:
+    """BookSourceEngine+Flagship.resolveExploreCategories (32-94): run the category script with no book and input "".
+
+    Returns (generated text, failed). A script exception is not a validation failure in the App - it becomes an
+    unclickable `ERROR:` header, i.e. `发现规则为空` - so errors are captured here instead of reaching the stage sink.
+    Validator-polyfill gaps (`compat` entries) are forwarded to the stage's sink as warnings."""
+    script = extract_explore_kinds_script(explore_text)
+    if script is None:
+        return None, False
+    outer_sink = getattr(runtime, "script_error_sink", None)
+    outer_error = getattr(runtime, "script_error", "")
+    local_sink: list = []
+    runtime.script_error_sink = local_sink
+    runtime.script_error = ""
+    try:
+        generated = evaluate_js(script, "", runtime).strip()
+    finally:
+        runtime.script_error_sink = outer_sink
+        runtime.script_error = outer_error
+    failed = any(entry.get("kind") == "error" for entry in local_sink)
+    if outer_sink is not None:
+        outer_sink.extend(entry for entry in local_sink if entry.get("kind") == "compat")
+    return generated, failed
+
+
 def parse_explore_urls(text: str, source_name: str) -> list[tuple[str, str]]:
     raw = (text or "").strip()
     if not raw:
@@ -9252,7 +9415,7 @@ def parse_explore_urls(text: str, source_name: str) -> list[tuple[str, str]]:
     if first_line.lower().startswith("@js:") or first_line.lower().startswith("<js>") or first_line.lower() == "@js":
         return [(source_name, raw)]
     results: list[tuple[str, str]] = []
-    for line in [ln.strip() for ln in raw.splitlines() if ln.strip()]:
+    for line in split_explore_url_entries(raw):
         try:
             if line.startswith("{") and line.endswith("}"):
                 obj = json.loads(line)
@@ -9499,6 +9662,8 @@ def normalize_selector(selector: str) -> str:
 
 def css_extract(html: str, selector: str, attr: str | None, index: int | None, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
+    if "tbody" in selector.lower():
+        _insert_implicit_tbody(soup)  # R149 (B4): Jsoup's HTML5 tree builder always puts <tr> into a <tbody>
     try:
         elems = soup.select(normalize_selector(selector))
     except Exception as _swallowed:
@@ -10609,6 +10774,12 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     if t.startswith(("$.", "$[")) or t.startswith("$.."):
         return evaluate_json_rule(t, content, runtime)
     if looks_like_bare_jsonpath(t):
+        if not is_json_content(content):
+            # R149 (B2): RuleType.swift:911-925 makes this `.contentDependent(json:, css:)` - on HTML the rule is a
+            # JSoup selector (`ul.xbk`, `a.title`); JSONPath is only the fallback for markup that embeds JSON.
+            css_values = evaluate_css_rule(t, content, runtime, content_type)
+            if css_values:
+                return css_values
         return evaluate_json_rule(t, content, runtime)
 
     if t.startswith("{{") and t.endswith("}}") and "\n" not in t:
@@ -10781,6 +10952,80 @@ def _css_elements_including_self(node: Any) -> list[Any]:
         elements.append(node)
     elements.extend(node.find_all(True))
     return elements
+
+
+def _css_element_has_class(element: Any, wanted_casefolded: str) -> bool:
+    """Jsoup/SwiftSoup `Element.hasClass(className)` as used by `getElementsByClass` (RuleEvaluator.swift:1005-1010).
+
+    A class name that itself contains whitespace (`class.a b c`) is compared with the WHOLE `class` attribute
+    (case-insensitive equality); a single-token name matches any whitespace separated token. It is never split into
+    several tokens that must all be present. SwiftSoup's source is not available offline; this follows Jsoup's
+    `hasClass` (equal length -> `equalsIgnoreCase(classAttr)`, otherwise whitespace-delimited region scan). BeautifulSoup
+    keeps `class` as a token list, so the attribute is rebuilt with single spaces (irregular whitespace inside the
+    original attribute is therefore treated as a single space)."""
+    classes = element.get("class", [])
+    if isinstance(classes, str):
+        classes = classes.split()
+    if not classes or not wanted_casefolded:
+        return False
+    tokens = [str(name) for name in classes]
+    if any(token.casefold() == wanted_casefolded for token in tokens):
+        return True
+    if any(ch.isspace() for ch in wanted_casefolded):
+        return " ".join(tokens).casefold() == wanted_casefolded
+    return False
+
+
+def _css_node_matches_selector(node: Any, selector: str) -> bool:
+    """Whether the context element itself matches `selector` (Jsoup select() includes the root element)."""
+    if getattr(node, "name", None) in (None, "[document]"):
+        return False
+    try:
+        css_namespace = getattr(node, "css", None)  # bs4 >= 4.12
+        if css_namespace is not None:
+            return bool(css_namespace.match(selector))
+        import soupsieve
+        return bool(soupsieve.match(selector, node))
+    except Exception as _swallowed:
+        note_debug_error("css self match", _swallowed)
+        return False
+
+
+def _insert_implicit_tbody(soup: Any) -> None:
+    """Local stand-in for the HTML5 tree builder's implicit `<tbody>` (Jsoup/SwiftSoup wrap the `<tr>` children of a
+    `<table>` in a `<tbody>`; html.parser does not). Only called when the rule mentions `tbody`, so the common path
+    pays nothing; each run of direct `<tr>` children of a table is wrapped in a new `<tbody>`."""
+    try:
+        tables = list(soup.find_all("table"))
+        for table in tables:
+            run: list[Any] = []
+            runs: list[list[Any]] = []
+            for child in list(table.children):
+                child_name = getattr(child, "name", None)
+                if child_name == "tr":
+                    run.append(child)
+                    continue
+                if child_name is None and not str(child).strip():
+                    # whitespace between rows keeps the current run open
+                    if run:
+                        run.append(child)
+                    continue
+                if run:
+                    runs.append(run)
+                    run = []
+            if run:
+                runs.append(run)
+            for rows in runs:
+                while rows and getattr(rows[-1], "name", None) is None:
+                    rows.pop()
+                if not rows or not any(getattr(item, "name", None) == "tr" for item in rows):
+                    continue
+                wrapper = soup.new_tag("tbody")
+                rows[0].insert_before(wrapper)
+                for item in rows:
+                    wrapper.append(item.extract())
+    except Exception as _swallowed:
+        note_debug_error("implicit tbody", _swallowed)
 
 
 def _css_own_text(node: Any) -> str:
@@ -10987,6 +11232,8 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
         final_attr = attr_override
 
     soup = BeautifulSoup(content, "html.parser")
+    if "tbody" in rule.lower():
+        _insert_implicit_tbody(soup)
     current: list[Any] = [soup]
     for part in parts:
         (selector_kind, selector_value), step_selection = parse_css_chain_part(part)
@@ -11001,10 +11248,7 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
                 wanted = selector_value.casefold()
                 for node in current:
                     for element in _css_elements_including_self(node):
-                        classes = element.get("class", [])
-                        if not isinstance(classes, list):
-                            classes = str(classes).split()
-                        if any(str(name).casefold() == wanted for name in classes):
+                        if _css_element_has_class(element, wanted):
                             selected.append(element)
             elif selector_kind == "tag":
                 wanted = selector_value.casefold()
@@ -11031,6 +11275,11 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
                     return []
                 normalized = normalize_selector(selector_value)
                 for node in current:
+                    # R149 (B3): Jsoup Element.select(css) collects from the element itself as well
+                    # (RuleEvaluator.swift:1034-1041 -> SwiftSoup select), so `.item-link@a@href` on an `<a class=item-link>`
+                    # item matches the item. soupsieve's select() only visits descendants.
+                    if _css_node_matches_selector(node, normalized):
+                        selected.append(node)
                     selected.extend(node.select(normalized))
         except Exception as _swallowed:
             note_debug_error("css chain selector", _swallowed)
@@ -12426,20 +12675,40 @@ def loading_verify_redirect_url(html: str, final_url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, "/userverify" + fragment, "", "", ""))
 
 
-def build_first_explore_url(explore_text: str, runtime: RuleRuntime) -> str | None:
+def build_first_explore_url(explore_text: str, runtime: RuleRuntime, *, resolve_categories: bool = False) -> str | None:
+    """First requestable discovery category. `resolve_categories=True` (the validation / debug request paths) follows the
+    App's resolveExploreCategories + BookSourceValidator.swift:2357-2360: an `@js:` / `<js>` exploreUrl is run to get its
+    category list and a title-only segment (no `::`) is a header, never a URL. The default keeps the lenient reading
+    that static checks (`source_has_absolute_entry_point`, `fallback_base_url_from_entry_point`) rely on."""
     previous_binding = getattr(runtime, "book_binding", "automatic")
     runtime.book_binding = "unbound"
     try:
-        return _build_first_explore_url(explore_text, runtime)
+        return _build_first_explore_url(explore_text, runtime, resolve_categories=resolve_categories)
     finally:
         runtime.book_binding = previous_binding
 
 
-def _build_first_explore_url(explore_text: str, runtime: RuleRuntime) -> str | None:
+def _build_first_explore_url(explore_text: str, runtime: RuleRuntime, *, resolve_categories: bool = False) -> str | None:
     entries = parse_explore_urls(explore_text, runtime.source_url)
+    if resolve_categories:
+        if is_script_explore_text(explore_text):
+            # R149 (B6): the App runs the script and parses its OUTPUT as the category list (JSON array / `title::url`
+            # lines split on `&&` and newlines); only an empty output falls back to the script itself.
+            generated, failed = run_explore_kinds_script(explore_text, runtime)
+            if failed:
+                return None
+            generated_entries = parse_explore_kinds_app(generated or "", runtime.source_url)
+            if generated_entries:
+                entries = generated_entries
+        else:
+            # R149 (B6): a title-only first line (潇湘书院 starts with `排行`, then `title::url` lines) is a header in the
+            # App, not `GET /排行`.
+            entries = parse_explore_kinds_app(explore_text, runtime.source_url)
     for _, url in entries:
-        if not url:
-            continue
+        if not url or not url.strip():
+            continue  # title-only header (App: isHeader)
+        if is_explore_action_url(url):
+            continue  # `{{js}}` button, never a category (BookSourceValidator.swift:2357-2360)
         if url.lower().startswith("@js:") or (url.lower().startswith("<js>") and url.lower().endswith("</js>")):
             return url
         # Resolve templates like {{page}} in explore URL
@@ -12511,7 +12780,7 @@ def request_search_or_explore(session: requests.Session, src: dict[str, Any], ru
     if mode == "search":
         template = app_profiles.app_search_url_template(src)
     else:
-        template = build_first_explore_url(str(src.get("exploreUrl") or ""), runtime) or ""
+        template = build_first_explore_url(str(src.get("exploreUrl") or ""), runtime, resolve_categories=True) or ""
     if not template:
         return None
     url, opts = build_url_with_options(template, keyword=keyword, page=page, runtime=runtime, session=session)
@@ -12638,6 +12907,13 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
         if results:
             return results
     if text.startswith(("$.", "$[")) or text.startswith("$..") or looks_like_bare_jsonpath(text):
+        if not text.startswith("$") and not is_json_content(html):
+            # R149 (B2): RuleEvaluator.swift:1534-1539 (.contentDependent in a list rule): JSON content -> JSONPath,
+            # HTML -> the JSoup selector (`ul.xbk`, `div.bookbox`), JSONPath only when the selector finds nothing.
+            selector, _attr, css_index = parse_css_rule(text)
+            css_items = css_extract(html, selector, "outerhtml", css_index, runtime.base_url)
+            if css_items:
+                return css_items
         return evaluate_json_object_list(text, html)
 
     if low.startswith("@xpath:"):
@@ -13974,7 +14250,7 @@ def fetch_book_candidates(
         if _dbg.active():
             _dbg.set_stage(mode)
         if mode == "explore":
-            template = explore_url or build_first_explore_url(str(src.get("exploreUrl") or ""), runtime)
+            template = explore_url or build_first_explore_url(str(src.get("exploreUrl") or ""), runtime, resolve_categories=True)
             if not template:
                 explore_link_empty[0] = True
                 return [], ""
@@ -14010,10 +14286,9 @@ def fetch_book_candidates(
                 if _dbg.active():
                     _dbg.emit("warn", code="login_check", url=final_url)
                 return [], final_url
-            if is_likely_search_or_explore_landing_url(final_url, runtime):
-                if _dbg.active():
-                    _dbg.emit("warn", code="landing", url=final_url)
-                return [], final_url
+            # R149 (B7): no landing-page guard here. The App's explore() (BookSourceEngine+Flagship.swift:100-263) only
+            # applies it to search (BookSourceEngine.swift:250-268), so a category such as "首页" (/) is judged by
+            # whether the explore bookList rule finds books.
             # Match Legado BookList: explicit rules see the fetched body before
             # generic marker classification. Search pages often bundle dormant
             # captcha/404/empty-state templates while still containing books.
@@ -14423,11 +14698,6 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
     if not name.strip() and not toc_url.strip() and is_likely_detail_error_json(json_obj):
         return False, "", "", json_first_text(json_obj, ["msg", "message", "error", "errorMsg", "reason"])
 
-    if not name.strip() and not toc_url.strip() and (
-        is_likely_detail_login_page(original_html) or is_likely_detail_login_page(html)
-    ):
-        return False, "", "", ""
-
     should_recover_toc_from_html = toc_heuristics_allowed and (not toc_url.strip() or is_likely_search_or_explore_landing_url(toc_url, runtime2))
     html_for_toc_recovery = original_html if original_html.strip() and not is_json_content(original_html) else html
     if should_recover_toc_from_html and html_for_toc_recovery.strip() and not is_json_content(html_for_toc_recovery):
@@ -14463,11 +14733,15 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
     if name.strip() and not is_usable_search_book_title(name):
         name = ""
 
-    # Engine behavior: if both are empty, detail failed.
+    # R149 (B5): the App's detail stage (BookSourceValidator.validateCandidate 2455-2480 -> getBookInfo) only fails when
+    # the request or a script throws. An unresolved name is the info detail "（书名未解析）" and tocUrl falls back to
+    # bookUrl (BookSourceEngine.swift:9123-9150), so `name` and `tocUrl` both empty is not a detail failure; a toc /
+    # content failure is judged by those stages. `toc_url` stays "" here and the caller already walks
+    # `normalized_toc_url or first_book_url`.
     if runtime.variables is None:
         runtime.variables = {}
     runtime.variables.update(runtime2.variables or {})
-    return bool(name or toc_url), name, toc_url, ""
+    return True, name, toc_url, ""
 
 
 def html_to_visible_text(html: str) -> str:
@@ -16135,38 +16409,10 @@ def _quick_scan_single_source(
     # R144a (F11): one fresh Session per source - no cookie of another source (or of an earlier round) leaks in, and
     # `enabledCookieJar: false` stops Set-Cookie from being stored.
     session = make_source_session(src)
-    try:
-        probe_timeout = remaining_source_validation_seconds(CONNECT_TIMEOUT)
-        # R144a (F11): the reachability probe uses a throwaway Session; the App never probes the home page, so its
-        # Set-Cookie must not seed the Session the real search / detail / toc / content requests use.
-        response = requests.Session().get(
-            runtime.base_url,
-            headers=runtime.headers,
-            timeout=(min(REQUEST_CONNECT_TIMEOUT, probe_timeout), probe_timeout),
-            allow_redirects=True,
-        )
-        # Any HTTP response proves that the host is reachable. A 4xx/5xx is
-        # retained for diagnostics; the search check below decides usability.
-        detail["quickScan"]["connectivity"] = True
-        detail["quickScan"]["statusCode"] = int(response.status_code or 0)
-        if _dbg.active():
-            _dbg.emit("info", code="connectivity", url=runtime.base_url, status=int(response.status_code or 0),
-                      value=f"站点首页可连通（HTTP {int(response.status_code or 0)}）")
-    except SourceValidationDeadlineExceeded:
-        raise
-    except Exception as exc:
-        if _dbg.active():
-            _dbg.emit("warn", code="connectivity", url=runtime.base_url, value=f"站点首页不可连通：{type(exc).__name__}: {exc}")
-        detail["error"] = str(exc)
-        # Sources with an absolute search/explore endpoint may intentionally
-        # use a non-HTTP bookSourceUrl (for example a JS/data endpoint). Keep
-        # probing the real entry point instead of rejecting them on the base
-        # URL probe alone.
-        if not source_has_absolute_entry_point(src):
-            detail["failureReason"] = "connectivity failed"
-            detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
-            return False, None, detail
-
+    # R149 (B8): no home page probe. The App's batch check (BookSourceValidator.doCheckSource) goes straight to search;
+    # the probe used to spend up to the whole 8s quick-scan quota (a slow home page left the real search ~1s) and
+    # could fail a source whose search endpoint works. Reachability is now judged by the search / explore request
+    # itself (`connectivity` is set when it returns a book).
     try:
         ensure_source_validation_time_remaining()
         # Quick scan does not turn source-script errors into failures (the full chain does), with one exception:
@@ -16354,17 +16600,7 @@ def _validate_single_source(
                 _dbg.emit("info", code="seeded", count=len(book_urls),
                           value=f"沿用快速扫描的搜索结果（{len(book_urls)} 本），不再重复搜索")
         else:
-            try:
-                initial_timeout = remaining_source_validation_seconds(CONNECT_TIMEOUT)
-                requests.Session().get(
-                    runtime.base_url,
-                    headers=runtime.headers,
-                    timeout=(min(REQUEST_CONNECT_TIMEOUT, initial_timeout), initial_timeout),
-                    allow_redirects=True,
-                )
-            except Exception as _swallowed:
-                note_debug_error("base url probe", _swallowed)
-                pass
+            # R149 (B8): no home page probe (the App has none; it only burned the per-source budget).
             # Legado ScriptException in searchUrl/exploreUrl/bookList/item rules fails the stage.
             if _dbg.active():
                 _dbg.set_stage("search")
