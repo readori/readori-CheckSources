@@ -12,6 +12,7 @@
 - 支持并发、复测轮次、失败原因、阶段明细和通过书源 JSON 输出。
 - 兼容 Legado/Readori 常见 CSS、XPath、JSONPath、内嵌 JavaScript、动态请求、Cookie、压缩包和部分 WebView/付费源识别。
 - GUI 支持选择 JSON 文件或目录、实时进度、取消任务、打开报告目录。
+- 按 App 版本判定（`--app-version 1.1.1|1.1.2|both`，默认 1.1.1），见下文“App 版本档案”。
 - `static-tools/capture.py` 提供静态审计、修复、合并和书源生成辅助，不代替联网验证。
 
 ## 快速运行（已有 Python）
@@ -31,8 +32,51 @@ python .\source_validator_cli.py `
   --validated-output-full .\output\validated_sources_full.json `
   --pipeline staged --quick-timeout 8 `
   --rounds 1 --min-pass-rounds 1 --workers 20 `
-  --source-timeout 30 --idle-timeout 180 --no-mirror
+  --source-timeout 30 --idle-timeout 180 --no-mirror `
+  --app-version 1.1.1
 ```
+
+## App 版本档案（1.1.1 / 1.1.2 / both）
+
+验证器回答的是“这条书源在某个 Readori App 版本里能不能用”。App 1.1.1（当前公开版）与 1.1.2（下一版）在四处行为不同，验证器按所选档案模拟：
+
+| 差异 | 1.1.1 | 1.1.2 |
+| --- | --- | --- |
+| `@js:` 开头的 searchUrl | 请求脚本里第一个 http(s) 字面量并丢弃脚本（取不到字面量才执行脚本） | 执行脚本，返回值才是搜索地址 |
+| String 字段写成 JSON 数组 / 对象（exploreUrl、loginUi、规则子字段等） | 整个字段丢弃（视为不存在） | 存成紧凑 JSON 文本 |
+| CryptoJS | 无条件装一个简化的假对象，会遮挡书源自带的库；`AES.encrypt` 不存在 | 书源引用且未自带时才装 crypto-js 4.1 兼容实现 |
+| 批量验证中被拦下的登录 / 验证交互 | 记为失效 | 记为“需要登录/验证”，不算失效 |
+
+三种模式：
+
+- `--app-version 1.1.1`（**默认**）：按当前公开版判定。通过的源在 1.1.1 里确实可用；输出文件路径和含义与以前相同。
+- `--app-version 1.1.2`：按下一版判定。输出路径不变，内容为 1.1.2 通过集。
+- `--app-version both`：两版对比。1.1.1 先跑全部书源，只有“档案敏感”的源（静态特征命中上表四项之一）才在 1.1.2 下重跑，其余直接复用 1.1.1 的结果。`--pipeline legacy` 不能与 `both` 同用。
+
+GUI 里的“App 版本”下拉框对应这三种模式（1.1.1（当前公开版）/ 1.1.2（下一版）/ 两版对比），默认 1.1.1。服务器任务用配置项 `config.app_version`（`1.1.1` 或 `1.1.2`，默认 1.1.1，Cloudflare 控制台有同名下拉框）；服务器不支持 `both`，想对比请提交两个任务。
+
+输出文件：
+
+- `--validated-output` 与 `--validated-output-full`：`both` 模式下仍是 1.1.1 通过集，默认消费方不受影响。
+- `both` 模式额外写 `<文件名>.app-1.1.2<后缀>`（例如 `validated_sources.app-1.1.2.json` 和 `validated_sources_full.app-1.1.2.json`），内容为 1.1.2 通过集。
+- 报告（`--report-path`）只增不减：每条结果带 `appVersion`、`appVerdict`（`pass`/`invalid`/`needsInteraction`/`timeout`），`both` 模式另有兼容性标签（如“两版均可用”“仅 1.1.2 可用”“1.1.1 失效、1.1.2 需要登录/验证”）和 `passedSourcesByAppVersion`。
+
+分组与标签（写进书源的 `bookSourceGroup` / `customTag`）：
+
+- 通过源的 `customTag` 为 `✅ 完整验证通过（书籍+详情+目录+正文）`。App 的 `searchValidationTier` / `healthStatus` 只认含“完整验证通过”的标签（排序权重 4，健康状态 healthy）；旧标签 `✅ 书籍+详情+目录+正文通过` 在 App 里不被识别。
+- `bookSourceGroup` 为验证日期 `MMDD`（洛杉矶时区）。1.1.2 档案下，档案敏感且未在 1.1.1 通过的源会在 `MMDD` 后追加分组 `需1.1.2`：把 1.1.2 的包导入 1.1.1 时可以按这个分组筛掉；1.1.2 正式上架后可批量删除该分组。分组不含“失效”，不影响健康判定。
+
+已知偏差（验证器与 App 不完全一致的地方）：
+
+- 本机验证 JS 默认走 Node；没有安装 QuickJS 时 QuickJS 路径只能靠单元测试和 CI 覆盖。
+- DES / 3DES 的 CTR 模式（CommonCrypto 支持）在验证器里返回 `!unsupported mode`：加密抛错、解密得空。AES 全部模式、DES / 3DES 的 CBC / ECB / CFB / OFB 与 App 一致。
+- `both` 模式靠静态特征判断是否重跑。动态拉取的脚本只有写成 `eval(java.ajax/get/cacheFile …)` 或 `java.importScript(` 才会被识别为 CryptoJS 敏感，其他动态代码可能漏判；需要完全确定时请分别用 `1.1.1` 和 `1.1.2` 各跑一遍。
+- 静态预判（脚本里出现 `getVerificationCode(` / `openUrl(`，或 loginCheckJs 里出现 `startBrowserAwait(`）仍会提前判失败，只会偏保守（误判失败，不会误判通过）。`openUrl` 在 App 里不被记录，所以 1.1.2 下也记失效；`getVerificationCode` 与 loginCheckJs 里的 `startBrowserAwait` 在 1.1.2 下记“需要登录/验证”。
+- 切到 1.1.1 档案后，一部分以前“通过”的源会变成失败，这是预期结果：例如 `@js:` 带字面量的源（已发布通过包里有 5 个），1.1.1 实际会请求字面量、丢掉 POST body；依赖 `startBrowserAwait` 的源，批量验证没有人手完成验证，在 1.1.1 里记失效。
+- 规则对象被存成 JSON 字符串（`"ruleSearch":"{...}"`）时，两档案都按 App 的规则解开，再套简写；有这种写法的源结果可能与旧版验证器不同。
+- 服务器版不支持 `both`；任务配置存在已有的 `config_json` 里，不改 SQLite 表结构，旧任务没有 `app_version` 时按默认版本处理。
+
+默认版本是 1.1.1；1.1.2 正式上架当天才把 `validator/app_profiles.py` 的 `DEFAULT_APP_VERSION` 改成 1.1.2（同步守卫），不要提前改。
 
 ## 生成独立 EXE
 
@@ -86,7 +130,8 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 
 - 最快首轮筛选：`--quick-timeout 8 --rounds 1 --min-pass-rounds 1 --source-timeout 30`。
 - 稳定复测：只对快速扫描和首次完整验证均通过的源运行 `--rounds 3 --min-pass-rounds 2`；后续复测会重新执行搜索、详情、目录、正文。
-- `--pipeline legacy` 可临时回退到旧版完整轮次调度，便于结果对比。
+- `--pipeline legacy` 可临时回退到旧版完整轮次调度，便于结果对比（只能配合单个 App 版本，不能配合 `both`）。
+- `--app-version` 默认 1.1.1（当前公开版）；准备发布 1.1.2 前用 `both` 看哪些源两版表现不同。
 - `--workers` 不宜盲目增大；建议先使用 8–20，并观察目标站点是否限流。
 - `--source-timeout 0` 表示不限制，不建议对大批源使用。
 

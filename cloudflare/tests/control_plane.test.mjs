@@ -67,6 +67,29 @@ test("job creation is forwarded with the server token and compatible field names
   }
 });
 
+test("job creation passes config.app_version through to the server", async () => {
+  const original = globalThis.fetch;
+  let forwarded = null;
+  globalThis.fetch = async (request, options) => {
+    assert.equal(new URL(request).pathname, "/v1/jobs");
+    forwarded = JSON.parse(options.body);
+    return new Response(JSON.stringify({ job: { id: "job-2", status: "queued", input_name: "sources.json", source_count: 1, config_json: JSON.stringify({ app_version: "1.1.2" }) }, deduplicated: 0 }), { status: 201, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const response = await worker.fetch(new Request("https://control.example/api/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ inputName: "sources.json", sources: [{ bookSourceUrl: "https://example.com" }], config: { app_version: "1.1.2" } }),
+    }), env);
+    assert.equal(response.status, 201);
+    assert.equal(forwarded.config.app_version, "1.1.2");
+    const body = await response.json();
+    assert.equal(body.job.config.app_version, "1.1.2");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test("status and event polling are translated from the local server API", async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async (request) => {

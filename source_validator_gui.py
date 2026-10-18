@@ -25,6 +25,15 @@ PROGRESS_RE = re.compile(r"Progress:\s*(\d+)/(\d+),\s*passed=(\d+)")
 ROUND_RE = re.compile(r"=== .*?(\d+)/(\d+) 轮")
 LOADED_RE = re.compile(r"Loaded\s+(\d+)\s+records.*?(\d+)\s+unique source URLs")
 STAGE_RE = re.compile(r"stage=([\w-]+)")
+PROFILE_RE = re.compile(r"=== App (\d+\.\d+\.\d+)")
+
+# R143: the label shown in the selector -> value of the CLI's --app-version. The first entry is the default
+# (App 1.1.1 is the current public build).
+APP_VERSION_CHOICES = {
+    "1.1.1（当前公开版）": "1.1.1",
+    "1.1.2（下一版）": "1.1.2",
+    "两版对比": "both",
+}
 
 
 def application_dir() -> Path:
@@ -67,6 +76,7 @@ class ValidatorApp(tk.Tk):
         self.source_timeout_var = tk.IntVar(value=30)
         self.idle_timeout_var = tk.IntVar(value=180)
         self.limit_var = tk.IntVar(value=0)
+        self.app_version_var = tk.StringVar(value=next(iter(APP_VERSION_CHOICES)))
         self.status_var = tk.StringVar(value="请选择 JSON 文件或目录，然后开始验证")
         self.detail_var = tk.StringVar(value="")
         self.progress_var = tk.DoubleVar(value=0)
@@ -118,11 +128,24 @@ class ValidatorApp(tk.Tk):
         self._spin(options, 1, 2, "完整验证超时", self.source_timeout_var, 0, 600)
         self._spin(options, 1, 4, "无进度超时(秒)", self.idle_timeout_var, 0, 3600)
         self._spin(options, 2, 0, "仅验证前 N 个", self.limit_var, 0, 1_000_000)
+        ttk.Label(options, text="App 版本").grid(row=2, column=2, sticky="w", padx=(0, 5), pady=4)
+        ttk.Combobox(
+            options,
+            textvariable=self.app_version_var,
+            values=list(APP_VERSION_CHOICES),
+            state="readonly",
+            width=16,
+        ).grid(row=2, column=3, columnspan=2, sticky="w", padx=(0, 22), pady=4)
         ttk.Label(
             options,
             text="流水线：先去重，再以 5-10 秒快速扫描筛选，最后对通过源做完整链路和稳定复测；0 表示不限制。",
             style="Hint.TLabel",
         ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(9, 0))
+        ttk.Label(
+            options,
+            text="默认按当前公开版 1.1.1 判定；两版对比会额外输出 *.app-1.1.2.json。",
+            style="Hint.TLabel",
+        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(3, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=(14, 8))
@@ -220,6 +243,7 @@ class ValidatorApp(tk.Tk):
             "--quick-timeout", str(max(0, self.quick_timeout_var.get())),
             "--source-timeout", str(max(0, self.source_timeout_var.get())),
             "--no-mirror",
+            "--app-version", APP_VERSION_CHOICES.get(self.app_version_var.get(), next(iter(APP_VERSION_CHOICES.values()))),
         ]
         if self.limit_var.get() > 0:
             command.extend(["--limit", str(self.limit_var.get())])
@@ -305,6 +329,9 @@ class ValidatorApp(tk.Tk):
                         if stage.startswith("stability-"):
                             stage = "稳定性复测 " + stage.split("-", 1)[1]
                         self.status_var.set(stage_labels.get(stage, stage))
+                profile_match = PROFILE_RE.search(line)
+                if profile_match:
+                    self.status_var.set(f"App {profile_match.group(1)} 验证")
                 round_match = ROUND_RE.search(line)
                 if round_match:
                     self.status_var.set(f"第 {round_match.group(1)}/{round_match.group(2)} 轮")

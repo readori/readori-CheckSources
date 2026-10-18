@@ -1,0 +1,106 @@
+name: Readori Source Validator Cloudflare Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "仅检查 Wrangler 包，或部署 Pages/Worker 反向代理"
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - dry-run
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readori-source-validator-cloudflare-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+      VALIDATOR_SERVER_URL: ${{ secrets.VALIDATOR_SERVER_URL || vars.VALIDATOR_SERVER_URL || 'https://syyz-api.readori.com' }}
+      VALIDATOR_SERVER_TOKEN: ${{ secrets.VALIDATOR_SERVER_TOKEN }}
+      FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN || vars.FRONTEND_ORIGIN }}
+      DEPLOY_MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate server-only deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || missing+=(CLOUDFLARE_API_TOKEN)
+          [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || missing+=(CLOUDFLARE_ACCOUNT_ID)
+          [ -n "${VALIDATOR_SERVER_URL:-}" ] || missing+=(VALIDATOR_SERVER_URL)
+          if [ "${DEPLOY_MODE}" != "dry-run" ]; then
+            [ -n "${VALIDATOR_SERVER_TOKEN:-}" ] || missing+=(VALIDATOR_SERVER_TOKEN)
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing deployment secrets/variables: ${missing[*]}"
+            echo "::error::D1/R2/Queue credentials are no longer used. Configure VALIDATOR_SERVER_URL and VALIDATOR_SERVER_TOKEN instead."
+            exit 1
+          fi
+          echo "::add-mask::$CLOUDFLARE_API_TOKEN"
+          [ -z "${VALIDATOR_SERVER_TOKEN:-}" ] || echo "::add-mask::$VALIDATOR_SERVER_TOKEN"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Install Wrangler
+        working-directory: tools/source-validator/cloudflare
+        run: npm install --no-audit --no-fund --ignore-scripts
+
+      - name: Generate deployment configuration
+        working-directory: tools/source-validator/cloudflare
+        shell: bash
+        run: |
+          set -euo pipefail
+          frontend_origin="${FRONTEND_ORIGIN:-https://syyz.readori.com}"
+          python3 - wrangler.toml wrangler-ci.toml "$VALIDATOR_SERVER_URL" "$frontend_origin" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          source, target, server_url, origin = sys.argv[1:]
+          text = Path(source).read_text(encoding="utf-8")
+          text = text.replace('VALIDATOR_SERVER_URL = "https://syyz-api.readori.com"', f'VALIDATOR_SERVER_URL = {json.dumps(server_url)}')
+          text = text.replace('FRONTEND_ORIGIN = ""', f'FRONTEND_ORIGIN = {json.dumps(origin)}')
+          Path(target).write_text(text, encoding="utf-8")
+          PY
+          test -s wrangler-ci.toml
+
+      - name: Validate Wrangler package
+        working-directory: tools/source-validator/cloudflare
+        run: npx wrangler deploy --dry-run --config wrangler-ci.toml --outdir .wrangler-dry-run
+
+      - name: Deploy server-only Worker/Pages proxy
+        if: ${{ inputs.mode == 'deploy' }}
+        working-directory: tools/source-validator/cloudflare
+        run: |
+          npx wrangler deploy --config wrangler-ci.toml
+          printf '%s' "$VALIDATOR_SERVER_TOKEN" | npx wrangler secret put VALIDATOR_SERVER_TOKEN --config wrangler-ci.toml
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Server-only Cloudflare deployment'
+            echo
+            echo '- D1: **not used**'
+            echo '- R2: **not used**'
+            echo '- Queue: **not used**'
+            echo '- AMD Micro: local FastAPI + SQLite server'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -17,6 +17,7 @@ configure ``READORI_VALIDATOR_API_KEY`` and ``READORI_VALIDATOR_DB``.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import hmac
 import json
 import logging
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
+from validator import app_profiles
 from validator import validate_source_packages as core
 
 try:  # FastAPI is optional for the Windows one-file validator.
@@ -506,6 +508,14 @@ class ValidationService:
         config["idle_timeout"] = max(0.0, min(900.0, float(config.get("idle_timeout") or 180.0)))
         config["max_retries"] = max(0, min(3, int(config.get("max_retries") or 1)))
         config["profile"] = "device" if str(config.get("profile") or "device").lower() != "legacy" else "legacy"
+        # R143: which App version the verdicts follow.  Jobs stored before this key existed (or with an unknown
+        # value) fall back to the default public version; `both` is not supported here - submit two jobs to compare.
+        requested_app_version = str(config.get("app_version") or "").strip()
+        config["app_version"] = (
+            requested_app_version
+            if requested_app_version in app_profiles.SUPPORTED_APP_VERSIONS
+            else app_profiles.DEFAULT_APP_VERSION
+        )
         if self.settings.amd_micro:
             # Oracle VM.Standard.E2.1.Micro has 1 GB RAM and a fraction of a
             # vCPU.  Enforce a safe profile even when a remote client sends
@@ -604,7 +614,10 @@ class ValidationService:
                     row = next(iterator)
                 except StopIteration:
                     return
+                # Worker threads do not inherit contextvars; give each submission its own copy so the App profile
+                # selected for this job (R143) applies inside the stage handlers.
                 future = executor.submit(
+                    contextvars.copy_context().run,
                     self._execute_item,
                     row,
                     stage,
@@ -646,6 +659,22 @@ class ValidationService:
         job = self.store.job(job_id)
         if not job:
             return
+        with app_profiles.app_profile_scope(self._load_config(job)["app_version"]):
+            self._run_job_in_profile(job_id)
+
+    def _stage_failure_verdict(self, config: dict[str, Any], row: dict[str, Any], result: StageResult) -> str:
+        try:
+            source = json.loads(str(row.get("source_json") or "{}"))
+        except json.JSONDecodeError:
+            source = {}
+        return app_profiles.app_verdict(
+            result.detail, result.passed, config["app_version"], src=source if isinstance(source, dict) else None
+        )
+
+    def _run_job_in_profile(self, job_id: str) -> None:
+        job = self.store.job(job_id)
+        if not job:
+            return
         if job.get("status") == "completed":
             return
         config = self._load_config(job)
@@ -666,6 +695,9 @@ class ValidationService:
 
         def save_quick(row: dict[str, Any], result: StageResult) -> None:
             safe_detail = redact(result.detail)
+            safe_detail["appVersion"] = config["app_version"]
+            if not result.passed:
+                safe_detail["appVerdict"] = self._stage_failure_verdict(config, row, result)
             self.store.update_source(
                 job_id,
                 str(row["source_key"]),
@@ -700,6 +732,18 @@ class ValidationService:
             return StageResult(record is not None, record, detail, str(detail.get("error") or detail.get("failureReason") or ""))
 
         def save_full(row: dict[str, Any], result: StageResult) -> None:
+            extra: dict[str, Any] = {}
+            if not result.passed:
+                # No schema change: keep the App verdict of a full-chain failure next to the quick-scan detail.
+                try:
+                    stored = json.loads(str(row.get("quick_json") or "{}"))
+                except json.JSONDecodeError:
+                    stored = {}
+                if isinstance(stored, dict):
+                    stored["appVersion"] = config["app_version"]
+                    stored["appVerdict"] = self._stage_failure_verdict(config, row, result)
+                    stored["appVerdictStage"] = "full-validation"
+                    extra["quick_json"] = json_dumps(stored)
             self.store.update_source(
                 job_id,
                 str(row["source_key"]),
@@ -709,6 +753,7 @@ class ValidationService:
                 stability_last_round=1 if result.passed else 0,
                 last_error=str(result.error or result.detail.get("failureReason") or ""),
                 attempts=int(row.get("attempts") or 0) + 1,
+                **extra,
             )
 
         full_rows = [row for row in rows if str(row.get("quick_status")) == "passed" and str(row.get("full_status")) == "pending"]
@@ -763,7 +808,7 @@ class ValidationService:
         passed = self.store.finalize_sources(job_id, int(config["rounds"]), int(config["min_pass_rounds"]))
         total = len(rows)
         self.store.update_job(job_id, status="completed", stage="completed", completed_count=total, passed_count=passed, progress=1.0, error="", cancel_requested=0)
-        self.store.event(job_id, "info", "completed", f"validation completed: {passed}/{total} device-ready sources", {"passed": passed, "total": total})
+        self.store.event(job_id, "info", "completed", f"validation completed: {passed}/{total} device-ready sources (App {config['app_version']})", {"passed": passed, "total": total, "app_version": config["app_version"]})
 
     def resume(self, job_id: str) -> bool:
         job = self.store.job(job_id)
@@ -818,6 +863,8 @@ if BaseModel is not None:
         idle_timeout: float = Field(default=180.0, ge=0, le=900)
         max_retries: int = Field(default=1, ge=0, le=3)
         profile: str = Field(default="device", pattern="^(device|legacy)$")
+        # R143: App version the verdicts follow (1.1.1 = current public build).  `profile` above is device|legacy.
+        app_version: str = Field(default=app_profiles.DEFAULT_APP_VERSION, pattern=r"^1\.1\.[12]$")
 
 
     class CreateJobModel(BaseModel):

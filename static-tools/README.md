@@ -16,12 +16,12 @@ The tool has two primary workflows:
 It is intentionally conservative. Static validation proves that a source has the
 minimum import/runtime fields, not that every target website is currently
 readable. Runtime validation should still be done in Readori or with
-`scripts/validate_source_packages.py`.
+`validator/validate_source_packages.py`.
 
 ## 1. Install
 
 ```bash
-cd tools/booksource-auto-builder
+cd tools/source-validator/static-tools
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -104,7 +104,7 @@ Audit one or more existing Legado/Readori source packages:
 
 ```bash
 python capture.py \
-  --audit-file ../../docs/Json/shareBookSource.json \
+  --audit-file ../data/shareBookSource.json \
   --audit-output output/shareBookSource.audit.md \
   --report output/shareBookSource.audit.report.json \
   --audit-keyword 测试 \
@@ -151,7 +151,7 @@ Repair a local package:
 
 ```bash
 python capture.py \
-  --repair-file ../../docs/Json/shareBookSource.json \
+  --repair-file ../data/shareBookSource.json \
   --package-output output/repaired-sources.json \
   --report output/repaired-sources.report.json
 ```
@@ -292,11 +292,11 @@ Static checks include:
 After static repair, run the project validator when network validation is needed:
 
 ```bash
-python scripts/validate_source_packages.py \
+python validator/validate_source_packages.py \
   --input output/public-sources.usable.json \
-  --report-path docs/Json/validation_report_runtime.json \
-  --validated-output docs/Json/bookinfo_validated_sources.json \
-  --validated-output-full docs/Json/bookinfo_validated_sources_full.json
+  --report-path data/validation_report_runtime.json \
+  --validated-output data/bookinfo_validated_sources.json \
+  --validated-output-full data/bookinfo_validated_sources_full.json
 ```
 
 The validator checks the four required runtime stages: search/explore, detail,

@@ -55,6 +55,17 @@ sudo --preserve-env=READORI_VALIDATOR_API_KEY,READORI_VALIDATOR_HOST,READORI_VAL
 4. `POST /v1/jobs/{id}/cancel` 可取消；`POST /v1/jobs/{id}/resume` 从 SQLite 已完成阶段继续，不重复验证已确认的源。
 5. `GET /v1/jobs/{id}/result` 只返回完整链路和设备兼容性检查均通过的 Readori 书源 JSON。
 
+## App 版本
+
+任务配置项 `app_version` 决定按哪个 Readori App 版本判定书源：`1.1.1`（当前公开版，**默认**）或 `1.1.2`（下一版）。例如 `POST /v1/jobs` 的 `config` 里带 `{"app_version": "1.1.2"}`；Cloudflare 控制台的“App 版本”下拉框传的就是它。注意 `profile` 仍然表示 `device|legacy`，与 App 版本无关。
+
+- 服务器不支持 `both`。想对比两版，用同一份书源提交两个任务（`1.1.1` 和 `1.1.2`），再比较两份结果。
+- 版本只存在已有的 `jobs.config_json` 里，不改 SQLite 表结构。任务创建前存下的旧任务没有这个键，恢复时按默认版本（1.1.1）处理；不认识的值同样回退到默认版本。
+- 每个任务在自己的上下文里运行，各阶段线程池会把当前版本带进工作线程，所以并发的 1.1.1 / 1.1.2 任务互不串档案。
+- 快速扫描失败的源，`quick_json` 里会带 `appVersion` 和 `appVerdict`（`pass` / `invalid` / `needsInteraction` / `timeout`）；完整验证失败时同样写进 `quick_json`（带 `appVerdictStage: "full-validation"`）。`needsInteraction` 表示被拦下的是登录 / 验证交互，不算失效。
+- `/result` 导出的 `customTag` 为 `✅ 完整验证通过（书籍+详情+目录+正文）`；1.1.2 任务里档案敏感的源，`bookSourceGroup` 的 `MMDD` 后会追加 `需1.1.2`。
+- 完成事件文字带上所用版本，例如 `validation completed: 3/5 device-ready sources (App 1.1.1)`。
+
 ## 验证策略
 
 - 导入先按规范化 `bookSourceUrl`、默认端口、尾斜杠、查询参数和 URL options 去重；保留所有规则变体，同组按完整度评分依次尝试。

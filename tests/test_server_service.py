@@ -55,7 +55,7 @@ def test_service_runs_staged_pipeline_and_persists_result(monkeypatch, tmp_path:
     def fake_full(url: str, candidates: list[dict], quick_seed: dict | None = None) -> tuple[str, dict, dict]:
         calls.append("full")
         record = dict(candidates[0])
-        record["customTag"] = "✅ 书籍+详情+目录+正文通过"
+        record["customTag"] = "✅ 完整验证通过（书籍+详情+目录+正文）"
         return url, record, _full_detail()
 
     monkeypatch.setattr(server.core, "quick_scan_group", fake_quick)
@@ -94,6 +94,64 @@ def test_service_runs_staged_pipeline_and_persists_result(monkeypatch, tmp_path:
         assert calls.count("full") == 2
         events = service.store.events(job_id)
         assert any(event["stage"] == "completed" for event in events)
+    finally:
+        service.close()
+
+
+def _run_and_collect_app_versions(monkeypatch, tmp_path: Path, config: dict) -> set[str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+
+    def fake_quick(url: str, candidates: list[dict]) -> tuple[str, dict, dict]:
+        seen.add(server.app_profiles.current_app_version())
+        return url, {"source": dict(candidates[0]), "bookUrls": ["https://example.com/book/1"]}, {"pipelineStage": "quick-scan", "stages": {"search": True}}
+
+    def fake_full(url: str, candidates: list[dict], quick_seed: dict | None = None) -> tuple[str, dict, dict]:
+        seen.add(server.app_profiles.current_app_version())
+        return url, dict(candidates[0]), _full_detail()
+
+    monkeypatch.setattr(server.core, "quick_scan_group", fake_quick)
+    monkeypatch.setattr(server.core, "validate_group", fake_full)
+    settings = server.ServerSettings(db_path=tmp_path / "jobs.sqlite3", max_workers=2, max_jobs=1, default_domain_concurrency=2)
+    service = server.ValidationService(settings)
+    try:
+        groups = server.prepare_source_groups([_source("https://example.com", "A"), _source("https://other.example", "B")])
+        service.store.create_job("app-version-job", groups, {"rounds": 1, "min_pass_rounds": 1, "profile": "device", **config}, "test.json")
+        assert service.submit("app-version-job")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = service.store.job("app-version-job")
+            if job and job["status"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.02)
+        job = service.store.job("app-version-job")
+        assert job is not None and job["status"] == "completed"
+        assert job["passed_count"] == 2
+        events = service.store.events("app-version-job")
+        expected = f"App {config.get('app_version', '1.1.1')}"
+        assert any(event["stage"] == "completed" and expected in event["message"] for event in events)
+    finally:
+        service.close()
+    return seen
+
+
+def test_job_config_app_version_reaches_stage_workers(monkeypatch, tmp_path: Path) -> None:
+    assert _run_and_collect_app_versions(monkeypatch, tmp_path / "v112", {"app_version": "1.1.2"}) == {"1.1.2"}
+    assert server.app_profiles.current_app_version() == "1.1.1"
+
+
+def test_job_config_app_version_defaults_to_public_111(monkeypatch, tmp_path: Path) -> None:
+    assert _run_and_collect_app_versions(monkeypatch, tmp_path / "default", {}) == {"1.1.1"}
+
+
+def test_load_config_normalizes_app_version(tmp_path: Path) -> None:
+    service = server.ValidationService(server.ServerSettings(db_path=tmp_path / "jobs.sqlite3", max_jobs=1))
+    try:
+        assert service._load_config({"config_json": "{}"})["app_version"] == "1.1.1"
+        assert service._load_config({"config_json": '{"app_version":"1.1.2"}'})["app_version"] == "1.1.2"
+        assert service._load_config({"config_json": '{"app_version":" 1.1.2 "}'})["app_version"] == "1.1.2"
+        assert service._load_config({"config_json": '{"app_version":"both"}'})["app_version"] == "1.1.1"
+        assert service._load_config({"config_json": '{"app_version":"9.9"}'})["app_version"] == "1.1.1"
     finally:
         service.close()
 

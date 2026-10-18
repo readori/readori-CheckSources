@@ -5,15 +5,17 @@
 # 完整链路：详情页 → 书名（或 tocUrl）→ 首章目录 → 非空正文；
 # 目录/正文支持 nextTocUrl/nextContentUrl，最多 6 页。
 # 输出：默认写入 docs/Json，可通过 CLI 指定任意输入/输出路径，便于独立整理书源
-# 依赖：pip install -r scripts/requirements-validate-sources.txt
+# 依赖：pip install -r tools/source-validator/requirements-validate-sources.txt
 from __future__ import annotations
 
 import argparse
 import ast
 import base64
+import copy
 import hashlib
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -25,8 +27,9 @@ import threading
 import unicodedata
 import warnings
 import zlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from html import escape as html_escape, unescape as html_unescape
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -62,6 +65,17 @@ try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 except (ImportError, OSError):
     Cipher = algorithms = modes = None
+
+# R143: App version profiles. Loaded as a package module (CLI / PyInstaller) or, from scripts/tests, as a
+# top-level module with the validator directory on sys.path; both must resolve the same app_profiles module.
+try:
+    from . import app_profiles  # type: ignore[attr-defined]
+except ImportError:
+    import app_profiles  # type: ignore[no-redef]
+
+DEFAULT_APP_VERSION = app_profiles.DEFAULT_APP_VERSION
+app_profile_scope = app_profiles.app_profile_scope
+current_app_version = app_profiles.current_app_version
 
 
 def configure_rar_extractor() -> None:
@@ -275,6 +289,188 @@ class RuleRuntime:
     source_login_header: str = ""
     source_login_info: str = ""
     source_concurrent_rate: str = ""
+    # First uncaught exception thrown by a source script since the last reset
+    # (Legado ScriptException). Evaluations keep their legacy result; callers
+    # that need Legado's failure semantics use raise_if_script_error().
+    script_error: str = ""
+    # Legado AnalyzeRule.book = ruleData as? BaseBook: "bound" (item fields,
+    # detail, TOC, content), "unbound" (searchUrl/exploreUrl/RSS RuleData) or
+    # "automatic" (bound except while a list rule is evaluated).
+    book_binding: str = "automatic"
+    book_list_depth: int = 0
+    # Shared (by reference) across RuleRuntime(**{**runtime.__dict__, ...})
+    # child copies, so the validation stage that owns a runtime sees every
+    # script error/compat warning recorded by its child runtimes.
+    script_error_sink: list | None = None
+    # Validation report metadata only (never read by rule evaluation): the
+    # author string that the selected search/explore item's `author` rule
+    # already produced. Same-site book/author aggregation uses it, so
+    # capturing it cannot alter Legado book binding or rule results.
+    validation_book_author: str = ""
+    # R143 (S1 = A): App batch validation runs with allowsUserInteraction=false, so the browser / verification-code
+    # APIs are blocked there. make_runtime() (the pipeline) sets False; directly constructed runtimes keep the
+    # legacy "assume the user finished the verification" behavior. interaction_state is shared by reference across
+    # RuleRuntime(**{**runtime.__dict__, ...}) child copies (like script_error_sink):
+    # {"kinds": [...], "failuresAtFirst": int | None, "failures": int}.
+    allows_user_interaction: bool = True
+    interaction_state: dict | None = None
+
+
+class RuleScriptError(RuntimeError):
+    """An uncaught source-script exception (Legado lets ScriptException escape)."""
+
+    def __init__(self, raw_message: str) -> None:
+        text = (raw_message or "").strip()
+        if not re.match(r"^[A-Za-z]*(?:Error|Exception)\b", text):
+            text = "JavaScriptException: " + (text or "unknown")
+        super().__init__(text)
+
+
+# Legado binding/global names a source script may use without defining them
+# (AnalyzeRule.evalJS / AnalyzeUrl.evalJS bindings, Rhino JavaImporter and
+# Java package roots). A ReferenceError/TypeError that points at one of these
+# comes from the Python JS compatibility layer not implementing that Legado
+# API, not from the source script itself.
+_LEGADO_JS_BINDING_ROOTS = frozenset({
+    "java", "source", "book", "chapter", "cookie", "cache", "rssArticle",
+    "Packages", "JavaImporter", "importPackage", "importClass", "JavaAdapter",
+    "org", "android", "androidx", "javax", "com", "cn", "okhttp3", "kotlin",
+})
+
+
+def is_js_compat_gap_error(message: str, script: str = "") -> bool:
+    """Whether a JS error is attributable to a gap in the Python polyfill.
+
+    Only ReferenceError/TypeError qualify, and only when the message names the
+    Legado binding API surface:
+
+    * ``X is not defined`` where X is a Legado binding/Java package root;
+    * ``A.B... is not a function`` / ``is not a constructor`` where A is one;
+    * ``Cannot read properties of undefined (reading 'p')`` where the script
+      reads ``p`` from a member chain rooted at a binding (``java.foo.p``),
+      i.e. the undefined value is a shim member the polyfill lacks.
+
+    Everything else (syntax errors, ``throw``, errors on the script's own
+    names, reading from a ``null`` book/chapter) is a genuine Legado
+    ScriptException.
+    """
+    text = (message or "").strip()
+    match = re.match(r"^(ReferenceError|TypeError)\b:?\s*(.*)$", text, flags=re.S)
+    if not match:
+        return False
+    detail = match.group(2)
+    undefined_name = re.match(r"^'?([A-Za-z_$][\w$]*)'? is not defined", detail)
+    if undefined_name:
+        return undefined_name.group(1) in _LEGADO_JS_BINDING_ROOTS
+    member_call = re.match(r"^([A-Za-z_$][\w$]*)(?:\.[\w$]+)+ is not a (?:function|constructor)", detail)
+    if member_call:
+        return member_call.group(1) in _LEGADO_JS_BINDING_ROOTS
+    undefined_read = re.match(r"^Cannot read propert(?:y|ies) of undefined \(reading '([^']+)'\)", detail)
+    if undefined_read and script:
+        prop = re.escape(undefined_read.group(1))
+        roots = "|".join(sorted(_LEGADO_JS_BINDING_ROOTS))
+        return re.search(rf"(?<![\w$.])(?:{roots})(?:\.[A-Za-z_$][\w$]*)+\s*(?:\.\s*{prop}\b|\[\s*['\"]{prop}['\"]\s*\])", script) is not None
+    return False
+
+
+def record_script_error(runtime: RuleRuntime, message: str, script: str = "") -> None:
+    """Record an uncaught source-script exception on ``runtime``.
+
+    Compat-layer gaps (is_js_compat_gap_error) are only reported to the stage
+    sink as warnings; genuine errors also set ``runtime.script_error``.
+    """
+    if runtime is None or not message:
+        return
+    compat = is_js_compat_gap_error(message, script)
+    sink = getattr(runtime, "script_error_sink", None)
+    if sink is not None:
+        sink.append({"kind": "compat" if compat else "error", "message": str(message)})
+    if not compat and not getattr(runtime, "script_error", ""):
+        runtime.script_error = str(message)
+
+
+def begin_script_error_stage(runtime: RuleRuntime) -> list:
+    """Start a validation stage: a fresh sink shared with every child runtime."""
+    sink: list = []
+    runtime.script_error_sink = sink
+    runtime.script_error = ""
+    return sink
+
+
+def finish_script_error_stage(runtime: RuleRuntime, sink: list, detail: dict[str, Any], stage: str) -> None:
+    """Record compat warnings in ``detail`` and fail the stage on a genuine error."""
+    if runtime.script_error_sink is sink:
+        runtime.script_error_sink = None
+    compat = [entry["message"] for entry in sink if entry.get("kind") == "compat"]
+    if compat:
+        warnings = detail.setdefault("jsCompatWarnings", [])
+        for message in dict.fromkeys(compat):
+            if len(warnings) >= 10:
+                break
+            warnings.append(f"{stage}: {message}")
+    errors = [entry["message"] for entry in sink if entry.get("kind") == "error"]
+    runtime.script_error = errors[0] if errors else ""
+    if errors:
+        detail["failedStage"] = stage
+    raise_if_script_error(runtime)
+
+
+def raise_if_script_error(runtime: RuleRuntime) -> None:
+    """Throw (and clear) the source-script exception recorded on ``runtime``."""
+    message = getattr(runtime, "script_error", "")
+    if message:
+        runtime.script_error = ""
+        raise RuleScriptError(message)
+
+
+# ---- R143 App interaction model (S1 = A) ----------------------------------------------------------------------
+# BookSourceBrowserBridge records every blocked interaction (startBrowser / startBrowserAwait / showBrowser /
+# getVerificationCode) and the number of failure groups already recorded when the first one happened. The validator
+# mirrors that with a per-runtime state; app_profiles.app_verdict() turns it into invalid / needsInteraction.
+
+
+# Message of the NoStackTraceException SourceVerificationHelp throws when the (blocked) browser returns nothing.
+BLOCKED_BROWSER_AWAIT_MESSAGE = "验证结果为空"
+
+
+def new_interaction_state() -> dict[str, Any]:
+    return {"kinds": [], "failuresAtFirst": None, "failures": 0}
+
+
+def note_app_validation_failure(runtime: RuleRuntime) -> None:
+    """A real (non-interaction) failure was recorded, e.g. search failed and validation fell back to explore."""
+    state = getattr(runtime, "interaction_state", None)
+    if isinstance(state, dict):
+        state["failures"] = int(state.get("failures") or 0) + 1
+
+
+def record_suppressed_interaction(runtime: RuleRuntime, kind: str) -> None:
+    state = getattr(runtime, "interaction_state", None)
+    if not isinstance(state, dict) or not kind:
+        return
+    kinds = state.setdefault("kinds", [])
+    if state.get("failuresAtFirst") is None:
+        state["failuresAtFirst"] = int(state.get("failures") or 0)
+    if kind not in kinds:
+        kinds.append(kind)
+
+
+def apply_interaction_state_to_detail(detail: dict[str, Any], state: dict[str, Any] | None) -> None:
+    """Fill detail["suppressedInteractions"] / ["failureBeforeInteraction"] from a runtime's interaction state."""
+    if not isinstance(state, dict):
+        return
+    kinds = [str(kind) for kind in (state.get("kinds") or [])]
+    detail["suppressedInteractions"] = kinds
+    detail["failureBeforeInteraction"] = bool(kinds) and int(state.get("failuresAtFirst") or 0) > 0
+
+
+def runtime_binds_book_as_null(runtime: RuleRuntime) -> bool:
+    binding = getattr(runtime, "book_binding", "automatic")
+    if binding == "bound":
+        return False
+    if binding == "unbound":
+        return True
+    return getattr(runtime, "book_list_depth", 0) > 0
 
 
 def legado_is_true(raw: Any, null_is_true: bool = False) -> bool:
@@ -287,9 +483,32 @@ def legado_is_true(raw: Any, null_is_true: bool = False) -> bool:
     return text.strip().lower() not in {"false", "no", "not", "0"}
 
 
+def _insert_dot_after_bracket_before_name(path: str) -> str:
+    """Jayway reads a bare property token right after "]" ($.a[*]b); jsonpath_ng needs the dot ($.a[*].b)."""
+    out: list[str] = []
+    quote = ""
+    escaped = False
+    for index, char in enumerate(path):
+        out.append(char)
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in "'\"":
+            quote = char
+        elif char == "]" and index + 1 < len(path) and (path[index + 1].isalpha() or path[index + 1] == "_"):
+            out.append(".")
+    return "".join(out)
+
+
 def parse_jsonpath_expression(path: str):
     # Legado's pinned Jayway version accepts but ignores the third slice part.
     path = re.sub(r"\[([^:\]]*):([^:\]]*):[^\]]*\]", r"[\1:\2]", path)
+    path = _insert_dot_after_bracket_before_name(path)
     try:
         return jsonpath_parse(path)
     except Exception:
@@ -520,13 +739,13 @@ def discover_json_files(json_dir: Path) -> list[Path]:
 
 
 def display_path(path: Path, root: Path = ROOT) -> str:
-    """Return a report path without failing for external user-selected inputs."""
+    """Return a stable report path for bundled and external inputs."""
     resolved = path.expanduser().resolve()
     try:
         return str(resolved.relative_to(root.expanduser().resolve()))
     except ValueError:
-        # A bundled PyInstaller process has a temporary _MEI root; selected
-        # JSON files/directories normally live elsewhere on the user's disk.
+        # PyInstaller runs from a temporary _MEI directory while users select
+        # JSON files/directories anywhere on disk.
         return str(resolved)
 
 
@@ -574,7 +793,7 @@ def load_sources_from_paths(input_paths: list[Path]) -> tuple[list[dict[str, Any
             continue
         out.extend(batch)
         try:
-            loaded_names.append(display_path(path, root_resolved))
+            loaded_names.append(str(path.relative_to(root_resolved)))
         except ValueError:
             loaded_names.append(str(path))
         seen_files.add(path)
@@ -632,6 +851,21 @@ def _source_url_part(url: str) -> tuple[str, dict[str, Any]]:
     return effective_base_url(url_part), options
 
 
+def _source_identity_tag(source_or_url: dict[str, Any] | str) -> str:
+    """Return the Legado ``##tag`` suffix that makes a serialized identity distinct.
+
+    ``https://site##route-a`` and ``https://site##route-b`` are separate
+    BookSource identities in Legado and the iOS app, so dedupe keeps them
+    apart. A plain ``#fragment`` is treated as an export cosmetic.
+    """
+
+    raw = source_or_url if isinstance(source_or_url, str) else str(source_or_url.get("bookSourceUrl") or "")
+    text = normalize_book_source_url(raw)
+    if "##" not in text:
+        return ""
+    return text.split("##", 1)[1].strip()
+
+
 def canonical_source_site_key(source_or_url: dict[str, Any] | str) -> str:
     """Return a cosmetic-insensitive site key without changing source URLs."""
 
@@ -665,6 +899,14 @@ def canonical_source_site_key(source_or_url: dict[str, Any] | str) -> str:
     except Exception:
         pass
     return url_part.casefold().rstrip("/")
+
+
+def _source_identity_scope(source_or_url: dict[str, Any] | str) -> str:
+    """Canonical site plus any Legado ``##tag`` identity suffix."""
+
+    site = canonical_source_site_key(source_or_url)
+    tag = _source_identity_tag(source_or_url)
+    return f"{site}##{tag}" if tag else site
 
 
 _RULE_FINGERPRINT_FIELDS = (
@@ -709,7 +951,9 @@ def source_rule_fingerprint(source: dict[str, Any]) -> str:
 
 
 def source_dedupe_key(source: dict[str, Any]) -> str:
-    return f"site:{canonical_source_site_key(source)}|rule:{source_rule_fingerprint(source)}"
+    """Layers 1+2: canonical site (keeping any ``##tag``) + rule fingerprint."""
+
+    return f"site:{_source_identity_scope(source)}|rule:{source_rule_fingerprint(source)}"
 
 
 def normalize_book_identity(value: Any) -> str:
@@ -732,7 +976,11 @@ def _detail_book_identity(record: dict[str, Any], detail: dict[str, Any] | None)
 def aggregate_validated_sources(
     entries: Iterable[tuple[str, dict[str, Any], dict[str, Any] | None]],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Collapse same-site validated variants by normalized title and author."""
+    """Layer 3: collapse same-site validated variants by normalized title and author.
+
+    Aggregation never crosses sites or Legado ``##tag`` identities, and records
+    without a usable book identity pass through untouched.
+    """
 
     groups: dict[tuple[str, str, str, str], list[tuple[str, dict[str, Any], dict[str, Any] | None]]] = {}
     passthrough: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
@@ -747,7 +995,7 @@ def aggregate_validated_sources(
         if not author and not sample:
             passthrough.append((group_key, record, detail))
             continue
-        groups.setdefault((canonical_source_site_key(record), title, author, "" if author else sample), []).append((group_key, record, detail))
+        groups.setdefault((_source_identity_scope(record), title, author, "" if author else sample), []).append((group_key, record, detail))
     selected: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = list(passthrough)
     duplicate_groups = 0
     for candidates in groups.values():
@@ -935,7 +1183,8 @@ def fallback_base_url_from_entry_point(src: dict[str, Any], base_url: str) -> st
 
 
 def score_candidate(src: dict[str, Any]) -> int:
-    tag = (src.get("customTag") or "").strip()
+    raw_tag = src.get("customTag")
+    tag = raw_tag.strip() if isinstance(raw_tag, str) else ""
     if "完整验证通过" in tag:
         validation = 4
     elif "模板修复" in tag:
@@ -959,18 +1208,39 @@ def score_candidate(src: dict[str, Any]) -> int:
     if isinstance(src.get("ruleBookInfo"), dict):
         completeness += 2
 
-    weight = int(src.get("weight") or 0)
+    raw_weight = src.get("weight")
+    try:
+        weight = int(float(str(raw_weight))) if raw_weight not in (None, "") else 0
+    except (TypeError, ValueError, OverflowError):
+        weight = 0
     return validation * 10_000 + completeness * 100 + weight
 
 
 def group_sources(sources: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    groups: dict[str, list[dict[str, Any]]] = {}
+    """Group import records for validation.
+
+    Records sharing the exact serialized ``bookSourceUrl`` (the Legado/iOS
+    primary key) always share a group. Different URLs collapse only when the
+    canonical site (case, default port, ``www.``, trailing slash, query order
+    or a plain ``#fragment``) and the behaviour rule fingerprint both match;
+    Legado ``##tag`` identities stay distinct. Groups are keyed by the best
+    candidate's serialized URL.
+    """
+    by_dedupe_key: dict[str, list[dict[str, Any]]] = {}
+    dedupe_key_for_url: dict[str, str] = {}
     for src in sources:
-        if not normalize_book_source_url(str(src.get("bookSourceUrl") or "")):
+        url = normalize_book_source_url(str(src.get("bookSourceUrl") or ""))
+        if not url:
             continue
-        groups.setdefault(source_dedupe_key(src), []).append(src)
-    for items in groups.values():
+        key = dedupe_key_for_url.get(url)
+        if key is None:
+            key = source_dedupe_key(src)
+            dedupe_key_for_url[url] = key
+        by_dedupe_key.setdefault(key, []).append(src)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for items in by_dedupe_key.values():
         items.sort(key=score_candidate, reverse=True)
+        groups[normalize_book_source_url(str(items[0].get("bookSourceUrl") or ""))] = items
     return groups
 
 
@@ -1463,10 +1733,12 @@ def _resolve_js_template_expressions(
         if java_encode_uri is not None:
             return java_encode_uri
         # This is a JS expression — evaluate it
+        fast_ctx = None
         try:
             ctx = make_quickjs_context()
             if ctx is None:
                 raise RuntimeError("quickjs unavailable")
+            fast_ctx = ctx
             ctx.set("page", page)
             ctx.set("pageIndex", page - 1)
             ctx.set("pagePlus1", page + 1)
@@ -1481,8 +1753,13 @@ def _resolve_js_template_expressions(
                 ctx.set("keyword", keyword)
                 ctx.set("searchKey", encode_keyword(keyword))
             # Inject java stub
+            install_quickjs_app_globals(ctx, runtime)
             java_api = _build_java_api_js(runtime)
             ctx.eval(java_api)
+            # No jsLib on this path: the plan only decides the profile's CryptoJS for the expression itself.
+            fast_plan = app_profiles.app_js_setup_plan("", inner)
+            install_quickjs_app_cryptojs(ctx, fast_plan, "jslib")
+            install_quickjs_app_cryptojs(ctx, fast_plan, "code")
             result = ctx.eval(f"String({inner})")
             if result is not None and str(result) != "undefined":
                 text_result = str(result)
@@ -1490,6 +1767,9 @@ def _resolve_js_template_expressions(
                     return text_result
         except Exception:
             pass
+        finally:
+            if fast_ctx is not None:
+                drain_quickjs_interactions(fast_ctx, runtime)
         try:
             result = evaluate_js(
                 inner,
@@ -1514,7 +1794,20 @@ def _resolve_js_template_expressions(
     return re.sub(r"\{\{([^}]+)\}\}", replace_expr, text)
 
 
-def resolve_template(template: str, runtime: RuleRuntime, keyword: str | None = None, page: int = 1, raw_keyword: str | None = None) -> str:
+def resolve_template(
+    template: str,
+    runtime: RuleRuntime,
+    keyword: str | None = None,
+    page: int = 1,
+    raw_keyword: str | None = None,
+    rule_template: bool = False,
+) -> str:
+    """Substitute URL/rule placeholders.
+
+    ``rule_template`` is Legado makeUpRule for rules: only double-brace
+    ``{{name}}`` placeholders expand; a single-brace ``{name}`` is literal rule
+    text (``{$.…}`` inner JSONPath rules are handled by the rule engine).
+    """
     out = template
     replacements = {
         "{{baseUrl}}": runtime.base_url,
@@ -1557,6 +1850,8 @@ def resolve_template(template: str, runtime: RuleRuntime, keyword: str | None = 
             "{rawKeyword}": raw,
         })
     for key, value in replacements.items():
+        if rule_template and not key.startswith("{{"):
+            continue
         out = out.replace(key, value)
     for key, value in (runtime.variables or {}).items():
         replacement = str(value).lower() if isinstance(value, bool) else str(value)
@@ -1663,7 +1958,7 @@ def substitute_json_placeholders(rule: str, content: str) -> str:
         else:
             text_value = "" if value is None else str(value)
         if replace_chain:
-            text_value = apply_replace_chain(text_value, replace_chain)
+            text_value = legado_replace_regex(text_value, replace_chain)
         return text_value
 
     # First handle double-brace {{$.xxx}} pattern (legado makeUpRule / jsRuleType behavior):
@@ -2118,13 +2413,66 @@ if (typeof String.prototype.getBytes !== 'function') {
     String.prototype.getBytes = function(charset) {
         var value = String(this);
         if (typeof Buffer !== 'undefined') {
-            return Array.from(Buffer.from(value, /gbk|gb2312|gb18030/i.test(String(charset || '')) ? 'binary' : 'utf8'));
+            return __readoriSignedBytes(Array.from(Buffer.from(value, /gbk|gb2312|gb18030/i.test(String(charset || '')) ? 'binary' : 'utf8')));
         }
         var out = [];
         for (var i = 0; i < value.length; i++) out.push(value.charCodeAt(i) & 255);
-        out.toArray = function(){ return this; };
-        return out;
+        return __readoriSignedBytes(out);
     };
+}
+// R143 (S1 = A): App batch validation blocks interaction (allowsUserInteraction=false). The runtime sets
+// __readoriAllowsUserInteraction; directly constructed runtimes leave it true/undefined and keep the legacy behavior.
+// AnalyzeRule.content: the input until java.setContent replaces it (the `src` binding itself never changes).
+var __readoriContent;
+function __readoriCurrentContent() {
+    if (typeof __readoriContent !== 'undefined') return __readoriContent;
+    return typeof src !== 'undefined' ? src : result;
+}
+function __readoriInteractionBlocked(kind) {
+    if (typeof __readoriAllowsUserInteraction !== 'undefined' && !__readoriAllowsUserInteraction) {
+        try {
+            if (kind && typeof __readoriRecordSuppressedInteraction === 'function') {
+                __readoriRecordSuppressedInteraction(kind);
+            }
+        } catch (error) {}
+        return true;
+    }
+    return false;
+}
+// Binary-safe (latin1) base64 for the prelude itself: the App-semantics global atob/btoa are UTF-8 and would
+// corrupt binary data.
+var __readoriB64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function __readoriLatin1Btoa(input) {
+    var s = String(input === undefined || input === null ? '' : input);
+    var out = '';
+    for (var i = 0; i < s.length; i += 3) {
+        var hasB = i + 1 < s.length;
+        var hasC = i + 2 < s.length;
+        var n = ((s.charCodeAt(i) & 255) << 16)
+            | ((hasB ? s.charCodeAt(i + 1) & 255 : 0) << 8)
+            | (hasC ? s.charCodeAt(i + 2) & 255 : 0);
+        out += __readoriB64Alphabet.charAt((n >> 18) & 63)
+            + __readoriB64Alphabet.charAt((n >> 12) & 63)
+            + (hasB ? __readoriB64Alphabet.charAt((n >> 6) & 63) : '=')
+            + (hasC ? __readoriB64Alphabet.charAt(n & 63) : '=');
+    }
+    return out;
+}
+function __readoriLatin1Atob(input) {
+    var s = String(input === undefined || input === null ? '' : input).replace(/[^A-Za-z0-9+\/]/g, '');
+    var out = '';
+    var buffer = 0;
+    var bits = 0;
+    for (var i = 0; i < s.length; i++) {
+        buffer = (buffer << 6) | __readoriB64Alphabet.indexOf(s.charAt(i));
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += String.fromCharCode((buffer >> bits) & 255);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    return out;
 }
 function __readoriToByteArray(value) {
     if (!value) return [];
@@ -2164,8 +2512,7 @@ function __readoriStringToBytes(value, charset) {
     if (typeof __readoriEncodeBytesNative === 'function') {
         try {
             var nativeBytes = JSON.parse(__readoriEncodeBytesNative(text, normalized) || '[]');
-            nativeBytes.toArray = function(){ return this; };
-            return nativeBytes;
+            return __readoriByteArrayWithUtf8String(nativeBytes);
         } catch (error) {}
     }
     if (typeof Buffer !== 'undefined') {
@@ -2232,13 +2579,15 @@ function __readoriHexToByteArray(value) {
         var pair = clean.slice(i, i + 2);
         if (!pair) continue;
         var byte = parseInt(pair, 16);
-        if (!isNaN(byte)) out.push(byte & 255);
+        if (!isNaN(byte)) out.push(byte > 127 ? byte - 256 : byte);
     }
     out.toArray = function(){ return this; };
     return out;
 }
+// Java byte[] result: signed elements (-128..127) whose toString() decodes UTF-8.
+// Inputs everywhere are normalised with `Number(v) & 255`.
 function __readoriByteArrayWithUtf8String(value) {
-    var out = __readoriToByteArray(value);
+    var out = __readoriToByteArray(value).map(function(v){ return v > 127 ? v - 256 : v; });
     out.toArray = function(){ return this; };
     out.toString = function(){ return __readoriBytesToUtf8(this); };
     return out;
@@ -2326,9 +2675,8 @@ var Base64 = {
         var raw = (typeof value === 'string') ? value : __readoriBytesToUtf8(value);
         raw = String(raw || '').replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
         while (raw.length % 4) raw += '=';
-        var bytes = typeof Buffer !== 'undefined' ? Array.from(Buffer.from(raw, 'base64')) : __readoriToByteArray(atob(raw));
-        bytes.toArray = function(){ return this; };
-        return bytes;
+        var bytes = typeof Buffer !== 'undefined' ? Array.from(Buffer.from(raw, 'base64')) : __readoriToByteArray(__readoriLatin1Atob(raw));
+        return __readoriSignedBytes(bytes);
     },
     getDecoder: function() {
         return { decode: function(value) { return Base64.decode(value, 0); } };
@@ -2340,7 +2688,7 @@ var Base64 = {
                 if (typeof Buffer !== 'undefined') return Buffer.from(bytes).toString('base64');
                 var s = '';
                 for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i] & 255);
-                return btoa(s);
+                return __readoriLatin1Btoa(s);
             }
         };
     },
@@ -2388,7 +2736,7 @@ var Cipher = {
             init: function(mode, key, iv) { this.mode = Number(mode) || 2; this.key = key; this.iv = iv; },
             doFinal: function(bytes) {
                 if (typeof Buffer === 'undefined' || typeof __readoriCrypto === 'undefined' || !__readoriCrypto.createDecipheriv) {
-                    return __readoriToByteArray(bytes);
+                    return __readoriSignedBytes(bytes);
                 }
                 try {
                     var keyBuf = __readoriNormalizeCipherKey(this.algorithm, this.key && this.key.value !== undefined ? this.key.value : this.key);
@@ -2418,7 +2766,7 @@ var Mac = {
                         .digest();
                     return __readoriSignedBytes(Array.from(out));
                 }
-                return __readoriToByteArray(bytes);
+                return __readoriSignedBytes(bytes);
             }
         };
     }
@@ -2477,7 +2825,7 @@ function ByteArrayInputStream(bytes) {
         if (count <= 0) return -1;
         for (var i = 0; i < count; i++) {
             target[i] = this.bytes[this.offset++] & 255;
-            buffer[i] = target[i];
+            buffer[i] = target[i] > 127 ? target[i] - 256 : target[i];
         }
         return count;
     };
@@ -2496,11 +2844,11 @@ function __readoriInflateBytes(value) {
     if (typeof __readoriZlib !== 'undefined') {
         try {
             var inflated = __readoriZlib.inflateSync(Buffer.from(bytes));
-            return __readoriToByteArray(inflated);
+            return __readoriSignedBytes(inflated);
         } catch (error) {
             try {
                 var raw = __readoriZlib.inflateRawSync(Buffer.from(bytes));
-                return __readoriToByteArray(raw);
+                return __readoriSignedBytes(raw);
             } catch (inner) {}
         }
     }
@@ -2511,14 +2859,14 @@ function __readoriInflateBytes(value) {
             if (decoded && decoded.length) return decoded;
         } catch (error) {}
     }
-    return bytes;
+    return __readoriSignedBytes(bytes);
 }
 function __readoriGunzipBytes(value) {
     var bytes = __readoriToByteArray(value);
     if (typeof __readoriZlib !== 'undefined') {
         try {
             var gunzipped = __readoriZlib.gunzipSync(Buffer.from(bytes));
-            return __readoriToByteArray(gunzipped);
+            return __readoriSignedBytes(gunzipped);
         } catch (error) {}
     }
     if (typeof __readoriGunzipBytesBase64 === 'function') {
@@ -2528,7 +2876,7 @@ function __readoriGunzipBytes(value) {
             if (decoded && decoded.length) return decoded;
         } catch (error) {}
     }
-    return bytes;
+    return __readoriSignedBytes(bytes);
 }
 function InflaterInputStream(stream) {
     var input = __readoriBytesFromInputStream(stream);
@@ -2558,7 +2906,7 @@ function ByteArrayOutputStream(size) {
             this.bytes.push(Number(value) & 255);
         }
     };
-    this.toByteArray = function(){ var out = this.bytes.slice(); out.toArray = function(){ return this; }; return out; };
+    this.toByteArray = function(){ return __readoriSignedBytes(this.bytes); };
     this.toString = function(){ return __readoriBytesToUtf8(this.bytes); };
     this.close = function(){};
 }
@@ -2624,9 +2972,27 @@ function __readoriAesAlgorithm(mode, key) {
     if (keyBits !== 128 && keyBits !== 192 && keyBits !== 256) keyBits = 128;
     return 'aes-' + keyBits + '-' + blockMode;
 }
+function __readoriSymmetricFamily(mode) {
+    var algo = String(mode || 'AES/CBC/PKCS5Padding').toUpperCase().split('/')[0];
+    if (algo.indexOf('RC4') === 0 || algo.indexOf('ARCFOUR') === 0) return 'RC4';
+    if (algo.indexOf('BLOWFISH') === 0) return 'BLOWFISH';
+    if (algo.indexOf('SM4') === 0) return 'SM4';
+    return '';
+}
 function __readoriCipherAlgorithm(mode, key) {
     var modeText = String(mode || 'AES/CBC/PKCS5Padding').toUpperCase();
     var useEcb = modeText.indexOf('/') < 0 || modeText.indexOf('/ECB/') >= 0;
+    var family = __readoriSymmetricFamily(modeText);
+    if (family === 'RC4') {
+        // Hutool/JCE RC4/ARCFOUR: stream cipher, no IV, no padding.
+        return 'rc4';
+    }
+    if (family === 'BLOWFISH' || family === 'SM4') {
+        var block = useEcb ? 'ecb' : String(modeText.split('/')[1] || 'ecb').toLowerCase().replace(/\d+$/, '');
+        var allowed = family === 'SM4' ? ['ecb', 'cbc', 'cfb', 'ofb', 'ctr'] : ['ecb', 'cbc', 'cfb', 'ofb'];
+        if (allowed.indexOf(block) < 0) throw new Error('Unsupported transformation: ' + modeText);
+        return (family === 'SM4' ? 'sm4-' : 'bf-') + block;
+    }
     if (modeText.indexOf('DESEDE') >= 0 || modeText.indexOf('3DES') >= 0) {
         return useEcb ? 'des-ede3' : 'des-ede3-cbc';
     }
@@ -2639,6 +3005,20 @@ function __readoriNormalizeCipherKey(mode, value) {
     if (typeof Buffer === 'undefined') return value;
     var modeText = String(mode || 'AES/CBC/PKCS5Padding').toUpperCase();
     var buf = __readoriBufferFromBytes(value);
+    var family = __readoriSymmetricFamily(modeText);
+    if (family === 'RC4') {
+        if (buf.length < 1 || buf.length > 256) throw new Error('Invalid RC4 key length');
+        return buf;
+    }
+    if (family === 'BLOWFISH') {
+        // JCE Blowfish accepts 32..448-bit keys.
+        if (buf.length < 4 || buf.length > 56) throw new Error('Invalid Blowfish key length');
+        return buf;
+    }
+    if (family === 'SM4') {
+        if (buf.length !== 16) throw new Error('Invalid SM4 key length');
+        return buf;
+    }
     var wanted = 16;
     if (modeText.indexOf('DESEDE') >= 0 || modeText.indexOf('3DES') >= 0) wanted = 24;
     else if (modeText.indexOf('DES') === 0) wanted = 8;
@@ -2651,8 +3031,10 @@ function __readoriNormalizeCipherKey(mode, value) {
 function __readoriNormalizeCipherIv(mode, value) {
     if (typeof Buffer === 'undefined') return value;
     var modeText = String(mode || 'AES/CBC/PKCS5Padding').toUpperCase();
+    var family = __readoriSymmetricFamily(modeText);
+    if (family === 'RC4') return null;
     if (modeText.indexOf('/') < 0 || modeText.indexOf('/ECB/') >= 0) return null;
-    var wanted = modeText.indexOf('DES') === 0 ? 8 : 16;
+    var wanted = (modeText.indexOf('DES') === 0 || family === 'BLOWFISH') ? 8 : 16;
     var buf = __readoriBufferFromBytes(value);
     if (buf.length >= wanted) return buf.subarray(0, wanted);
     var out = Buffer.alloc(wanted);
@@ -2784,6 +3166,32 @@ function __readoriCacheDeleteAll(key) {
     __readoriCacheDelete('value', key);
     __readoriCacheDelete('file', key);
     __readoriCacheDelete('memory', key);
+    __readoriCacheDelete('bytes', key);
+}
+// Kotlin String.toIntOrNull/toLongOrNull: optional sign + digits, no trimming.
+function __readoriCacheInteger(key, min, max) {
+    var value = __readoriCacheGet('value', key);
+    if (value === null || value === undefined) return null;
+    var text = String(value);
+    if (!/^[+-]?\d+$/.test(text)) return null;
+    var number = Number(text);
+    return (number >= min && number <= max) ? number : null;
+}
+// Kotlin String.toDoubleOrNull (Java Double.valueOf grammar, decimal forms).
+function __readoriCacheDouble(key) {
+    var value = __readoriCacheGet('value', key);
+    if (value === null || value === undefined) return null;
+    var text = String(value).trim();
+    if (!/^[+-]?(NaN|Infinity|((\d+\.?\d*|\.\d+)([eE][+-]?\d+)?[fFdD]?))$/.test(text)) return null;
+    return parseFloat(text.replace(/[fFdD]$/, ''));
+}
+function __readoriCacheIsByteArray(value) {
+    if (!value || typeof value === 'string' || typeof value.length !== 'number' || value.length === 0) return false;
+    for (var i = 0; i < value.length; i++) {
+        var item = value[i];
+        if (typeof item !== 'number' || item % 1 !== 0 || item < -128 || item > 255) return false;
+    }
+    return true;
 }
 function __readoriCacheClear() {
     if (typeof variables === 'undefined') return;
@@ -2861,12 +3269,26 @@ function __readoriChineseNumberValue(value) {
     }
     return sawToken ? total + section + number : null;
 }
+// Legado JsExtensions.toNumChapter: titleNumPattern (第)(.+?)(章), first match only,
+// group 2 through StringUtils.stringToInt (full->half width, Integer.parseInt, then
+// chineseNumToInt, -1 on failure); returns only group1 + number + group3.
+function __readoriStringToInt(raw) {
+    var text = String(raw === undefined || raw === null ? '' : raw).replace(/[\uff01-\uff5e]/g, function(ch) {
+        return String.fromCharCode(ch.charCodeAt(0) - 0xfee0);
+    }).replace(/\u3000/g, ' ').replace(/\s+/g, '');
+    if (/^[+-]?\d+$/.test(text)) {
+        var parsed = Number(text);
+        if (parsed >= -2147483648 && parsed <= 2147483647) return parsed;
+    }
+    var number = __readoriChineseNumberValue(text);
+    return number === null ? -1 : number;
+}
 function __readoriToNumChapter(value) {
-    var text = String(value === undefined || value === null ? '' : value);
-    return text.replace(/\u7b2c([\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07]+)\u7ae0/g, function(match, cn) {
-        var number = __readoriChineseNumberValue(cn);
-        return number === null ? match : '\u7b2c' + number + '\u7ae0';
-    });
+    if (value === undefined || value === null) return null;
+    var text = String(value);
+    var match = /(\u7b2c)(.+?)(\u7ae0)/.exec(text);
+    if (!match) return text;
+    return match[1] + __readoriStringToInt(match[2]) + match[3];
 }
 function __readoriFormatTimestamp(timestamp, fmt, useUTC) {
     var value = Number(timestamp || 0);
@@ -3486,7 +3908,7 @@ function __readoriResponseObject(body, finalUrl, status, responseHeaders, respon
     var out = {
         body: function() { return text; },
         getStrResponse: function() { return text; },
-        bodyAsBytes: function() { return __readoriToByteArray(text); },
+        bodyAsBytes: function() { return __readoriSignedBytes(__readoriToByteArray(text)); },
         getByteArrayString: function() { return Base64.getEncoder().encodeToString(__readoriToByteArray(text)); },
         code: function() { return codeValue; },
         statusCode: function() { return codeValue; },
@@ -3623,7 +4045,7 @@ var java = {
             } else if (typeof __readoriAjaxBytesBase64 === 'function') {
                 response.bodyAsBytes = function() {
                     try { return Base64.decode(__readoriAjaxBytesBase64(target), 0); } catch (error) {}
-                    return __readoriToByteArray(response.body());
+                    return __readoriSignedBytes(__readoriToByteArray(response.body()));
                 };
                 response.getByteArrayString = function() {
                     try { return __readoriAjaxBytesBase64(target); } catch (error) {}
@@ -3636,8 +4058,8 @@ var java = {
         if (key === 'cookie') return cookie || '';
         if (key === 'result') return result || '';
         if (key === 'baseUrl') return baseUrl || '';
-        if (key === 'bookName' && typeof book !== 'undefined') return String(book.name || '');
-        if (key === 'title' && typeof chapter !== 'undefined') return String(chapter.title || '');
+        if (key === 'bookName' && typeof book !== 'undefined' && book) return String(book.name || '');
+        if (key === 'title' && typeof chapter !== 'undefined' && chapter) return String(chapter.title || '');
         if (typeof chapter !== 'undefined' && chapter && typeof chapter.getVariable === 'function') {
             var chapterValue = chapter.getVariable(target);
             if (chapterValue !== '') return chapterValue;
@@ -3671,8 +4093,16 @@ var java = {
             throw new Error('openUrl parameter url too long');
         }
     },
-    startBrowser: function(url, title) { return ''; },
+    startBrowser: function(url, title) {
+        __readoriInteractionBlocked('startBrowser');
+        return '';
+    },
     startBrowserAwait: function(url, title, refetchAfterSuccess) {
+        // App batch validation: no window can open, the browser answers with an empty response and
+        // SourceVerificationHelp.getVerificationResult throws "验证结果为空" (JSEngine startBrowserAwait requireResult).
+        if (__readoriInteractionBlocked('startBrowserAwait')) {
+            throw new Error('验证结果为空');
+        }
         var target = String(url || baseUrl || '');
         var shouldRefetch = arguments.length < 3 ? true : !!refetchAfterSuccess;
         if (!shouldRefetch) {
@@ -3693,6 +4123,28 @@ var java = {
         return arguments.length < 3
             ? java.startBrowserAwait(url, title)
             : java.startBrowserAwait(url, title, refetchAfterSuccess);
+    },
+    // App: openBlocking() records every blocked blocking-browser call as startBrowserAwait and answers with an empty
+    // proxy; showReadingBrowser has no requireResult, so it does not throw.
+    showReadingBrowser: function(url, title) {
+        if (__readoriInteractionBlocked('startBrowserAwait')) return __readoriResponseObject('', '', 0, {}, {});
+        return java.startBrowserAwait(url, title, false);
+    },
+    showBrowser: function(url, html, js) {
+        var content = String(html === undefined || html === null ? '' : html);
+        var hasContent = content.replace(/\s+/g, '') !== '';
+        if (__readoriInteractionBlocked(hasContent ? 'showBrowser' : 'startBrowserAwait')) {
+            return __readoriResponseObject('', '', 0, {}, {});
+        }
+        if (hasContent) return __readoriResponseObject(content, String(url || ''), 200, {}, {});
+        return java.startBrowserAwait(url, '', false);
+    },
+    startBrowserDp: function(url, title) {
+        // Deep links with a non-http(s)/data scheme leave the app (not recorded); everything else is startBrowser.
+        var scheme = /^([A-Za-z][A-Za-z0-9+.\-]*):/.exec(String(url === undefined || url === null ? '' : url));
+        if (scheme && !/^(?:https?|data)$/i.test(scheme[1])) return '';
+        __readoriInteractionBlocked('startBrowser');
+        return '';
     },
     webView: function(first, second, script) {
         var target = arguments.length > 1 && second ? second : first;
@@ -3816,14 +4268,14 @@ var java = {
             arguments.length > 1 ? String(explicitBase || '') : ''
         );
     },
-    setContent: function(content) { result = content; },
+    setContent: function(content) { result = content; __readoriContent = content; },
     getElement: function(selector, html) {
-        var sourceHtml = arguments.length > 1 ? String(html || '') : String((typeof src !== 'undefined' ? src : result) || '');
+        var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
         var rows = _readoriJsoupRows(sourceHtml, String(selector || ''));
         return rows.length ? _readoriJsoupElement(rows[0], null) : _readoriJsoupElement({}, null);
     },
     getElements: function(selector, html) {
-        var sourceHtml = arguments.length > 1 ? String(html || '') : String((typeof src !== 'undefined' ? src : result) || '');
+        var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
         return _readoriJsoupElements(_readoriJsoupRowsForRule(sourceHtml, String(selector || '')), null);
     },
     selectElementsJSON: function(selector, html) {
@@ -3837,14 +4289,14 @@ var java = {
     getString: function(ruleStr, html) {
         try {
             if (typeof __readoriEvaluateString === 'function') {
-                var sourceHtml = arguments.length > 1 ? String(html || '') : String((typeof src !== 'undefined' ? src : result) || '');
+                var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
                 return __readoriEvaluateString(String(ruleStr || ''), sourceHtml) || '';
             }
         } catch (error) {}
         return '';
     },
     getStringList: function(ruleStr, html, raw) {
-        var sourceHtml = arguments.length > 1 ? String(html || '') : String((typeof src !== 'undefined' ? src : result) || '');
+        var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
         var values = [];
         try {
             if (typeof __readoriEvaluateList === 'function') {
@@ -4479,7 +4931,10 @@ var java = {
     refreshContent: function() { return ''; },
     refreshBookUrl: function() { return ''; },
     openVideoPlayer: function(url, title, float) { return ''; },
-    getVerificationCode: function(url) { return ''; },
+    getVerificationCode: function(url) {
+        __readoriInteractionBlocked('getVerificationCode');
+        return '';
+    },
     queryTTF: function(urlOrBase64) { return { replaceText: function(text) { return text; } }; },
     queryBase64TTF: function(base64) { return java.queryTTF(base64); },
     replaceFont: function(text, font) {
@@ -4798,8 +5253,9 @@ var source = {
         }
         delete variables[String(key || '')];
     },
-    getLoginInfo: function() { return typeof sourceLoginInfo !== 'undefined' ? String(sourceLoginInfo || '') : ''; },
-    getLoginHeader: function() { return typeof sourceLoginHeader !== 'undefined' ? String(sourceLoginHeader || '') : ''; },
+    // Legado BaseSource.getLoginInfo/getLoginHeader return null when nothing is stored.
+    getLoginInfo: function() { return typeof sourceLoginInfo !== 'undefined' && sourceLoginInfo ? String(sourceLoginInfo) : null; },
+    getLoginHeader: function() { return typeof sourceLoginHeader !== 'undefined' && sourceLoginHeader ? String(sourceLoginHeader) : null; },
     getLoginInfoMap: function() {
         var raw = typeof sourceLoginInfo !== 'undefined' ? String(sourceLoginInfo || '').trim() : '';
         return raw ? __readoriParseMapText(raw) : null;
@@ -4893,7 +5349,25 @@ var cookie = {
 };
 var cache = {
     get: function(key) { return __readoriCacheGet('value', key); },
-    put: function(key, value, seconds) { __readoriCachePut('value', key, value, seconds); },
+    getInt: function(key) { return __readoriCacheInteger(key, -2147483648, 2147483647); },
+    getLong: function(key) { return __readoriCacheInteger(key, -9223372036854775808, 9223372036854775807); },
+    getDouble: function(key) { return __readoriCacheDouble(key); },
+    getFloat: function(key) {
+        var value = __readoriCacheDouble(key);
+        return value === null ? null : Math.fround(value);
+    },
+    // Legado CacheManager.getByteArray -> ACache binary tier (signed Java bytes).
+    getByteArray: function(key) {
+        var hex = __readoriCacheGet('bytes', key);
+        return hex === null || hex === undefined ? null : __readoriHexToByteArray(hex);
+    },
+    put: function(key, value, seconds) {
+        if (__readoriCacheIsByteArray(value)) {
+            var bytes = __readoriToByteArray(value);
+            __readoriCachePut('bytes', key, bytes.map(function(b){ return ('0' + b.toString(16)).slice(-2); }).join(''), seconds);
+        }
+        __readoriCachePut('value', key, value, seconds);
+    },
     getFile: function(key) { return __readoriCacheGet('file', key); },
     putFile: function(key, value, seconds) { __readoriCachePut('file', key, value, seconds); },
     getFromMemory: function(key) { return __readoriCacheGet('memory', key); },
@@ -5304,6 +5778,11 @@ function _readoriJsoupDocument(html) {
 org.jsoup.Jsoup.parse = function(html) {
     return _readoriJsoupDocument(html);
 };
+// Legado binds `book = ruleData as? BaseBook` and `chapter` only when set:
+// searchUrl/exploreUrl/RSS and list rules see `book == null`; `chapter` is
+// non-null only in TOC item fields and content.
+if (typeof __readoriBookIsNull !== 'undefined' && __readoriBookIsNull) { book = null; }
+if (typeof chapterActive !== 'undefined' && !chapterActive) { chapter = null; }
 """
 
 
@@ -5313,6 +5792,116 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { URL, URLSearchParams } = require('node:url');
+
+// R143: App globals (btoa/atob/md5/sha256, UTF-8 semantics) and the native bridges behind the App's CryptoJS
+// (hex in, hex out, failures come back as "!" + reason). Single DES runs as 3DES with K||K||K because OpenSSL 3's
+// default provider has no single DES.
+function __readoriAppNatives() {
+  const HASHES = { MD5: 'md5', SHA1: 'sha1', SHA224: 'sha224', SHA256: 'sha256', SHA384: 'sha384', SHA512: 'sha512' };
+  const hashKey = (name) => String(name).toUpperCase().replace(/-/g, '');
+  const hexBytes = (value) => (typeof value === 'string' && /^(?:[0-9a-fA-F]{2})*$/.test(value)) ? Buffer.from(value, 'hex') : null;
+  const textOf = (value) => (value === undefined || value === null) ? '' : String(value);
+  return {
+    btoa(value) { return Buffer.from(textOf(value), 'utf8').toString('base64'); },
+    atob(value) {
+      const raw = textOf(value);
+      if (!/^(?:[A-Za-z0-9+\/]{4})*(?:[A-Za-z0-9+\/]{2}==|[A-Za-z0-9+\/]{3}=)?$/.test(raw)) return raw;
+      try {
+        return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.from(raw, 'base64'));
+      } catch (error) {
+        return raw;
+      }
+    },
+    md5(value) { return crypto.createHash('md5').update(Buffer.from(textOf(value), 'utf8')).digest('hex'); },
+    sha256(value) { return crypto.createHash('sha256').update(Buffer.from(textOf(value), 'utf8')).digest('hex'); },
+    __readoriCryptoJSCipher(operation, algorithm, mode, keyHex, ivHex, dataHex) {
+      const key = hexBytes(keyHex);
+      const ivRaw = hexBytes(ivHex);
+      const data = hexBytes(dataHex);
+      if (!key || !ivRaw || !data) return '!invalid hex';
+      const alg = String(algorithm).toUpperCase();
+      let blockSize;
+      let keyBytes = key;
+      let prefix;
+      if (alg === 'AES') {
+        if (![16, 24, 32].includes(key.length)) return '!Invalid key length';
+        blockSize = 16;
+        prefix = 'aes-' + (key.length * 8);
+      } else if (alg === 'DES') {
+        if (key.length !== 8) return '!Invalid key length';
+        blockSize = 8;
+        keyBytes = Buffer.concat([key, key, key]);
+        prefix = 'des-ede3';
+      } else if (alg === '3DES') {
+        if (key.length !== 24) return '!Invalid key length';
+        blockSize = 8;
+        prefix = 'des-ede3';
+      } else {
+        return '!unsupported algorithm';
+      }
+      const modeName = String(mode).toUpperCase();
+      let needsAligned = true;
+      if (modeName === 'CBC' || modeName === 'ECB') {
+        needsAligned = true;
+      } else if (modeName === 'CFB' || modeName === 'OFB' || modeName === 'CTR') {
+        needsAligned = false;
+      } else {
+        return '!unsupported mode';
+      }
+      if (alg !== 'AES' && modeName === 'CTR') return '!unsupported mode';
+      if (needsAligned && data.length % blockSize !== 0) return '!data not block aligned';
+      if (data.length === 0) return '';
+      let iv = ivRaw.subarray(0, blockSize);
+      if (iv.length < blockSize) iv = Buffer.concat([iv, Buffer.alloc(blockSize - iv.length)]);
+      const cipherName = prefix + '-' + modeName.toLowerCase();
+      try {
+        const worker = operation === 'e'
+          ? crypto.createCipheriv(cipherName, keyBytes, modeName === 'ECB' ? null : iv)
+          : crypto.createDecipheriv(cipherName, keyBytes, modeName === 'ECB' ? null : iv);
+        worker.setAutoPadding(false);
+        return Buffer.concat([worker.update(data), worker.final()]).toString('hex');
+      } catch (error) {
+        return '!cipher init failed';
+      }
+    },
+    __readoriCryptoJSDigest(algorithm, dataHex) {
+      const data = hexBytes(dataHex);
+      if (!data) return '!invalid hex';
+      const name = HASHES[hashKey(algorithm)];
+      if (!name) return '!unsupported algorithm';
+      return crypto.createHash(name).update(data).digest('hex');
+    },
+    __readoriCryptoJSHmac(algorithm, keyHex, dataHex) {
+      const key = hexBytes(keyHex);
+      const data = hexBytes(dataHex);
+      if (!key || !data) return '!invalid hex';
+      const name = HASHES[hashKey(algorithm)];
+      if (!name) return '!unsupported algorithm';
+      return crypto.createHmac(name, key).update(data).digest('hex');
+    },
+    __readoriCryptoJSRandom(byteCount) {
+      const count = Math.trunc(Number(byteCount));
+      if (!Number.isFinite(count) || count < 0 || count > 1024) return '!invalid length';
+      return crypto.randomBytes(count).toString('hex');
+    },
+    __readoriCryptoJSPBKDF2(hasher, passwordHex, saltHex, iterations, keyBytes) {
+      const password = hexBytes(passwordHex);
+      const salt = hexBytes(saltHex);
+      if (!password || !salt) return '!invalid hex';
+      const key = hashKey(hasher);
+      if (!HASHES[key] || key === 'MD5') return '!unsupported hasher';
+      const size = Math.trunc(Number(keyBytes));
+      const rounds = Math.max(1, Math.min(Math.trunc(Number(iterations)), 2147483647));
+      if (!Number.isFinite(size) || !Number.isFinite(rounds)) return '!invalid key size';
+      if (size <= 0 || size > 1024) return '!invalid key size';
+      try {
+        return crypto.pbkdf2Sync(password, salt, rounds, size, HASHES[key]).toString('hex');
+      } catch (error) {
+        return '!pbkdf2 failed';
+      }
+    }
+  };
+}
 
 {
   const payload = fs.readFileSync(0, 'utf8');
@@ -5380,6 +5969,7 @@ const { URL, URLSearchParams } = require('node:url');
     chapterCount: Number(data.chapterCount || 0),
     chapterVariable: data.chapterVariable || '',
     chapterActive: !!data.chapterActive,
+    __readoriBookIsNull: !!data.bookIsNull,
     sourceBookSourceName: data.sourceBookSourceName || '',
     sourceBookSourceComment: data.sourceBookSourceComment || '',
     sourceVariableComment: data.sourceVariableComment || '',
@@ -5711,6 +6301,14 @@ const { URL, URLSearchParams } = require('node:url');
   for (const [key, value] of Object.entries(data.extraVars || {})) {
     context[key] = value;
   }
+  Object.assign(context, __readoriAppNatives());
+  // R143 (S1 = A): blocked interactions are reported back to Python in the result JSON.
+  const suppressedInteractions = [];
+  context.__readoriAllowsUserInteraction = data.allowsUserInteraction !== false;
+  context.__readoriRecordSuppressedInteraction = function(kind) {
+    const name = String(kind);
+    if (!suppressedInteractions.includes(name)) suppressedInteractions.push(name);
+  };
   const initialResult = context.result;
   vm.createContext(context, {
     codeGeneration: { strings: true, wasm: false },
@@ -5748,7 +6346,56 @@ const { URL, URLSearchParams } = require('node:url');
     }
   } catch (error) {}
   try {
-    vm.runInContext(data.javaApi || '', context, { timeout: 700 });
+    vm.runInContext(data.javaApi || '', context, { timeout: 700, filename: 'readori-api.js' });
+  } catch (error) {}
+  // R143: the App installs CryptoJS right after the java prelude and before jsLib (1.1.1: the fake global;
+  // 1.1.2: the crypto-js 4.1 builtin only when the text references it and does not define it itself).
+  const appJs = data.appJs || {};
+  const appJsSources = data.appJsSources || {};
+  function __readoriInstallAppJs(source, filename) {
+    if (!source) return;
+    try {
+      vm.runInContext(source, context, { timeout: 700, filename });
+    } catch (error) {}
+  }
+  if (appJs.legacyCryptoJS) __readoriInstallAppJs(appJsSources.legacy, 'readori-app-cryptojs-111.js');
+  if (appJs.cryptoJSBeforeJsLib) __readoriInstallAppJs(appJsSources.builtin, 'readori-app-cryptojs-112.js');
+  // Source scripts see Readori's Buffer shim semantics: Buffer.from/concat called
+  // directly from source (or jsLib) code return a signed Java byte array whose
+  // toString() decodes UTF-8. The polyfill itself keeps the native Buffer.
+  try {
+    const NativeBuffer = Buffer;
+    const calledFromSource = function() {
+      const frames = String(new Error().stack || '').split('\n');
+      // [0] "Error", [1] calledFromSource, [2] SourceBuffer.from/concat, [3] caller
+      return /readori-(?:source|jslib)\.js/.test(frames[3] || '');
+    };
+    const toSigned = function(buffer) {
+      return typeof context.__readoriByteArrayWithUtf8String === 'function'
+        ? context.__readoriByteArrayWithUtf8String(Array.from(buffer))
+        : Array.from(buffer, function(b) { return b > 127 ? b - 256 : b; });
+    };
+    const SourceBuffer = function(a, b, c) { return NativeBuffer(a, b, c); };
+    Object.setPrototypeOf(SourceBuffer, NativeBuffer);
+    SourceBuffer.prototype = NativeBuffer.prototype;
+    SourceBuffer.from = function(value, encodingOrOffset, length) {
+      const source = calledFromSource();
+      let input = value;
+      if (source && input && typeof input !== 'string' && !NativeBuffer.isBuffer(input) && typeof input.length === 'number') {
+        input = Array.from(input, function(v) { return Number(v) & 255; });
+      }
+      const out = NativeBuffer.from(input, encodingOrOffset, length);
+      return source ? toSigned(out) : out;
+    };
+    SourceBuffer.concat = function(list, totalLength) {
+      const source = calledFromSource();
+      const parts = Array.from(list || [], function(item) {
+        return NativeBuffer.isBuffer(item) ? item : NativeBuffer.from(Array.from(item || [], function(v) { return Number(v) & 255; }));
+      });
+      const out = NativeBuffer.concat(parts, totalLength);
+      return source ? toSigned(out) : out;
+    };
+    context.Buffer = SourceBuffer;
   } catch (error) {}
   function __readoriWrapJsoupResultArray(value) {
     if (!Array.isArray(value) || typeof context._readoriJsoupElements !== 'function' || typeof context._readoriJsoupRows !== 'function') {
@@ -5784,22 +6431,36 @@ const { URL, URLSearchParams } = require('node:url');
   } catch (error) {}
   try {
     if (data.jsLib) {
-      vm.runInContext(data.jsLib, context, { timeout: 700 });
+      vm.runInContext(data.jsLib, context, { timeout: 700, filename: 'readori-jslib.js' });
     }
   } catch (error) {}
+  if (appJs.cryptoJSBeforeCode) __readoriInstallAppJs(appJsSources.builtin, 'readori-app-cryptojs-112.js');
   let value;
+  let scriptError = '';
+  function __readoriErrorText(error) {
+    let text = 'unknown';
+    try { text = String(error); } catch (ignored) {}
+    // vm timeouts are engine limits, not Legado ScriptExceptions.
+    return /Script execution timed out/i.test(text) ? '' : text;
+  }
+  function __readoriIsTopLevelReturn(text) {
+    return /illegal return statement|return statements are only valid inside functions|return not in a function/i.test(text || '');
+  }
   try {
-    value = vm.runInContext(data.code || '', context, { timeout: 1200 });
+    value = vm.runInContext(data.code || '', context, { timeout: 1200, filename: 'readori-source.js' });
   } catch (error) {
     if (process.env.READORI_DEBUG_NODE_JS) {
       console.error('NODE_DIRECT_FAIL', error && error.message);
     }
+    const directText = __readoriErrorText(error);
+    if (directText && !__readoriIsTopLevelReturn(directText)) scriptError = directText;
     try {
-      value = vm.runInContext(`(function(){ ${data.code || ''} })()`, context, { timeout: 1200 });
+      value = vm.runInContext(`(function(){ ${data.code || ''} })()`, context, { timeout: 1200, filename: 'readori-source.js' });
     } catch (inner) {
       if (process.env.READORI_DEBUG_NODE_JS) {
         console.error('NODE_WRAP_FAIL', inner && inner.message);
       }
+      if (!scriptError && directText) scriptError = __readoriErrorText(inner);
       value = context.result !== initialResult ? context.result : '';
     }
   }
@@ -5821,8 +6482,10 @@ const { URL, URLSearchParams } = require('node:url');
   try {
     process.stdout.write(JSON.stringify({
       value: text,
+      scriptError: scriptError,
       variables: context.variables || {},
-      requests: Array.isArray(context.__readoriRequestLog) ? context.__readoriRequestLog : []
+      requests: Array.isArray(context.__readoriRequestLog) ? context.__readoriRequestLog : [],
+      interactions: suppressedInteractions
     }));
   } catch (error) {
     process.stdout.write(JSON.stringify({ value: '', variables: {} }));
@@ -5831,10 +6494,84 @@ const { URL, URLSearchParams } = require('node:url');
 """
 
 
+def app_cryptojs_sources(plan: dict[str, bool]) -> dict[str, str]:
+    """The App JS texts a setup plan needs (kept out of the Node payload when unused: 22 KB)."""
+    sources: dict[str, str] = {}
+    if plan.get("legacyCryptoJS"):
+        sources["legacy"] = app_profiles.APP_111_CRYPTOJS_POLYFILL
+    if plan.get("cryptoJSBeforeJsLib") or plan.get("cryptoJSBeforeCode"):
+        sources["builtin"] = app_profiles.APP_112_CRYPTOJS_BUILTIN
+    return sources
+
+
+def _js_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def install_quickjs_app_globals(ctx: Any, runtime: RuleRuntime) -> None:
+    """App globals (btoa/atob/md5/sha256, UTF-8 semantics), the CryptoJS native bridges and the interaction gate.
+
+    python-quickjs refuses callbacks into Python while a time limit is set, and make_quickjs_context always sets one,
+    so everything here is plain JS (QUICKJS_APP_NATIVES_JS). Blocked interactions are collected on the JS side and
+    moved into the runtime's interaction state by drain_quickjs_interactions. Runs before the java prelude.
+    """
+    try:
+        ctx.eval(app_profiles.QUICKJS_APP_NATIVES_JS)
+    except Exception:
+        pass
+    try:
+        ctx.set("__readoriAllowsUserInteraction", bool(getattr(runtime, "allows_user_interaction", True)))
+    except Exception:
+        pass
+
+
+def drain_quickjs_interactions(ctx: Any, runtime: RuleRuntime) -> None:
+    """Move the interaction kinds the JS side logged (java.startBrowser* etc.) into runtime.interaction_state."""
+    try:
+        raw = ctx.eval(
+            "JSON.stringify(typeof __readoriSuppressedInteractionLog === 'undefined' ? [] : __readoriSuppressedInteractionLog)"
+        )
+        kinds = json.loads(str(raw or "[]"))
+    except Exception:
+        return
+    if not isinstance(kinds, list):
+        return
+    for kind in kinds:
+        record_suppressed_interaction(runtime, _js_text(kind))
+    try:
+        ctx.eval("if (typeof __readoriSuppressedInteractionLog !== 'undefined') __readoriSuppressedInteractionLog.length = 0;")
+    except Exception:
+        pass
+
+
+def install_quickjs_app_cryptojs(ctx: Any, plan: dict[str, bool], phase: str) -> None:
+    """phase "jslib": 1.1.1 fake global / 1.1.2 builtin before jsLib. phase "code": 1.1.2 builtin before the rule script.
+
+    Every install is best-effort (the App clears a failed install's exception too).
+    """
+    if phase == "jslib":
+        if plan.get("legacyCryptoJS"):
+            source = app_profiles.APP_111_CRYPTOJS_POLYFILL
+        elif plan.get("cryptoJSBeforeJsLib"):
+            source = app_profiles.APP_112_CRYPTOJS_BUILTIN
+        else:
+            return
+    else:
+        if not plan.get("cryptoJSBeforeCode"):
+            return
+        source = app_profiles.APP_112_CRYPTOJS_BUILTIN
+    try:
+        # The native bridges (__readoriCryptoJS*) are already JS globals from install_quickjs_app_globals.
+        ctx.eval(source)
+    except Exception:
+        pass
+
+
 def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, extra_vars: dict[str, Any] | None = None) -> str:
     node = node_binary_path()
     if not node:
         return ""
+    app_js_plan = app_profiles.app_js_setup_plan(runtime.js_lib or "", script)
     extra_vars = dict(extra_vars or {})
     inject_rar_script_fixtures(script, runtime, extra_vars)
     should_materialize_dynamic_requests = "__readoriRequestLog" not in extra_vars
@@ -5881,6 +6618,7 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         "chapterCount": runtime.chapter_count,
         "chapterVariable": runtime.chapter_variable,
         "chapterActive": runtime.chapter_active,
+        "bookIsNull": runtime_binds_book_as_null(runtime),
         "sourceBookSourceName": runtime.source_book_source_name,
         "sourceBookSourceComment": runtime.source_book_source_comment,
         "sourceVariableComment": runtime.source_variable_comment,
@@ -5901,6 +6639,9 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         "extraVars": extra_vars,
         "jsLib": runtime.js_lib or "",
         "javaApi": _build_java_api_js(runtime),
+        "allowsUserInteraction": bool(getattr(runtime, "allows_user_interaction", True)),
+        "appJs": app_js_plan,
+        "appJsSources": app_cryptojs_sources(app_js_plan),
         "percentEncodeMap": build_percent_encode_map(
             input_text,
             extra_vars or {},
@@ -5952,6 +6693,8 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         node_result = run_node(payload)
         if not node_result:
             return ""
+        for interaction_kind in node_result.get("interactions") or []:
+            record_suppressed_interaction(runtime, str(interaction_kind))
         # If the rule already produced a value, any logged browser/navigation
         # requests are side effects rather than missing data dependencies. Do
         # not turn guarded CAPTCHA/settings fallbacks into extra validation I/O.
@@ -5973,6 +6716,8 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
 
     if not isinstance(node_result, dict) or "value" not in node_result:
         return ""
+    if node_result.get("scriptError"):
+        record_script_error(runtime, str(node_result.get("scriptError")), script)
     variables = node_result.get("variables")
     if isinstance(variables, dict):
         runtime.variables = dict(runtime.variables or {})
@@ -6017,6 +6762,9 @@ def js_requires_node_crypto(script: str) -> bool:
             "bytearrayinputstream",
             "bytearrayoutputstream",
             "mac.getinstance",
+            "messagedigest.getinstance",
+            "cipher.getinstance",
+            "secretkeyfactory.getinstance",
             "signature.getinstance",
             "hmacsha256",
             "sha256withrsa",
@@ -6056,7 +6804,7 @@ def build_percent_encode_map(*value_sources: Any) -> dict[str, dict[str, str]]:
     return out
 
 
-def collect_static_js_request_urls(script: str) -> list[tuple[str, str, str, bool]]:
+def collect_static_js_request_urls(script: str, include_browser_await: bool = True) -> list[tuple[str, str, str, bool]]:
     """Collect literal java network calls so the Node fallback can mirror QuickJS fetch callbacks."""
     code = script or ""
     requests_out: list[tuple[str, str, str, bool]] = []
@@ -6080,6 +6828,8 @@ def collect_static_js_request_urls(script: str) -> list[tuple[str, str, str, boo
         "ajax", "connect", "startBrowserAwait", "startBrowserAwaitAwait",
         "cacheFile", "importScript",
     ):
+        if not include_browser_await and name.startswith("startBrowserAwait"):
+            continue
         pattern = rf"""java\s*\.\s*{name}\s*\(\s*{string_re}"""
         for match in re.finditer(pattern, code):
             add("GET", decode_literal(match.group(2)))
@@ -6185,7 +6935,9 @@ def materialize_js_request_log_fixtures(
 
 def build_js_response_fixtures(script: str, runtime: RuleRuntime) -> dict[str, dict[str, Any]]:
     fixtures: dict[str, dict[str, Any]] = {}
-    static_requests = collect_static_js_request_urls(script)
+    # App batch validation blocks startBrowserAwait (the script throws before any request), so nothing is prefetched.
+    browser_await_allowed = bool(getattr(runtime, "allows_user_interaction", True))
+    static_requests = collect_static_js_request_urls(script, include_browser_await=browser_await_allowed)
     variable_urls = {
         "baseUrl": runtime.base_url,
         "sourceUrl": runtime.source_url,
@@ -6195,7 +6947,7 @@ def build_js_response_fixtures(script: str, runtime: RuleRuntime) -> dict[str, d
     for variable_name, variable_url in variable_urls.items():
         if not variable_url:
             continue
-        if re.search(rf"java\s*\.\s*startBrowserAwait(?:Await)?\s*\(\s*{variable_name}\b", script or ""):
+        if browser_await_allowed and re.search(rf"java\s*\.\s*startBrowserAwait(?:Await)?\s*\(\s*{variable_name}\b", script or ""):
             static_requests.append(("GET", variable_url, "", True))
         if re.search(rf"java\s*\.\s*web[Vv]iew(?:GetSource|GetOverrideUrl)?\s*\(\s*(?:null|undefined|['\"][^'\"]*['\"])?\s*,\s*{variable_name}\b", script or ""):
             static_requests.append(("GET", variable_url, "", True))
@@ -6203,7 +6955,7 @@ def build_js_response_fixtures(script: str, runtime: RuleRuntime) -> dict[str, d
         r"\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*java\s*\.\s*ruleUrl\b",
         script or "",
     ):
-        if runtime.rule_url and re.search(
+        if browser_await_allowed and runtime.rule_url and re.search(
             rf"java\s*\.\s*startBrowserAwait(?:Await)?\s*\(\s*{re.escape(alias)}\b",
             script or "",
         ):
@@ -6526,6 +7278,82 @@ def repair_glued_var_declarations(script: str) -> str:
     return repaired
 
 
+def _quickjs_error_message(error: BaseException) -> str:
+    text = str(error or "").strip()
+    # quickjs.JSException text is "ReferenceError: x is not defined\n    at …".
+    first = text.splitlines()[0].strip() if text else ""
+    if re.search(r"interrupted|timed out|out of memory", first, flags=re.I):
+        return ""  # engine limits are not source-script exceptions
+    if first == "TypeError: not a function":
+        # QuickJS drops the callee text; V8 / JavaScriptCore both say "<callee> is not a function".
+        first = "TypeError: value is not a function"
+    return first or type(error).__name__
+
+
+def quickjs_value_text(value: Any) -> str:
+    """Script completion value as text, the way the Node runner reports it.
+
+    python-quickjs hands back Python objects: str() of a quickjs.Object is a Python repr, and True / 1.0 would print as
+    "True" / "1.0". The Node path (and the App) give strings as-is, objects / arrays as JSON, everything else as
+    String(value).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value:
+            return "NaN"
+        if value in (float("inf"), float("-inf")):
+            return "Infinity" if value > 0 else "-Infinity"
+        if value == int(value) and abs(value) < 1e21:
+            return str(int(value))
+        return repr(value)
+    json_method = getattr(value, "json", None)
+    if callable(json_method):
+        try:
+            return str(json_method() or "")
+        except Exception:
+            return ""
+    return str(value)
+
+
+def _is_top_level_return_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return (
+        "return not in a function" in lower
+        or "illegal return statement" in lower
+        or "return statements are only valid inside functions" in lower
+    )
+
+
+_JS_LIST_URL_ATTR_RE = re.compile(r"@\s*(?:href|src|data-src|data-href|action)\s*$", re.IGNORECASE)
+
+
+def evaluate_js_string_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
+    """java.getStringList(rule): the rule's values; href / src style attributes come back resolved like the Node native."""
+    mode = "json" if is_json_content(html) else "html"
+    values = evaluate_rule(rule, html, runtime, mode)
+    if mode != "html" or not values or "<js>" in rule or "@js:" in rule or "{{" in rule:
+        return values
+    base = runtime.base_url or runtime.book_source_url or "https://example.test/"
+    for branch in rule.split("||"):
+        branch = branch.strip()
+        if not branch:
+            continue
+        branch_values = evaluate_rule(branch, html, runtime, mode)
+        if not branch_values:
+            continue
+        if _JS_LIST_URL_ATTR_RE.search(branch):
+            return [urljoin(base, str(value)) if value else value for value in branch_values]
+        return values
+    return values
+
+
 def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: dict[str, Any] | None = None) -> str:
     code = script.strip()
     if not code:
@@ -6576,10 +7404,140 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
             extra_vars["__readoriResponseFixtures"] = fixtures
     if js_requires_node_crypto(code) and node_binary_path():
         return evaluate_js_with_node(code, input_text, runtime, extra_vars=extra_vars)
+    return _evaluate_js_quickjs(code, input_text, runtime, extra_vars, json_obj)
+
+
+# python-quickjs refuses callbacks into Python while a time limit is set ("Can not call into Python with a time limit
+# set."), and the time limit is what stops runaway scripts. So Python natives are never called from inside QuickJS:
+# each one is a JS stub that answers from a result cache, or records the call and throws. The driver runs the
+# script, executes the first recorded call in Python, caches its result and replays the script (the Node path does
+# the same with its request log). Results are cached per call position, so repeated identical calls still execute.
+QUICKJS_NATIVE_REPLAY_LIMIT = 150
+QUICKJS_NATIVE_REPLAY_SCRIPT_SECONDS = 6.0  # JS time summed over the replays (native calls themselves not counted)
+_QUICKJS_NATIVE_STUB = r"""
+(function (name) {
+  var stringify = JSON.stringify, slice = Array.prototype.slice;
+  globalThis[name] = function () {
+    var args = slice.call(arguments), size = 0;
+    try { size = stringify(args).length; } catch (error) {}
+    var key = (__readoriNativeSeq++) + ':' + name + ':' + size;
+    var hit = __readoriNativeCache[key];
+    if (hit !== undefined) {
+      if (hit.e !== undefined) throw new Error(hit.e);
+      return hit.v;
+    }
+    if (__readoriNativeMisses.length === 0) __readoriNativeMisses.push({ key: key, name: name, args: args });
+    throw new Error('__readoriNativeMiss');
+  };
+})(%s);
+"""
+
+
+class _QuickJSNativeBridge:
+    """Wraps a quickjs.Context so add_callable installs replay stubs instead of real (blocked) Python callbacks."""
+
+    def __init__(self, ctx: Any, results: dict[str, Any]) -> None:
+        self._ctx = ctx
+        self.natives: dict[str, Callable[..., Any]] = {}
+        try:
+            ctx.eval(
+                "var __readoriNativeCache = JSON.parse(%s); var __readoriNativeSeq = 0; var __readoriNativeMisses = [];"
+                % json.dumps(json.dumps(results, ensure_ascii=False))
+            )
+        except Exception:
+            pass
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ctx, name)
+
+    def add_callable(self, name: str, function: Callable[..., Any]) -> None:
+        self.natives[name] = function
+        self._ctx.eval(_QUICKJS_NATIVE_STUB % json.dumps(name))
+
+    def first_native_miss(self) -> dict[str, Any] | None:
+        try:
+            raw = self._ctx.eval("JSON.stringify(__readoriNativeMisses.length ? __readoriNativeMisses[0] : null)")
+            miss = json.loads(str(raw)) if raw else None
+        except Exception:
+            return None
+        return miss if isinstance(miss, dict) else None
+
+    def has_native_miss(self) -> bool:
+        try:
+            return bool(self._ctx.eval("__readoriNativeMisses.length"))
+        except Exception:
+            return False
+
+    def interaction_effects(self, runtime: RuleRuntime) -> list[Callable[[], None]]:
+        """Blocked-interaction kinds the JS side logged, as deferred runtime updates."""
+        try:
+            raw = self._ctx.eval(
+                "JSON.stringify(typeof __readoriSuppressedInteractionLog === 'undefined' ? [] : __readoriSuppressedInteractionLog)"
+            )
+            kinds = json.loads(str(raw or "[]"))
+        except Exception:
+            return []
+        if not isinstance(kinds, list):
+            return []
+        return [lambda kind=kind: record_suppressed_interaction(runtime, _js_text(kind)) for kind in kinds]
+
+
+def _evaluate_js_quickjs(
+    code: str,
+    input_text: str,
+    runtime: RuleRuntime,
+    extra_vars: dict[str, Any] | None,
+    json_obj: Any,
+) -> str:
+    native_results: dict[str, Any] = {}
+    outcome = ""
+    state: dict[str, Any] = {"pending": [], "miss": None, "bridge": None}
+    script_seconds = 0.0
+    for _attempt in range(QUICKJS_NATIVE_REPLAY_LIMIT):
+        state = {"pending": [], "miss": None, "bridge": None}
+        started = time.monotonic()
+        outcome = _evaluate_js_quickjs_attempt(code, input_text, runtime, extra_vars, json_obj, native_results, state)
+        script_seconds += time.monotonic() - started
+        miss = state["miss"]
+        bridge = state["bridge"]
+        if not miss or bridge is None or script_seconds > QUICKJS_NATIVE_REPLAY_SCRIPT_SECONDS:
+            break
+        function = bridge.natives.get(str(miss.get("name") or ""))
+        if function is None:
+            break
+        try:
+            args = miss.get("args")
+            value = function(*(args if isinstance(args, list) else []))
+            native_results[str(miss["key"])] = {"v": json.loads(json.dumps(value, ensure_ascii=False, default=str))}
+        except Exception as error:
+            native_results[str(miss["key"])] = {"e": str(error) or type(error).__name__}
+    for effect in state["pending"]:
+        effect()
+    return outcome
+
+
+def _evaluate_js_quickjs_attempt(
+    code: str,
+    input_text: str,
+    runtime: RuleRuntime,
+    extra_vars: dict[str, Any] | None,
+    json_obj: Any,
+    native_results: dict[str, Any],
+    state: dict[str, Any],
+) -> str:
+    pending: list[Callable[[], None]] = state["pending"]
+    js_ctx = None
+
+    def defer_script_error(message: str) -> None:
+        pending.append(lambda: record_script_error(runtime, message, code))
+
     try:
-        ctx = make_quickjs_context()
-        if ctx is None:
+        raw_ctx = make_quickjs_context()
+        if raw_ctx is None:
             return evaluate_js_with_node(code, input_text, runtime, extra_vars=extra_vars)
+        ctx = _QuickJSNativeBridge(raw_ctx, native_results)
+        js_ctx = ctx
+        state["bridge"] = ctx
         ctx.set("result", input_text)
         ctx.set("src", input_text)
         ctx.set("input", input_text)
@@ -6719,7 +7677,7 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
             ctx.add_callable(
                 "__readoriEvaluateList",
                 lambda rule, html: json.dumps(
-                    evaluate_rule(str(rule or ""), str(html or ""), runtime, "json" if is_json_content(str(html or "")) else "html"),
+                    evaluate_js_string_list(str(rule or ""), str(html or ""), runtime),
                     ensure_ascii=False,
                 ),
             )
@@ -6898,10 +7856,15 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
         except Exception:
             pass
 
+        ctx.set("__readoriBookIsNull", runtime_binds_book_as_null(runtime))
+        install_quickjs_app_globals(ctx, runtime)
         java_api = _build_java_api_js(runtime)
         ctx.eval(java_api)
+        app_js_plan = app_profiles.app_js_setup_plan(runtime.js_lib or "", code)
+        install_quickjs_app_cryptojs(ctx, app_js_plan, "jslib")
 
         def sync_quickjs_variables() -> None:
+            # Read the script's variables now, apply them to the runtime only if this attempt is the final one.
             try:
                 serialized = ctx.eval("JSON.stringify(variables || {})")
                 values = json.loads(str(serialized or "{}"))
@@ -6909,12 +7872,16 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
                 return
             if not isinstance(values, dict):
                 return
-            runtime.variables = dict(runtime.variables or {})
-            for key, value in values.items():
-                if key:
-                    runtime.variables[str(key)] = "" if value is None else str(value)
-            sync_runtime_book_state_from_variables(runtime)
-            sync_runtime_chapter_state_from_variables(runtime)
+
+            def apply_variables() -> None:
+                runtime.variables = dict(runtime.variables or {})
+                for key, value in values.items():
+                    if key:
+                        runtime.variables[str(key)] = "" if value is None else str(value)
+                sync_runtime_book_state_from_variables(runtime)
+                sync_runtime_chapter_state_from_variables(runtime)
+
+            pending.append(apply_variables)
 
         # 注入 jsLib（书源共享 JS 库）
         if runtime.js_lib:
@@ -6922,25 +7889,32 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
                 ctx.eval(runtime.js_lib)
             except Exception:
                 pass
+        install_quickjs_app_cryptojs(ctx, app_js_plan, "code")
 
+        direct_error = ""
         try:
             ret = ctx.eval(code)
-            text = "" if ret is None else str(ret)
+            text = quickjs_value_text(ret)
             if text and text != "undefined":
                 sync_quickjs_variables()
                 return text
-        except Exception:
-            pass
+        except Exception as error:
+            direct_error = _quickjs_error_message(error)
 
         try:
             wrapped = f"(function(){{ {code} }})()"
             ret = ctx.eval(wrapped)
-            text = "" if ret is None else str(ret)
+            text = quickjs_value_text(ret)
+            if direct_error and not _is_top_level_return_error(direct_error):
+                defer_script_error(direct_error)
             if text and text != "undefined":
                 sync_quickjs_variables()
                 return text
-        except Exception:
-            pass
+        except Exception as error:
+            if direct_error and not _is_top_level_return_error(direct_error):
+                defer_script_error(direct_error)
+            elif direct_error:
+                defer_script_error(_quickjs_error_message(error))
 
         try:
             fallback = ctx.eval("String(result)")
@@ -6948,9 +7922,17 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
             sync_quickjs_variables()
             return fallback_text if fallback_text and fallback_text != input_text else ""
         except Exception:
+            if js_ctx.has_native_miss():
+                return ""
             return evaluate_js_with_node(code, input_text, runtime, extra_vars=extra_vars)
     except Exception:
+        if js_ctx is not None and js_ctx.has_native_miss():
+            return ""
         return evaluate_js_with_node(code, input_text, runtime, extra_vars=extra_vars)
+    finally:
+        if js_ctx is not None:
+            state["miss"] = js_ctx.first_native_miss()
+            pending.extend(js_ctx.interaction_effects(runtime))
 
 
 def apply_login_check_js(
@@ -7860,6 +8842,16 @@ def derive_paged_chapter_urls(current_url: str, html: str, page_content: str) ->
 
 
 def build_url_with_options(template: str, keyword: str, page: int, runtime: RuleRuntime, session: requests.Session | None = None) -> tuple[str, dict[str, Any]]:
+    # Legado AnalyzeUrl for searchUrl/exploreUrl runs on RuleData (book == null).
+    previous_binding = getattr(runtime, "book_binding", "automatic")
+    runtime.book_binding = "unbound"
+    try:
+        return _build_url_with_options(template, keyword, page, runtime, session)
+    finally:
+        runtime.book_binding = previous_binding
+
+
+def _build_url_with_options(template: str, keyword: str, page: int, runtime: RuleRuntime, session: requests.Session | None = None) -> tuple[str, dict[str, Any]]:
     pre_resolved = resolve_template(template, runtime, page=page)
     raw = normalize_legacy_template(strip_leading_cookie_side_effect_template(pre_resolved))
     raw = apply_page_expression_templates(raw, page)
@@ -8253,10 +9245,31 @@ def css_extract(html: str, selector: str, attr: str | None, index: int | None, b
         elif attr == "textnodes":
             results.append("\n".join(s.strip() for s in el.find_all(string=True, recursive=False) if s.strip()))
         else:
-            value = el.get(attr, "")
+            value = _css_raw_attr_value(el, attr, base_url)
             if value:
-                results.append(urljoin(base_url, value) if attr.lower() in URL_ATTRS else str(value))
+                results.append(value)
     return [x for x in results if x]
+
+
+def _css_raw_attr_value(el: Any, attr: str, base_url: str) -> str:
+    """Attribute value for the `@css:` / text-search paths.
+
+    Legado AnalyzeByJSoup and the Swift CSSEngine (resolveURLAttributes == false) return the RAW
+    attribute value (`@css:a@href` -> "/book/1", not "https://host/book/1"). URLs are made absolute
+    only by the URL-consuming call sites (bookUrl/tocUrl/chapterUrl/nextTocUrl/nextContentUrl/
+    cover via resolve_url_with_options / legado_absolute_url). An explicit `abs:` prefix still
+    resolves against the base URL, like Jsoup Node.attr("abs:href").
+    """
+    if attr.lower().startswith("abs:"):
+        raw = el.get(attr[4:], "")
+        if isinstance(raw, list):
+            raw = " ".join(str(item) for item in raw)
+        raw = str(raw or "").strip()
+        return urljoin(base_url, raw) if raw else ""
+    value = el.get(attr, "")
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value)
+    return str(value) if value else ""
 
 
 def select_elements_json(selector: str, html: str, base_url: str) -> str:
@@ -8289,9 +9302,10 @@ def select_elements_json(selector: str, html: str, base_url: str) -> str:
                 attr_value = " ".join(str(v) for v in value)
             else:
                 attr_value = str(value)
-            if attr_key in URL_ATTRS:
-                attr_value = urljoin(base_url, attr_value)
+            # Jsoup Element.attr(name) is the raw value (Legado / iOS semantics); only an explicit "abs:" resolves.
             row[attr_key] = attr_value
+            if attr_key in URL_ATTRS:
+                row["abs:" + attr_key] = urljoin(base_url, attr_value)
         rows.append(row)
     return json.dumps(rows, ensure_ascii=False)
 
@@ -8364,6 +9378,13 @@ def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> lis
                 return str(item)
 
         for item_index, item in enumerate(items):
+            if isinstance(item, str) and (getattr(item, "is_text", False) or getattr(item, "is_tail", False)):
+                # JsoupXpath 2.x text(): each direct child text node, whitespace
+                # normalised like Jsoup TextNode.text(); blank nodes are skipped.
+                text_node = re.sub(r"\s+", " ", str(item)).strip()
+                if text_node:
+                    results.append(text_node)
+                continue
             if attr is None:
                 results.append(node_text(item))
                 continue
@@ -8379,7 +9400,9 @@ def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> lis
             if hasattr(item, "get"):
                 value = item.get(attr)
                 if value:
-                    results.append(urljoin(base_url, value) if attr.lower() in URL_ATTRS else str(value))
+                    # Legado AnalyzeByXPath returns attribute text verbatim; only
+                    # AnalyzeRule.getString(isUrl = true) absolutises URLs.
+                    results.append(str(value))
         return [x for x in results if x]
 
     # 策略1：XHTML + lxml.etree（与 Swift Foundation.XMLParser 路径一致）
@@ -8470,7 +9493,34 @@ def json_container_to_string(value: Any) -> str:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float):
+        return java_double_string(value)
     return str(value)
+
+
+def java_double_string(value: float) -> str:
+    """Java ``Double.toString`` (json-smart parses decimals/exponents as Double).
+
+    ``9.0`` → "9.0", ``0.0001`` → "1.0E-4", ``1e20`` → "1.0E20"; integers are
+    ints in Python and keep their plain text.
+    """
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "-Infinity" if value < 0 else "Infinity"
+    if value == 0:
+        return "-0.0" if math.copysign(1.0, value) < 0 else "0.0"
+    sign = "-" if value < 0 else ""
+    magnitude = abs(value)
+    decimal_value = Decimal(repr(magnitude))
+    if 1e-3 <= magnitude < 1e7:
+        text = format(decimal_value.normalize(), "f")
+        return sign + (text if "." in text else text + ".0")
+    _sign, digit_tuple, exponent = decimal_value.normalize().as_tuple()
+    digits = "".join(str(d) for d in digit_tuple) or "0"
+    point_position = len(digits) + int(exponent)
+    rest = digits[1:] or "0"
+    return f"{sign}{digits[0]}.{rest}E{point_position - 1}"
 
 
 def legado_get_string_unescape(value: Any) -> str:
@@ -8629,35 +9679,396 @@ def _first_rule_sequence(rule: str) -> tuple[str, list[str]] | None:
     return (operator, cleaned) if len(cleaned) > 1 else None
 
 
-def evaluate_rule(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> list[str]:
-    literal_json_template = is_literal_json_template_rule(rule or "")
+# Legado AppPattern.JS_PATTERN / AnalyzeRule.putPattern / evalPattern.
+_LEGADO_JS_PATTERN = re.compile(r"<js>([\w\W]*?)</js>|@js:([\w\W]*)", re.I)
+_LEGADO_PUT_PATTERN = re.compile(r"@put:(\{[^}]+?\})", re.I)
+_LEGADO_RULE_TEMPLATE_PATTERN = re.compile(r"\{\{([\w\W]*?)\}\}")
+_LEGADO_RULE_TEMPLATE_INNER = re.compile(r"\{\{\s*(?:@(?!get:)|//)", re.I)
+
+
+def _split_legado_js_segments(rule: str) -> list[tuple[str, bool, bool]]:
+    """Mirror AnalyzeRule.splitSourceRule / Swift RuleParser.splitJavaScriptSegments.
+
+    Every ``<js>…</js>`` and ``@js:…`` cuts the rule; non-JS fragments are
+    trimmed and dropped when blank. Returns ``(text, is_js, is_at_js)`` tuples.
+    """
+    segments: list[tuple[str, bool, bool]] = []
+    start = 0
+    for match in _LEGADO_JS_PATTERN.finditer(rule):
+        if match.start() > start:
+            text = rule[start:match.start()].strip()
+            if text:
+                segments.append((text, False, False))
+        if match.group(2) is not None:
+            segments.append((match.group(2), True, True))
+        else:
+            segments.append((match.group(1), True, False))
+        start = match.end()
+    if len(rule) > start:
+        tail = rule[start:].strip()
+        if tail:
+            segments.append((tail, False, False))
+    if not segments:
+        return [(rule, False, False)]
+    return segments
+
+
+def _split_top_level_replace(text: str) -> tuple[str, str] | None:
+    """First ``##`` outside ``{{…}}`` (Swift RuleParser.rangeOfTopLevelReplace)."""
+    if "##" not in text:
+        return None
+    depth = 0
+    i = 0
+    while i < len(text) - 1:
+        pair = text[i:i + 2]
+        if pair == "{{":
+            depth += 1
+            i += 2
+            continue
+        if pair == "}}" and depth > 0:
+            depth -= 1
+            i += 2
+            continue
+        if pair == "##" and depth == 0:
+            return text[:i], text[i + 2:]
+        i += 1
+    return None
+
+
+def _extract_legado_put_rules(rule: str) -> tuple[str, list[str]]:
+    """Legado splitPutRule: strip every ``@put:{…}`` from any position."""
+    if "@put:" not in rule.lower():
+        return rule, []
+    remaining = rule
+    bodies: list[str] = []
+    for match in _LEGADO_PUT_PATTERN.finditer(rule):
+        remaining = remaining.replace(match.group(0), "")
+        bodies.append(match.group(1)[1:-1])
+    return remaining, bodies
+
+
+def is_literal_rule_template(text: str) -> bool:
+    """Whether a non-JS SourceRule is a makeUpRule template with inner rules.
+
+    Legado switches such a SourceRule to Mode.Regex: ``{{@…}}`` / ``{{//…}}``
+    placeholders are evaluated with getString and the composed text is the
+    result. ``@put`` is stripped and ``##`` split first (Swift parseSourceRule).
+    """
+    raw, _bodies = _extract_legado_put_rules(text or "")
+    split = _split_top_level_replace(raw)
+    base = split[0] if split is not None else raw
+    return _LEGADO_RULE_TEMPLATE_INNER.search(base) is not None
+
+
+def substitute_rule_templates(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> str:
+    """Resolve ``{{@rule}}`` / ``{{//xpath}}`` with AnalyzeRule.getString semantics.
+
+    ``{{@@…}}`` keeps its dedicated handler (substitute_makeup_rule_templates).
+    """
+    text = rule or ""
+    if "{{" not in text or _LEGADO_RULE_TEMPLATE_INNER.search(text) is None:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        if inner.startswith("@@") or inner.lower().startswith("@get:") or not (inner.startswith("@") or inner.startswith("//")):
+            return match.group(0)
+        values = evaluate_rule(inner, content, runtime, content_type)
+        return legado_get_string_value(values)
+
+    return _LEGADO_RULE_TEMPLATE_PATTERN.sub(replace, text)
+
+
+def _legado_all_in_one_values(patterns: list[str], content: str) -> list[str]:
+    """Swift evaluateAllInOne: chained regexes (no DOTALL), whole matches."""
+    source = content or ""
+    for offset, pattern in enumerate(patterns):
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            return []
+        if offset == len(patterns) - 1:
+            return [m.group(0) for m in regex.finditer(source) if m.group(0)]
+        joined = "".join(m.group(0) for m in regex.finditer(source))
+        if not joined:
+            return []
+        source = joined
+    return []
+
+
+def _legado_all_in_one_patterns(rule: str) -> list[str] | None:
+    text = (rule or "").strip()
+    if not text.startswith(":") or text[1:].startswith("/"):
+        return None
+    patterns = [part.strip() for part in text[1:].split("&&") if part.strip()]
+    return patterns or None
+
+
+def _evaluate_legado_js_segment(
+    code: str,
+    is_at_js: bool,
+    js_input: str,
+    runtime: RuleRuntime,
+    is_last: bool,
+) -> list[str]:
+    js_code = code.strip()
+    json_tail = ""
+    if is_at_js:
+        # Readori compatibility: @js:…@json:… (Legado's @js: swallows the tail).
+        at_json = re.search(r"@json:", js_code, flags=re.I)
+        if at_json and js_code[: at_json.start()].strip() and js_code[at_json.end():].strip():
+            json_tail = js_code[at_json.end():].strip()
+            js_code = js_code[: at_json.start()].strip()
+    js_result = try_evaluate_fast_java_aes(js_code, js_input)
+    if js_result is None and is_at_js:
+        js_result = try_evaluate_fast_toc_item_js(js_code, js_input, runtime)
+    if js_result is None:
+        js_result = evaluate_js(js_code, js_input, runtime)
+    if json_tail:
+        return evaluate_rule(json_tail, js_result, runtime, "json")
+    if not js_result:
+        return []
+    if is_last and is_at_js:
+        return js_result_to_list(js_result)
+    return [js_result]
+
+
+def _evaluate_legado_js_pipeline(
+    segments: list[tuple[str, bool, bool]],
+    literal_flags: list[bool],
+    content: str,
+    runtime: RuleRuntime,
+    content_type: str,
+    string_mode: bool = False,
+) -> list[str]:
+    """Swift RuleType.combine: each segment's output feeds the next.
+
+    A JavaScript segment after another segment receives the previous result
+    as one ``\\n``-joined string (AnalyzeRule.getString semantics). In
+    getString mode every segment yields one joined string (Swift
+    evaluateRuleForString).
+    """
+    # Intermediate stages keep handing parseable JSON to the next stage; only
+    # the last stage renders JSONPath objects as Legado getString text.
+    object_mode = legado_object_string_mode()
+    if string_mode:
+        text_value = content
+        for offset, (text, is_js, is_at_js) in enumerate(segments):
+            is_last = offset == len(segments) - 1
+            previous_mode = set_legado_object_string_mode(object_mode and is_last)
+            try:
+                if is_js:
+                    values = _evaluate_legado_js_segment(text, is_at_js, text_value, runtime, is_last)
+                else:
+                    if offset == 0:
+                        item_type = content_type
+                    else:
+                        item_type = "json" if is_json_content(text_value) else content_type
+                    if literal_flags[offset]:
+                        values = _evaluate_legado_source_rule(text, text_value, runtime, item_type, True, True)
+                    else:
+                        values = evaluate_rule(text, text_value, runtime, item_type, string_mode=True)
+            finally:
+                set_legado_object_string_mode(previous_mode)
+            if not values:
+                return []
+            text_value = "\n".join(values)
+        return [text_value]
+    current = [content]
+    for offset, (text, is_js, is_at_js) in enumerate(segments):
+        is_last = offset == len(segments) - 1
+        previous_mode = set_legado_object_string_mode(object_mode and is_last)
+        try:
+            if is_js:
+                js_input = content if offset == 0 else "\n".join(current)
+                current = _evaluate_legado_js_segment(text, is_at_js, js_input, runtime, is_last)
+            else:
+                next_values: list[str] = []
+                for item in current:
+                    if offset == 0:
+                        item_type = content_type
+                    elif offset == 1 and segments[0][1]:
+                        item_type = "json" if is_json_content(item) or extract_json(item) else content_type
+                    else:
+                        item_type = "json" if is_json_content(item) else content_type
+                    if literal_flags[offset]:
+                        next_values.extend(_evaluate_legado_source_rule(text, item, runtime, item_type, True))
+                    else:
+                        next_values.extend(evaluate_rule(text, item, runtime, item_type))
+                current = next_values
+        finally:
+            set_legado_object_string_mode(previous_mode)
+        if not current:
+            break
+    return current
+
+
+def _evaluate_legado_source_rule(
+    rule: str,
+    content: str,
+    runtime: RuleRuntime,
+    content_type: str,
+    literal_template: bool,
+    string_mode: bool = False,
+) -> list[str]:
+    """One non-JS SourceRule: AllInOne → @put → ``##`` → template → engine.
+
+    ``string_mode`` is AnalyzeRule.getString: ``##`` acts once on the
+    ``\\n``-joined base result; list mode (getStringList) replaces per item.
+    """
+    t = rule.strip()
+    patterns = _legado_all_in_one_patterns(t)
+    if patterns is not None:
+        return _legado_all_in_one_values(patterns, content)
+
+    remaining, put_bodies = _extract_legado_put_rules(t)
+    if put_bodies:
+        base = remaining.strip()
+        if base or len(put_bodies) > 1:
+            first_values: list[str] | None = None
+            for body in put_bodies:
+                values = evaluate_single_rule("@put:{" + body + "}", content, runtime, content_type)
+                if first_values is None:
+                    first_values = values
+            if not base:
+                return first_values or []
+            return _evaluate_legado_source_rule(base, content, runtime, content_type, literal_template, string_mode)
+
+    split = _split_top_level_replace(t)
+    if split is not None:
+        base, chain = split
+        base = base.strip()
+        if not base:
+            base_values = [content]
+        elif literal_template:
+            base_values = [base]
+        else:
+            base_values = evaluate_rule(base, content, runtime, content_type, string_mode=string_mode)
+        if not chain:
+            return base_values
+        if string_mode:
+            return [legado_replace_regex("\n".join(base_values), chain)] if base_values else []
+        return [legado_replace_regex(value, chain) for value in base_values]
+
+    if literal_template:
+        return [t] if t else []
+    return _evaluate_rule_sequence(t, content, runtime, content_type)
+
+
+def legado_absolute_url(relative_path: str, base_url: str) -> str:
+    """NetworkUtils.getAbsoluteURL(redirectUrl, url) as used by getString(isUrl = true)."""
+    relative = (relative_path or "").strip()
+    if not base_url:
+        return relative
+    base_text = base_url.split(",", 1)[0].strip()
+    if not urlparse(base_text).scheme:
+        return relative
+    lower = relative.lower()
+    if lower.startswith(("http://", "https://", "data:")):
+        return relative
+    if lower.startswith("javascript"):
+        return ""
+    try:
+        return urljoin(base_text, relative)
+    except Exception:
+        return relative
+
+
+def evaluate_is_url_string(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> str:
+    """AnalyzeRule.getString(rule, isUrl = true): first value; blank -> baseUrl."""
+    values = evaluate_rule(rule, content, runtime, content_type)
+    raw = legado_get_string_unescape(values[0]) if values else ""
+    if not raw.strip():
+        return runtime.base_url
+    return legado_absolute_url(raw, runtime.base_url)
+
+
+def evaluate_is_url_list(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> list[str]:
+    """AnalyzeRule.getStringList(rule, isUrl = true): absolutise, drop empty, dedupe."""
+    urls: list[str] = []
+    for raw in evaluate_rule(rule, content, runtime, content_type):
+        absolute = legado_absolute_url(raw, runtime.base_url)
+        if absolute and absolute not in urls:
+            urls.append(absolute)
+    return urls
+
+
+def evaluate_get_string(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> str:
+    """AnalyzeRule.getString (non-isUrl) / Swift RuleEvaluator.evaluateGetString.
+
+    The base rule is evaluated as a list and joined with ``\\n``; ``##`` runs
+    once on the joined text (anchors and ``###`` act on the whole string);
+    HTML entities are unescaped last.
+    """
+    return legado_get_string(rule, content, runtime, content_type, unescape=True)
+
+
+def legado_get_string(
+    rule: str,
+    content: str,
+    runtime: RuleRuntime,
+    content_type: str = "html",
+    unescape: bool = True,
+) -> str:
+    """AnalyzeRule.getString(ruleList, unescape): list joined with "\\n", `##`
+    once, JSONPath objects rendered as ``{k=v}``; optional HTML unescape."""
+    if not (rule or "").strip():
+        return ""
+    previous_mode = set_legado_object_string_mode(True)
+    try:
+        values = evaluate_rule(rule, content, runtime, content_type, string_mode=True)
+    finally:
+        set_legado_object_string_mode(previous_mode)
+    text = "\n".join(str(value or "") for value in values)
+    if unescape and "&" in text:
+        return html_unescape(text)
+    return text
+
+
+def evaluate_rule(
+    rule: str,
+    content: str,
+    runtime: RuleRuntime,
+    content_type: str = "html",
+    string_mode: bool = False,
+) -> list[str]:
+    raw_rule = rule or ""
+    literal_json_template = is_literal_json_template_rule(raw_rule)
+    raw_segments = _split_legado_js_segments(raw_rule.strip())
     # Legado makeUpRule / RuleEvaluator resolves JSONPath-shaped placeholders
     # against the current item before generic {{...}} JavaScript/template
     # expansion. Doing this after resolve_template causes multi-placeholder
     # strings such as "{{$.source}} {{$.last_chapter_title}}" to be consumed as
     # invalid JS expressions and collapse to an empty rule.
-    rule = substitute_json_placeholders(rule or "", content)
-    rule = resolve_template(rule, runtime)
+    rule = substitute_json_placeholders(raw_rule, content)
+    rule = substitute_rule_templates(rule, content, runtime, content_type)
+    rule = resolve_template(rule, runtime, rule_template=True)
     rule = substitute_makeup_rule_templates(rule, content, runtime, content_type)
     if literal_json_template:
         rule = substitute_variable_references(rule, runtime)
         return [rule] if rule else []
     if not rule.strip():
         return []
-    low_rule = rule.strip().lower()
-    if "@js:" in low_rule and not low_rule.startswith(("@js:", "+@js:")):
-        idx = low_rule.index("@js:")
-        base = rule[:idx].strip()
-        js_tail = rule[idx + 4 :].strip()
-        if base:
-            intermediate = evaluate_rule(base, content, runtime, content_type)
-            out: list[str] = []
-            for item in intermediate:
-                js_result = try_evaluate_fast_java_aes(js_tail, item)
-                if js_result is None:
-                    js_result = evaluate_js(js_tail, item, runtime)
-                out.extend(js_result_to_list(js_result))
-            return out
+    stripped = rule.strip()
+    segments = _split_legado_js_segments(stripped)
+    if len(segments) == len(raw_segments):
+        literal_flags = [
+            (not raw_is_js) and is_literal_rule_template(raw_text)
+            for raw_text, raw_is_js, _raw_at in raw_segments
+        ]
+    else:
+        literal_flags = [False] * len(segments)
+    has_js = any(is_js for _text, is_js, _at in segments)
+    if has_js and (len(segments) == 1 or stripped.startswith("+")):
+        # A lone JavaScript rule (or Legado's "+" list prefix) keeps its
+        # dedicated fast paths.
+        return evaluate_single_rule(rule, content, runtime, content_type)
+    if len(segments) > 1:
+        return _evaluate_legado_js_pipeline(segments, literal_flags, content, runtime, content_type, string_mode)
+    return _evaluate_legado_source_rule(stripped, content, runtime, content_type, literal_flags[0], string_mode)
+
+
+def _evaluate_rule_sequence(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> list[str]:
     sequence = _first_rule_sequence(rule)
     if sequence is not None:
         operator, parts = sequence
@@ -8676,6 +10087,19 @@ def evaluate_rule(rule: str, content: str, runtime: RuleRuntime, content_type: s
             if index < len(values)
         ]
     return evaluate_single_rule(rule, content, runtime, content_type)
+
+
+_BARE_HTML_ATTRIBUTE_RULES = frozenset({
+    "href", "src", "text", "html", "innerhtml", "outerhtml", "textnodes",
+    "owntext", "name", "title", "id", "class", "value", "content",
+    "alt", "data-src", "data-href", "type", "style", "action", "onclick",
+})
+
+
+def is_legado_json_text(content: str) -> bool:
+    """Legado String.isJson(): trimmed text is `{…}` or `[…]` (AnalyzeRule.isJSON)."""
+    t = (content or "").strip()
+    return (t.startswith("{") and t.endswith("}")) or (t.startswith("[") and t.endswith("]"))
 
 
 def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> list[str]:
@@ -8818,8 +10242,9 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
         inner = t[1:].strip()
         if inner:
             return evaluate_rule(inner, content, runtime, content_type)
-    if "{{result}}" in t or "{result}" in t:
-        t = t.replace("{{result}}", content).replace("{result}", content)
+    # Legado makeUpRule expands only double-brace placeholders; `{result}` is literal.
+    if "{{result}}" in t:
+        t = t.replace("{{result}}", content)
     if low.startswith("text."):
         return evaluate_css_rule(t, content, runtime, content_type)
     # A newline-delimited nextContentUrl/nextTocUrl value is a URL list, not
@@ -8832,8 +10257,12 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
             for line in literal_lines
         ):
             return [t]
-    # Legado SourceRule dispatches every single leading slash rule to XPath.
+    # Legado SourceRule dispatches every single leading slash rule to XPath,
+    # except that the isJSON check comes first: on JSON content a bare `/`
+    # rule (not @XPath:) is a Jayway path, which practically never matches.
     if t.startswith("/"):
+        if is_legado_json_text(content):
+            return evaluate_json_rule(t, content, runtime)
         return evaluate_xpath_rule(t, content, runtime, content_type)
     if contains_json_placeholder(t) and t.startswith(("http://", "https://", "/", "./", "../")):
         substituted = substitute_json_placeholders(t, content)
@@ -8845,7 +10274,7 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     if "##" in t:
         base, replace_chain = t.split("##", 1)
         base_values = [content] if not base.strip() else evaluate_rule(base, content, runtime, content_type)
-        return [apply_replace_chain(value, replace_chain) for value in base_values]
+        return [legado_replace_regex(value, replace_chain) for value in base_values]
     if "@put:{" in t and not t.startswith("@put:{"):
         base, put_rule = t.split("@put:{", 1)
         base = base.strip()
@@ -8857,6 +10286,10 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
         json_values = evaluate_json_rule(t, content, runtime)
         if json_values:
             return json_values
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t) and t.lower() not in _BARE_HTML_ATTRIBUTE_RULES:
+            # Legado Json mode: a missing bare field is empty, never the
+            # field name itself and never an alias.
+            return []
     if looks_like_css_selector(t):
         return evaluate_css_rule(t, content, runtime, content_type)
     if t.startswith(("$.", "$[")) or t.startswith("$.."):
@@ -8881,11 +10314,7 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     if t.startswith("@@"):
         return evaluate_rule(t[2:], content, runtime, content_type)
 
-    bare_attrs = {
-        "href", "src", "text", "html", "innerhtml", "outerhtml", "textnodes",
-        "owntext", "name", "title", "id", "class", "value", "content",
-        "alt", "data-src", "data-href", "type", "style", "action", "onclick",
-    }
+    bare_attrs = _BARE_HTML_ATTRIBUTE_RULES
     if t.startswith("@"):
         attr = t[1:].strip()
         if attr.lower() in bare_attrs:
@@ -9156,7 +10585,16 @@ def _extract_css_values(elems: list[Any], attr: str | None, base_url: str) -> li
         elif normalized_attr == "textnodes":
             results.append("\n".join(s.strip() for s in el.find_all(string=True, recursive=False) if s.strip()))
         else:
-            value = el.get(attr or "", "")
+            attr_name = attr or ""
+            if attr_name.lower().startswith("abs:"):
+                # Jsoup/SwiftSoup Node.attr("abs:…") resolves against the base URI.
+                raw_value = el.get(attr_name[4:], "")
+                if isinstance(raw_value, list):
+                    raw_value = " ".join(str(item) for item in raw_value)
+                raw_value = str(raw_value or "").strip()
+                value = urljoin(base_url, raw_value) if raw_value else ""
+            else:
+                value = el.get(attr_name, "")
             if isinstance(value, list):
                 value = " ".join(str(item) for item in value)
             value = str(value)
@@ -9164,6 +10602,38 @@ def _extract_css_values(elems: list[Any], attr: str | None, base_url: str) -> li
                 seen_attributes.add(value)
                 results.append(value)
     return [x for x in results if x]
+
+
+_LEGADO_RESULT_ATTRIBUTE_NAMES = {
+    "text", "html", "innerhtml", "outerhtml", "all", "textnodes", "owntext",
+    "href", "src", "alt", "class", "id", "content", "name", "value", "title",
+    "type", "onclick", "action", "style",
+}
+_LEGADO_SELECTOR_TAG_NAMES = {
+    "div", "span", "li", "ul", "ol", "a", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+    "td", "tr", "table", "article", "section", "tbody", "thead", "tfoot", "th",
+    "img", "body", "header", "footer", "nav", "main", "aside", "dl", "dt", "dd",
+    "input", "button", "select", "option", "strong", "em", "b", "i", "u", "s",
+    "font", "small", "figure", "figcaption", "center", "br", "hr", "iframe",
+    "video", "audio", "source", "picture", "script", "noscript", "pre", "code",
+    "blockquote", "sub", "sup", "meta", "link", "head", "html", "time", "textarea",
+}
+
+
+def _is_selector_like_segment(segment: str) -> bool:
+    """Swift RuleParser.isSelectorLikeSegment: keep element semantics for selectors."""
+    lower = (segment or "").strip().lower()
+    if not lower:
+        return True
+    if lower.startswith("data-"):
+        return False
+    if lower in _LEGADO_RESULT_ATTRIBUTE_NAMES:
+        return False
+    if lower.startswith("children"):
+        return True
+    if any(ch in ".#[]()> ~+*,!" for ch in lower):
+        return True
+    return lower in _LEGADO_SELECTOR_TAG_NAMES
 
 
 def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_override: str | None = None) -> list[str]:
@@ -9188,7 +10658,12 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
             final_index = int(last)
             parts.pop()
 
-    if parts:
+    if attr_override is None and len(parts) >= 2 and not _is_selector_like_segment(parts[-1]):
+        # Legado AnalyzeByJSoup.getResultList/getResultLast: the last `@`
+        # segment of a string rule is the result (text/html/… or any
+        # attribute name such as _src, lay-src, original, abs:href).
+        final_attr = parts.pop()
+    elif parts:
         last = parts[-1]
         if last.lower() in known_attrs or last.lower().startswith("data-"):
             final_attr = last
@@ -9284,9 +10759,10 @@ def evaluate_css_rule(rule: str, content: str, runtime: RuleRuntime, content_typ
                 elif attr == "textnodes":
                     results.append("\n".join(s.strip() for s in el.find_all(string=True, recursive=False) if s.strip()))
                 else:
-                    value = el.get(attr, "")
+                    # Raw attribute value (Legado/iOS semantics); `abs:` still resolves.
+                    value = _css_raw_attr_value(el, attr, runtime.base_url)
                     if value:
-                        results.append(urljoin(runtime.base_url, value) if attr.lower() in URL_ATTRS else str(value))
+                        results.append(value)
                 if results:
                     return [x for x in results if x]
     results = css_extract(content, selector, attr, index, runtime.base_url)
@@ -9322,6 +10798,101 @@ def evaluate_xpath_rule(rule: str, content: str, runtime: RuleRuntime, content_t
     return xpath_extract(content, text, None, runtime.base_url)
 
 
+_LEGADO_STRING_STATE = threading.local()
+
+
+def legado_object_string_mode() -> bool:
+    """Whether JSONPath hits render as Legado getString text (``{k=v}``)."""
+    return bool(getattr(_LEGADO_STRING_STATE, "object_mode", False))
+
+
+def set_legado_object_string_mode(enabled: bool) -> bool:
+    previous = legado_object_string_mode()
+    _LEGADO_STRING_STATE.object_mode = bool(enabled)
+    return previous
+
+
+def jsonpath_is_indefinite(path: str) -> bool:
+    """Jayway indefinite path: wildcard, deep scan, filter, slice or multi index/key."""
+    text = (path or "").strip()
+    return jsonpath_is_collection_expression(text) or re.search(r"\.\*", text) is not None
+
+
+def _json_smart_string(value: str) -> str:
+    out = ['"']
+    for ch in value:
+        code = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "/":
+            out.append("\\/")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\b":
+            out.append("\\b")
+        elif ch == "\f":
+            out.append("\\f")
+        elif code < 0x20 or 0x7F <= code <= 0x9F or 0x2000 <= code <= 0x20FF:
+            out.append("\\u%04X" % code)
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def json_smart_json(value: Any) -> str:
+    """json-smart ``JSONValue.toJSONString(value, NO_COMPRESS)`` (escapes ``/``)."""
+    if isinstance(value, str):
+        return _json_smart_string(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return java_double_string(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{_json_smart_string(str(k))}:{json_smart_json(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(json_smart_json(v) for v in value) + "]"
+    return _json_smart_string(str(value))
+
+
+def legado_json_to_string(value: Any) -> str:
+    """Java ``String.valueOf`` of a json-smart model value (LinkedHashMap/JSONArray)."""
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{key}={legado_json_to_string(item)}" for key, item in value.items()) + "}"
+    if isinstance(value, list):
+        return json_smart_json(value)
+    return json_container_to_string(value)
+
+
+def legado_get_string_json_values(matches: list[Any], indefinite: bool) -> list[str]:
+    """AnalyzeByJSonPath getString/getStringList text for each JSONPath hit."""
+    out: list[str] = []
+    for item in matches:
+        if indefinite:
+            text = legado_json_to_string(item)
+        elif item is None:
+            text = ""  # ob.toString() on JSON null throws inside Legado's try
+        elif isinstance(item, list):
+            text = "\n".join(legado_json_to_string(element) for element in item)
+        else:
+            text = legado_json_to_string(item)
+        if text:
+            out.append(text)
+    return out
+
+
 def evaluate_json_rule(rule: str, content: str, runtime: RuleRuntime) -> list[str]:
     text = rule.strip()
     if not text:
@@ -9341,36 +10912,31 @@ def evaluate_json_rule(rule: str, content: str, runtime: RuleRuntime) -> list[st
     property_union = evaluate_legado_jsonpath_property_union(obj, path)
     if property_union is not None:
         return property_union
+    object_mode = legado_object_string_mode()
     legado_filter = evaluate_legado_jsonpath_filter(obj, path)
     if legado_filter is not None:
+        if object_mode:
+            return legado_get_string_json_values(legado_filter, indefinite=True)
         return [json_container_to_string(item) for item in legado_filter if json_container_to_string(item)]
     dot_wildcard = evaluate_legado_jsonpath_dot_wildcard(obj, path)
     if dot_wildcard is not None:
+        if object_mode:
+            return legado_get_string_json_values(dot_wildcard, indefinite=True)
         return [json_container_to_string(item) for item in dot_wildcard if json_container_to_string(item)]
     try:
         expr = parse_jsonpath_expression(path)
         matches = [m.value for m in expr.find(obj)]
     except Exception:
         matches = []
+    if object_mode:
+        return legado_get_string_json_values(matches, indefinite=jsonpath_is_indefinite(path))
     results: list[str] = []
     for item in matches:
         results.append(json_container_to_string(item))
-    results = [x for x in results if x]
-    if results:
-        return results
-    # Bare field fallback
-    if isinstance(obj, dict):
-        variants = field_name_variants(text)
-        for variant in [text, *variants]:
-            value = find_json_field(obj, variant)
-            if value is not None:
-                if isinstance(value, (dict, list)):
-                    try:
-                        return [json.dumps(value, ensure_ascii=False)]
-                    except Exception:
-                        return [str(value)]
-                return [str(value)]
-    return []
+    # Legado never guesses: Jayway only prefixes `$.` (no `$..key` deep scan)
+    # and AnalyzeRule has no camelCase/snake_case/alias fallback, so a missing
+    # field (e.g. `url` with only `id` present) stays empty.
+    return [x for x in results if x]
 
 
 def _json_key_path_value(value: Any, key_path: str) -> Any | None:
@@ -9458,6 +11024,8 @@ def _java_collection_string(value: Any) -> str:
         return "{" + ", ".join(f"{key}={_java_collection_string(item)}" for key, item in value.items()) + "}"
     if isinstance(value, list):
         return "[" + ", ".join(_java_collection_string(item) for item in value) + "]"
+    if isinstance(value, float):
+        return java_double_string(value)
     return str(value)
 
 
@@ -9847,16 +11415,13 @@ def expand_regex_group_template(template: str, list_rule: str, item: str) -> str
     text = str(template or "")
     if "$" not in text:
         return text
-    rule = str(list_rule or "").strip()
-    if not rule.startswith(":") or rule.startswith("://"):
+    patterns = _legado_all_in_one_patterns(str(list_rule or ""))
+    if not patterns:
         return text
-    inner = rule[1:]
-    parts = inner.split(":")
-    pattern = parts[0] if parts else ""
-    if not pattern:
-        return text
+    # The list item is the whole match of the last AllInOne pattern.
+    pattern = patterns[-1]
     try:
-        match = re.search(pattern, item or "", re.S)
+        match = re.search(pattern, item or "")
     except re.error:
         return text
     if match is None:
@@ -9919,6 +11484,80 @@ def apply_replace_chain(value: str, chain: str) -> str:
                     out = replacement
         i += 3 if flags or replace_first_marker else 2
     return out
+
+
+def _java_regex_replacement(match: re.Match[str], replacement: str) -> str:
+    """Expand a Java Matcher replacement string (``$n``, ``${name}``, ``\\x``)."""
+    out: list[str] = []
+    group_count = len(match.groups())
+    i = 0
+    while i < len(replacement):
+        ch = replacement[i]
+        if ch == "\\" and i + 1 < len(replacement):
+            out.append(replacement[i + 1])
+            i += 2
+            continue
+        if ch == "$" and i + 1 < len(replacement):
+            nxt = replacement[i + 1]
+            if nxt.isdigit():
+                number = int(nxt)
+                j = i + 2
+                while j < len(replacement) and replacement[j].isdigit():
+                    candidate = number * 10 + int(replacement[j])
+                    if candidate > group_count:
+                        break
+                    number = candidate
+                    j += 1
+                if number <= group_count:
+                    out.append(match.group(number) or "")
+                i = j
+                continue
+            if nxt == "{":
+                end = replacement.find("}", i + 2)
+                if end > i + 2:
+                    name = replacement[i + 2:end]
+                    try:
+                        out.append(match.group(name) or "")
+                    except (IndexError, KeyError):
+                        pass
+                    i = end + 1
+                    continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def legado_replace_regex(value: str, chain: str) -> str:
+    """AnalyzeRule.replaceRegex for a SourceRule ``##`` suffix.
+
+    ``regex##replacement[###]``: only the first regex/replacement pair is used;
+    a third segment selects replaceFirst (the replaced first match, or "" when
+    nothing matches). An invalid regex falls back to a literal replacement
+    (replaceFirst returns the replacement). No DOTALL, like Java's default.
+    """
+    parts = chain.split("##")
+    pattern = parts[0]
+    if not pattern:
+        return value
+    replacement = parts[1] if len(parts) > 1 else ""
+    replace_first = len(parts) > 2
+    # Readori compatibility: `^##https://…` must not prefix an absolute URL twice.
+    if pattern == "^":
+        repl = replacement.strip().lower()
+        current = value.strip().lower()
+        if (repl.startswith(("http://", "https://")) or "{{" in replacement) and current.startswith(("http://", "https://")):
+            return value
+    try:
+        regex = re.compile(pattern)
+    except re.error:
+        return replacement if replace_first else value.replace(pattern, replacement)
+    if replace_first:
+        first = regex.search(value)
+        if first is None:
+            return ""
+        matched = first.group(0)
+        return regex.sub(lambda m: _java_regex_replacement(m, replacement), matched, count=1)
+    return regex.sub(lambda m: _java_regex_replacement(m, replacement), value)
 
 
 def apply_legado_content_replace_indent(value: str) -> str:
@@ -10238,6 +11877,15 @@ def loading_verify_redirect_url(html: str, final_url: str) -> str:
 
 
 def build_first_explore_url(explore_text: str, runtime: RuleRuntime) -> str | None:
+    previous_binding = getattr(runtime, "book_binding", "automatic")
+    runtime.book_binding = "unbound"
+    try:
+        return _build_first_explore_url(explore_text, runtime)
+    finally:
+        runtime.book_binding = previous_binding
+
+
+def _build_first_explore_url(explore_text: str, runtime: RuleRuntime) -> str | None:
     entries = parse_explore_urls(explore_text, runtime.source_url)
     for _, url in entries:
         if not url:
@@ -10254,12 +11902,16 @@ def build_first_explore_url(explore_text: str, runtime: RuleRuntime) -> str | No
 
 def make_runtime(src: dict[str, Any]) -> RuleRuntime:
     url = str(src.get("bookSourceUrl") or "")
+    # The App keeps an object-shaped header as a [String: String] map; parse_headers takes the JSON text.
+    header_raw = src.get("header")
+    if isinstance(header_raw, dict):
+        header_raw = json.dumps(header_raw, ensure_ascii=False)
     base = fallback_base_url_from_entry_point(src, effective_base_url(url))
     try:
         source_type = int(src.get("bookSourceType") or 0)
     except Exception:
         source_type = 0
-    headers = parse_headers(src.get("header"), RuleRuntime(
+    headers = parse_headers(header_raw, RuleRuntime(
         source_url=base,
         base_url=base,
         book_source_url=url,
@@ -10270,7 +11922,7 @@ def make_runtime(src: dict[str, Any]) -> RuleRuntime:
         source_variable_comment=str(src.get("variableComment") or ""),
         source_book_source_type=source_type,
         source_last_update_time=src.get("lastUpdateTime") or 0,
-        source_header=str(src.get("header") or ""),
+        source_header=str(header_raw or ""),
         source_login_url=str(src.get("loginUrl") or ""),
         source_login_ui=str(src.get("loginUi") or ""),
         source_enabled_cookie_jar=src.get("enabledCookieJar") is not False,
@@ -10292,7 +11944,7 @@ def make_runtime(src: dict[str, Any]) -> RuleRuntime:
         source_variable_comment=str(src.get("variableComment") or ""),
         source_book_source_type=source_type,
         source_last_update_time=src.get("lastUpdateTime") or 0,
-        source_header=str(src.get("header") or ""),
+        source_header=str(header_raw or ""),
         source_login_url=str(src.get("loginUrl") or ""),
         source_login_ui=str(src.get("loginUi") or ""),
         source_enabled_cookie_jar=src.get("enabledCookieJar") is not False,
@@ -10300,12 +11952,14 @@ def make_runtime(src: dict[str, Any]) -> RuleRuntime:
         source_explore_url=str(src.get("exploreUrl") or ""),
         source_search_url=str(src.get("searchUrl") or ""),
         source_concurrent_rate=str(src.get("concurrentRate") or ""),
+        allows_user_interaction=False,
+        interaction_state=new_interaction_state(),
     )
 
 
 def request_search_or_explore(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, keyword: str, page: int = 1, mode: str = "search") -> tuple[str, str, dict[str, Any]] | None:
     if mode == "search":
-        template = str(src.get("searchUrl") or "").strip()
+        template = app_profiles.app_search_url_template(src)
     else:
         template = build_first_explore_url(str(src.get("exploreUrl") or ""), runtime) or ""
     if not template:
@@ -10325,7 +11979,16 @@ def request_search_or_explore(session: requests.Session, src: dict[str, Any], ru
 
 
 def evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
-    text = resolve_template(rule or "", runtime).strip()
+    # Legado list rules run on RuleData: JS `book` is null unless a book is bound.
+    runtime.book_list_depth = getattr(runtime, "book_list_depth", 0) + 1
+    try:
+        return _evaluate_book_list(rule, html, runtime)
+    finally:
+        runtime.book_list_depth -= 1
+
+
+def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
+    text = resolve_template(rule or "", runtime, rule_template=True).strip()
     if not text:
         return []
     if text.startswith("-") and len(text) > 1:
@@ -10333,6 +11996,12 @@ def evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
         return list(reversed(results))
     if text.startswith("+") and len(text) > 1:
         return evaluate_book_list(text[1:].strip(), html, runtime)
+
+    # Legado AllInOne (AnalyzeByRegex): everything after ':' is regex; only
+    # `&&` chains patterns, so it must win over the generic sequence split.
+    all_in_one = _legado_all_in_one_patterns(text)
+    if all_in_one is not None:
+        return _legado_all_in_one_values(all_in_one, html)
 
     sequence = _first_rule_sequence(text)
     if sequence is not None:
@@ -10426,13 +12095,6 @@ def evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
         return xpath_extract(html, xpath, "outerhtml", runtime.base_url)
     if text.startswith("/"):
         return xpath_extract(html, text, "outerhtml", runtime.base_url)
-
-    if text.startswith(":") and not text.startswith("://"):
-        inner = text[1:]
-        parts = inner.split(":")
-        pattern = parts[0] if parts else ""
-        group = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-        return regex_extract(pattern, group, html)
 
     if low.startswith("@css:"):
         return evaluate_explicit_css_rule(text[5:], html, runtime, attr_override="outerhtml")
@@ -10596,12 +12258,18 @@ def is_legado_blank_base_book_url(url: str, runtime: RuleRuntime) -> bool:
 
 
 def first_result_to_text(item: str, rule_field: str, runtime: RuleRuntime) -> str:
-    results = evaluate_rule(rule_field, item, runtime, "json" if is_json_content(item) else "html")
-    return legado_get_string_value(results) if results else ""
+    # Legado getString field semantics (join "\n", `##` once, `{k=v}` objects, unescape).
+    return evaluate_get_string(rule_field, item, runtime, "json" if is_json_content(item) else "html")
 
 
-def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime: RuleRuntime) -> None:
+def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime: RuleRuntime) -> str:
+    """Evaluate selected search-item side-effect fields before detail.
+
+    Returns the item's ``author`` rule result purely as validation metadata
+    (book/author aggregation); the runtime's Book binding is left untouched.
+    """
     content_type = "json" if is_json_content(item) else "html"
+    author = ""
     for field in (
         "author",
         "coverUrl",
@@ -10616,14 +12284,14 @@ def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime:
             continue
         try:
             values = evaluate_rule(rule_text, item, runtime, content_type)
-            if field == "author" and values:
-                author = legado_joined_string_list(values).strip()
-                if author:
-                    runtime.book_author = author
-                    runtime.variables = dict(runtime.variables or {})
-                    runtime.variables["__book.author"] = author
         except Exception:
             continue
+        if field == "author" and values:
+            try:
+                author = legado_joined_string_list(values).strip()
+            except Exception:
+                author = ""
+    return author
 
 
 def fallback_name_from_item(item: str) -> str:
@@ -11730,10 +13398,11 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
                     and book_url.strip()
                     and is_usable_rule_extracted_book_url(book_url, item, name, item_runtime)
                 ):
-                    capture_search_item_rule_variables(explore_rule, item, item_runtime)
+                    item_author = capture_search_item_rule_variables(explore_rule, item, item_runtime)
                     book_urls.append(book_url)
                     if selected_variables is None:
                         selected_variables = dict(item_runtime.variables or {})
+                        runtime.validation_book_author = item_author
             if selected_variables:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables.update(selected_variables)
@@ -11819,10 +13488,11 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
                     and book_url.strip()
                     and is_usable_rule_extracted_book_url(book_url, field_item, name, item_runtime)
                 ):
-                    capture_search_item_rule_variables(search_rule, field_item, item_runtime)
+                    item_author = capture_search_item_rule_variables(search_rule, field_item, item_runtime)
                     book_urls.append(book_url)
                     if selected_variables is None:
                         selected_variables = dict(item_runtime.variables or {})
+                        runtime.validation_book_author = item_author
             if book_urls:
                 if selected_variables:
                     runtime.variables = dict(runtime.variables or {})
@@ -11836,6 +13506,10 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
     search_urls, search_base = try_mode("search")
     if search_urls:
         return search_urls, search_base
+    if has_search:
+        # A real search failure: any interaction blocked from here on is not the cause of the failure group
+        # the App would already have recorded (BookSourceSuppressedInteractionRecorder.failureCountAtFirstRecord).
+        note_app_validation_failure(runtime)
     explore_urls, explore_base = try_mode("explore")
     return explore_urls, explore_base
 
@@ -11908,6 +13582,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
         "base_url": book_url,
         "book_url": book_url,
         "variables": dict(runtime.variables or {}),
+        # Legado BookInfo: analyzeRule.setRuleData(book) -> JS `book` is bound.
+        "book_binding": "bound",
     })
     seed_runtime_variables_from_url(runtime2, book_url)
     seed_runtime_variables_from_url(runtime2, final_url)
@@ -11919,7 +13595,6 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
         if transformed:
             html = transformed[0]
     name = ""
-    author = ""
     toc_url = ""
     if str(info_rule.get("name") or "").strip():
         name_values = evaluate_rule(str(info_rule.get("name")), html, runtime2, "json" if is_json_content(html) else "html")
@@ -11928,14 +13603,6 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             if name and not is_usable_search_book_title(name):
                 name = ""
             runtime2.book_name = name
-    if str(info_rule.get("author") or "").strip():
-        author_values = evaluate_rule(
-            str(info_rule.get("author")), html, runtime2,
-            "json" if is_json_content(html) else "html",
-        )
-        if author_values:
-            author = legado_joined_string_list(author_values).strip()
-            runtime2.book_author = author
     kind = ""
     if str(info_rule.get("kind") or "").strip():
         kind_values = evaluate_rule(str(info_rule.get("kind")), html, runtime2, "json" if is_json_content(html) else "html")
@@ -11992,12 +13659,6 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             name = clean_recovered_book_name(name)
             if name and not is_usable_search_book_title(name):
                 name = ""
-        if not author.strip():
-            author = json_first_text(json_obj, [
-                "author", "authorName", "author_name", "bookAuthor", "book_author", "writer", "penName",
-                "data.author", "data.authorName", "data.bookAuthor", "result.author", "result.authorName",
-            ])
-            runtime2.book_author = author.strip()
         if not toc_url.strip():
             raw_toc = json_first_text(json_obj, [
                 "tocUrl", "toc_url", "chapterListUrl", "chapter_list_url", "catalogUrl", "catalog_url",
@@ -12078,7 +13739,6 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
     if runtime.variables is None:
         runtime.variables = {}
     runtime.variables.update(runtime2.variables or {})
-    runtime.book_author = runtime2.book_author or author
     return bool(name or toc_url), name, toc_url, ""
 
 
@@ -12188,21 +13848,191 @@ def should_keep_pre_replace_content(pre_replace: str, replaced: str) -> bool:
     return False
 
 
+_LEGADO_FORMAT_WS = "[ \\t\\n\\x0B\\f\\r]"
+# Swift `legadoFormatKeepImgSteps` (BookSourceEngine.swift): Legado
+# HtmlFormatter.formatKeepImg text part. Java `\s` is ASCII-only, so the
+# whitespace class is spelled out; the patterns are case-sensitive like Swift.
+_LEGADO_FORMAT_KEEP_IMG_STEPS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(pattern), replacement)
+    for pattern, replacement in [
+        (r"<script[^>]*>[\s\S]*?</script>", ""),
+        (r"<style[^>]*>[\s\S]*?</style>", ""),
+        (r"<!\[CDATA\[[\s\S]*?\]\]>", ""),
+        (r"<\?xml[^>]*\?>", ""),
+        ("[﻿​⁠]", ""),
+        (r"(&nbsp;)+", " "),
+        (r"(&ensp;|&emsp;)", " "),
+        ("(&thinsp;|&zwnj;|&zwj;| |‌|‍)", ""),
+        (r"</?(?:div|p|br|hr|h\d|article|dd|dl)[^>]*>", "\n"),
+        (r"<!--[^>]*-->", ""),
+        (r"</?(?!img)[a-zA-Z]+(?=[ >])[^<>]*>", ""),
+        (_LEGADO_FORMAT_WS + r"*\n+" + _LEGADO_FORMAT_WS + "*", "\n"),
+        (r"^[\n \t\x0B\f\r]+", ""),
+        (r"[\n \t\x0B\f\r]+$", ""),
+    ]
+]
+_LEGADO_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I)
+
+# Swift `replacingInlineImageTagsWithMarkers` / `legadoOptionImageURL` /
+# `extractImages` / `resolveEmbeddedImageURL`: every `<img>` is presented to
+# the replaceRegex as Legado's normalized `<img src="ABSOLUTE_URL">`.
+_LEGADO_INLINE_IMG_TAG_RE = re.compile(r"""<img\b(?:[^>"']|"[^"<]*"|'[^'<]*')*>""", re.I)
+_LEGADO_OPTION_IMG_SRC_RE = re.compile(
+    r"""<img[^>]*\ssrc\s*=\s*['"]([^'"{>]*\{(?:[^{}]|\{[^}>]+\})+\})['"][^>]*>""",
+    re.I,
+)
+_LEGADO_LAZY_IMG_ATTRS = (
+    "data-original", "data-src", "data-lazy-src", "data-echo",
+    "data-url", "data-image", "data-img", "src",
+)
+
+
+def legado_resolve_embedded_image_url(raw: str, base_url: str) -> str:
+    """Swift ``resolveEmbeddedImageURL``: absolutize the URL part against the
+    base, keep a Legado ``,{options}`` suffix byte-exact."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    url_part, _opts = parse_url_options(text)
+    url_part = url_part.strip()
+    if not url_part:
+        return ""
+    if url_part.lower().startswith("data:image/"):
+        resolved = url_part
+    elif url_part.startswith("//"):
+        resolved = f"{urlparse(base_url or '').scheme or 'https'}:{url_part}"
+    else:
+        resolved = urljoin(base_url, url_part) if base_url else url_part
+    if len(text) > len(url_part):
+        return resolved + text[len(url_part):]
+    return resolved
+
+
+def _legado_inline_image_url(tag: str, base_url: str) -> str:
+    # Legado formatImagePattern first branch: `src="url,{...}"` (checked first,
+    # raw attribute text, no entity decoding -- same as Swift).
+    if "{" in tag:
+        match = _LEGADO_OPTION_IMG_SRC_RE.search(tag)
+        if match:
+            resolved = legado_resolve_embedded_image_url(match.group(1).strip(), base_url)
+            if resolved:
+                return resolved
+    try:
+        node = BeautifulSoup(tag, "html.parser").find("img")
+    except Exception:
+        return ""
+    if node is None:
+        return ""
+    for attribute in _LEGADO_LAZY_IMG_ATTRS:
+        raw = node.get(attribute)
+        if isinstance(raw, list):
+            raw = " ".join(raw)
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        resolved = legado_resolve_embedded_image_url(raw, base_url)
+        if resolved:
+            return resolved
+    return ""
+
+
+def legado_normalize_inline_image_tags(html: str, base_url: str) -> str:
+    """Rewrite every ``<img>`` that has a usable URL to ``<img src="ABS_URL">``
+    (lazy attribute priority data-original > data-src > data-lazy-src >
+    data-echo > data-url > data-image > data-img > src, relative URLs resolved
+    against ``base_url``, option suffix kept). Tags without a URL stay as-is.
+    Idempotent."""
+    if not html or "<img" not in html.lower():
+        return html
+
+    def replace(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        url = _legado_inline_image_url(tag, base_url)
+        return f'<img src="{url}">' if url else tag
+
+    return _LEGADO_INLINE_IMG_TAG_RE.sub(replace, html)
+
+
+def legado_format_content_keeping_images(html: str) -> str:
+    """Legado HtmlFormatter.formatKeepImg text part + unescapeHtml4 (Swift
+    ``legadoFormatContentKeepingImages``).
+
+    Block tags and ``<br>`` become newlines; comments and every tag except
+    ``<img>`` are removed; entities are decoded. ``<img>`` tags are shielded
+    from the whitespace folding / entity decoding so their URLs and request
+    options stay byte-exact (Swift does the same with ``[图片:URL]`` markers).
+    """
+    if not html:
+        return ""
+    images: list[str] = []
+
+    def placeholder(index: int) -> str:
+        digits = "".join(chr(0xE010 + int(ch, 16)) for ch in format(index, "x"))
+        return "" + digits + ""
+
+    def shield(match: re.Match[str]) -> str:
+        images.append(match.group(0))
+        return placeholder(len(images) - 1)
+
+    result = _LEGADO_IMG_TAG_RE.sub(shield, html)
+    for regex, replacement in _LEGADO_FORMAT_KEEP_IMG_STEPS:
+        result = regex.sub(replacement, result)
+    if "&" in result:
+        result = html_unescape(result)
+    result = result.replace(" ", " ")
+    for index in range(len(images) - 1, -1, -1):
+        result = result.replace(placeholder(index), images[index])
+    return result
+
+
+def apply_legado_content_replace_regex(
+    content: str,
+    replace_rule: str,
+    runtime: RuleRuntime,
+) -> tuple[str, str]:
+    """Legado BookContent ``ruleContent.replaceRegex`` (Swift
+    ``applyLegadoContentReplaceRegex``).
+
+    Order: formatKeepImg + unescape the merged page text, trim every line, and
+    only then run ``analyzeRule.getString(replaceRegex)`` on it, i.e. the rule
+    is a normal Legado rule: ``##regex##replacement`` is a plain regex (no
+    DOTALL, ``$1`` group references, ``###`` = replaceFirst) and ``<js>`` /
+    ``@js:`` / ``{{}}`` segments are evaluated like in any other rule (JS is
+    run by the validator's usual evaluate_js fallback).
+
+    Images are presented to the rule as Legado's normalized
+    ``<img src="ABSOLUTE_URL">`` (lazy attributes, relative URLs and option
+    suffixes resolved exactly like Swift), so rules such as
+    ``##src="(.*?)"##src="$1,{'webView':true}"`` or ``##<img\\ssrc="[^"]*ad[^"]*">``
+    behave the same. The result is normalized again (a rule may emit relative
+    or single-quoted ``<img>``), which keeps it consumable by
+    ``has_meaningful_image_content``.
+
+    Returns ``(formatted_text, replaced_text)``; the caller applies the
+    validator's quality guard between the two.
+    """
+    base_url = runtime.base_url or runtime.source_url or ""
+    formatted = legado_format_content_keeping_images(legado_normalize_inline_image_tags(content, base_url))
+    formatted = "\n".join(line.strip() for line in formatted.splitlines()).strip()
+    replaced = legado_get_string(replace_rule, formatted, runtime, "html", unescape=True)
+    return formatted, legado_normalize_inline_image_tags(replaced, base_url)
+
+
 def evaluate_content_rule_with_inline_replace_guard(
     content_expr: str,
     page_html: str,
     runtime: RuleRuntime,
     content_type: str,
 ) -> str:
-    page_content_values = evaluate_rule(content_expr, page_html, runtime, content_type) if content_expr else []
-    page_content = "\n".join(v.strip() for v in page_content_values if str(v).strip()).strip()
+    # Legado BookContent: analyzeRule.getString(contentRule.content, unescape = false)
+    # -- values joined with "\n", `##` applied once to the joined text, no unescape.
+    page_content = legado_get_string(content_expr, page_html, runtime, content_type, unescape=False).strip() if content_expr else ""
     if "##" not in content_expr:
         return page_content
     base_expr, _ = content_expr.split("##", 1)
     if not base_expr.strip():
         return page_content
-    base_values = evaluate_rule(base_expr, page_html, runtime, content_type)
-    base_content = "\n".join(v.strip() for v in base_values if str(v).strip()).strip()
+    base_content = legado_get_string(base_expr, page_html, runtime, content_type, unescape=False).strip()
     if should_keep_pre_replace_content(base_content, page_content):
         return base_content
     return page_content
@@ -12609,19 +14439,6 @@ def fallback_search_items_from_content(html: str) -> list[str]:
     return []
 
 
-def substitute_replace_templates(rule: str, runtime: RuleRuntime) -> str:
-    text = rule or ""
-    replacements = {
-        "{{book.name}}": runtime.book_name or runtime.book_url or "",
-        "{{book.author}}": runtime.book_author or "",
-        "{{book.durChapterTitle}}": runtime.chapter_title or "",
-        "{{chapter.title}}": runtime.chapter_title or "",
-    }
-    for key, value in replacements.items():
-        text = text.replace(key, value)
-    return text
-
-
 def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str, toc_url: str) -> tuple[bool, str, str, str, int, int, int]:
     """返回: ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages_walked, first_page_item_count"""
     toc_rule = src.get("ruleToc") or {}
@@ -12731,6 +14548,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             "book_url": book_url,
             "book_toc_url": effective_toc_url,
             "variables": dict(runtime_seed.variables or {}),
+            # Legado BookChapterList: setRuleData(book) binds `book` (also for chapterList).
+            "book_binding": "bound",
         })
         seed_runtime_variables_from_url(runtime2, final_url)
         content_type = "json" if is_json_content(html) else "html"
@@ -12855,7 +14674,10 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 chapter_url = resolve_url_preserving_options(raw_chapter_url, final_url) if raw_chapter_url.strip() else ""
             else:
                 chapter_url = ""
-            if not chapter_url and not current_element_url_rule:
+            # A bare HTML attribute rule (href/src) cannot address a JSON item
+            # (e.g. validator-synthesised app-cover-data chapters); the rule
+            # engine no longer guesses JSON aliases, so recover the URL here.
+            if not chapter_url and (not current_element_url_rule or is_json_content(item)):
                 chapter_url = fallback_chapter_url_from_item(item, final_url) or fallback_url_from_item(item, final_url)
             if chapter_url and not current_element_url_rule and is_same_book_or_toc_url(chapter_url, book_url, final_url):
                 recovered_url = recover_encoded_chapter_url_from_item(item, final_url)
@@ -13001,6 +14823,8 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         "chapter_title": chapter_title,
         "chapter_active": True,
         "variables": dict(runtime.variables or {}),
+        # Legado BookContent: setRuleData(book) + chapter.
+        "book_binding": "bound",
     })
     resolved_chapter_title = chapter_title
     did_resolve_content_title = False
@@ -13163,6 +14987,9 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                 return False, page_content, page_count
             break
         if page_content:
+            # Swift replacingInlineImageTagsWithMarkers(pageContent, ctx.baseUrl): resolve
+            # each page's images against that page's request URL (not the source base).
+            page_content = legado_normalize_inline_image_tags(page_content, runtime3.base_url)
             chunks.append(page_content)
         last_html = page_html
         page_count += 1
@@ -13212,9 +15039,13 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
     if merged:
         if str(content_rule.get("replaceRegex") or "").strip():
             did_apply_replace_regex = True
-            chain = substitute_replace_templates(str(content_rule.get("replaceRegex") or ""), runtime2)
-            pre_replace = "\n".join(line.strip() for line in merged.splitlines()).strip()
-            replaced = apply_replace_chain(pre_replace, chain).strip()
+            # Swift applyLegadoContentReplaceRegex: format (formatKeepImg +
+            # unescape) -> per-line trim -> getString(replaceRegex); a plain
+            # regex without DOTALL, JS/{{}} evaluated like any other rule.
+            pre_replace, replaced = apply_legado_content_replace_regex(
+                merged, str(content_rule.get("replaceRegex") or ""), runtime2
+            )
+            replaced = replaced.strip()
             merged = pre_replace if should_keep_pre_replace_content(pre_replace, replaced) else replaced
     if not merged and last_html:
         merged = html_to_visible_text(last_html)
@@ -13227,10 +15058,9 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
 
 
 def _empty_detail(src: dict[str, Any]) -> dict[str, Any]:
-    source_url = normalize_book_source_url(str(src.get("bookSourceUrl") or ""))
     return {
         "bookSourceName": str(src.get("bookSourceName") or ""),
-        "bookSourceUrl": source_url,
+        "bookSourceUrl": normalize_book_source_url(str(src.get("bookSourceUrl") or "")),
         "sourceSiteKey": canonical_source_site_key(src),
         "ruleFingerprint": source_rule_fingerprint(src),
         "enabled": bool(src.get("enabled", True)),
@@ -13257,10 +15087,25 @@ def _empty_detail(src: dict[str, Any]) -> dict[str, Any]:
         "stabilityPassCount": 0,
         "responseTimeMs": 0,
         "error": "",
+        # R143 App profile bookkeeping (appVerdict is filled when the report is assembled).
+        "appVersion": app_profiles.current_app_version(),
+        "appProfileFeatures": app_profiles.app_profile_sensitivity(src),
+        "appVerdict": "",
+        "suppressedInteractions": [],
+        "failureBeforeInteraction": False,
     }
 
 
+def _validated_group_value(src: dict[str, Any], version: str, proven_on_111: bool | None = None) -> str:
+    """bookSourceGroup written for a passed source: MMDD, plus `需1.1.2` for 1.1.2-only passes (R143 S2)."""
+    sensitive = bool(app_profiles.app_profile_sensitivity(src))
+    return ",".join(
+        app_profiles.pass_group_tokens(version, sensitive, proven_on_111, mmdd=current_validation_group_tag())
+    )
+
+
 def _group_source_url(group_key: str, candidates: list[dict[str, Any]]) -> str:
+    """Serialized source URL for a group key (which may be a composite dedupe key)."""
     for candidate in candidates:
         value = normalize_book_source_url(str(candidate.get("bookSourceUrl") or ""))
         if value:
@@ -13400,6 +15245,20 @@ def _quick_scan_detail(src: dict[str, Any], stage: str = "quick-scan") -> dict[s
 
 
 def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] | None, dict[str, Any]]:
+    holder: dict[str, Any] = {}
+    passed, seed, detail = _quick_scan_single_source(src, holder)
+    state = holder.get("state")
+    apply_interaction_state_to_detail(detail, state)
+    if seed is not None and isinstance(state, dict):
+        # validate_single_source restores it, so interactions blocked during quick scan survive into full validation.
+        seed["interactionState"] = copy.deepcopy(state)
+    return passed, seed, detail
+
+
+def _quick_scan_single_source(
+    src: dict[str, Any],
+    holder: dict[str, Any],
+) -> tuple[bool, dict[str, Any] | None, dict[str, Any]]:
     """Run only connectivity and search/explore entry checks for one source.
 
     The returned seed is intentionally small and serialisable. It lets the
@@ -13407,14 +15266,22 @@ def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] 
     issuing the same search request a second time.
     """
     ensure_source_validation_time_remaining()
-    detail = _quick_scan_detail(src)
+    original = src
+    detail = _quick_scan_detail(original)
+    # R143: rules are evaluated on the App's decoded view of the record (A2); output keeps the original record.
+    src, decode_error = app_profiles.app_decode_view(original)
     started = time.perf_counter()
     if not src.get("enabled", True):
         detail["failureReason"] = "disabled"
         return False, None, detail
+    if decode_error:
+        detail["failureReason"] = app_profiles.APP_IMPORT_REJECTED_REASON
+        detail["error"] = decode_error
+        return False, None, detail
     if source_requires_interactive_verification(src):
         detail["failureReason"] = "interactive verification required"
         detail["error"] = "source requires getVerificationCode/startBrowserAwait/openUrl user input"
+        detail["staticInteractionKinds"] = app_profiles.static_interaction_kinds(original)
         return False, None, detail
     base_url = effective_base_url(str(src.get("bookSourceUrl") or ""))
     if not has_valid_base_url(base_url) and not source_has_absolute_entry_point(src):
@@ -13429,6 +15296,7 @@ def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] 
         return False, None, detail
 
     runtime = make_runtime(src)
+    holder["state"] = runtime.interaction_state
     session = _thread_local.session if hasattr(_thread_local, "session") else None
     if session is None:
         session = requests.Session()
@@ -13460,7 +15328,29 @@ def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] 
 
     try:
         ensure_source_validation_time_remaining()
+        # Quick scan does not turn source-script errors into failures (the full chain does), with one exception:
+        # a startBrowserAwait the App's bulk validation blocks throws "验证结果为空" out of the search stage, so the
+        # search must fail here as well; otherwise heuristic book detection would pass a source the App marks
+        # js失效 / needs interaction.
+        stage_sink = begin_script_error_stage(runtime)
         book_urls, search_base = fetch_book_candidates(session, src, runtime)
+        runtime.script_error_sink = None
+        blocked_error = next(
+            (
+                str(entry.get("message") or "")
+                for entry in stage_sink
+                if entry.get("kind") == "error" and BLOCKED_BROWSER_AWAIT_MESSAGE in str(entry.get("message") or "")
+            ),
+            "",
+        )
+        if blocked_error:
+            detail["error"] = blocked_error
+            detail["scriptError"] = blocked_error
+            detail["failureReason"] = "js error"
+            detail["failureGroup"] = "js失效"
+            detail["failedStage"] = "search"
+            detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
+            return False, None, detail
         if not book_urls:
             if (runtime.variables or {}).get("__searchChallenge") == "1":
                 detail["failureReason"] = "webView/paid content"
@@ -13477,11 +15367,12 @@ def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] 
         detail["sampleBookUrl"] = first_book_url
         detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
         seed = {
-            "source": dict(src),
+            "source": dict(original),
             "bookUrls": [str(value) for value in book_urls[:20] if str(value).strip()],
             "searchBase": str(search_base or ""),
             "variables": dict(runtime.variables or {}),
             "cookies": requests.utils.dict_from_cookiejar(session.cookies),
+            "searchBookAuthor": runtime.validation_book_author,
             "quickDetail": detail,
         }
         detail["ok"] = True
@@ -13516,15 +15407,34 @@ def validate_single_source(
     src: dict[str, Any],
     quick_seed: dict[str, Any] | None = None,
 ) -> tuple[ValidationOutcome, dict[str, Any] | None, dict[str, Any]]:
+    holder: dict[str, Any] = {}
+    outcome, merged, detail = _validate_single_source(src, quick_seed, holder)
+    apply_interaction_state_to_detail(detail, holder.get("state"))
+    return outcome, merged, detail
+
+
+def _validate_single_source(
+    src: dict[str, Any],
+    quick_seed: dict[str, Any] | None,
+    holder: dict[str, Any],
+) -> tuple[ValidationOutcome, dict[str, Any] | None, dict[str, Any]]:
     ensure_source_validation_time_remaining()
-    detail = _empty_detail(src)
+    original = src
+    detail = _empty_detail(original)
     detail["pipelineStage"] = "full-validation"
+    # R143: rules are evaluated on the App's decoded view of the record (A2); output keeps the original record.
+    src, decode_error = app_profiles.app_decode_view(original)
     if not src.get("enabled", True):
         detail["failureReason"] = "disabled"
         return ValidationOutcome(False, reason="disabled"), None, detail
+    if decode_error:
+        detail["failureReason"] = app_profiles.APP_IMPORT_REJECTED_REASON
+        detail["error"] = decode_error
+        return ValidationOutcome(False, reason=app_profiles.APP_IMPORT_REJECTED_REASON), None, detail
     if source_requires_interactive_verification(src):
         detail["failureReason"] = "interactive verification required"
         detail["error"] = "source requires getVerificationCode/startBrowserAwait/openUrl user input"
+        detail["staticInteractionKinds"] = app_profiles.static_interaction_kinds(original)
         return (
             ValidationOutcome(False, reason="interactive verification required"),
             None,
@@ -13541,11 +15451,15 @@ def validate_single_source(
         return ValidationOutcome(False, reason="missing search/explore rule"), None, detail
 
     runtime = make_runtime(src)
+    holder["state"] = runtime.interaction_state
     session = _thread_local.session if hasattr(_thread_local, "session") else None
     if session is None:
         session = requests.Session()
         _thread_local.session = session
     if quick_seed:
+        seeded_interactions = quick_seed.get("interactionState")
+        if isinstance(seeded_interactions, dict) and isinstance(runtime.interaction_state, dict):
+            runtime.interaction_state.update(copy.deepcopy(seeded_interactions))
         variables = quick_seed.get("variables")
         if isinstance(variables, dict):
             runtime.variables = {str(key): str(value) for key, value in variables.items()}
@@ -13555,6 +15469,7 @@ def validate_single_source(
                 session.cookies.update(requests.utils.cookiejar_from_dict({str(k): str(v) for k, v in cookies.items()}))
             except Exception:
                 pass
+        runtime.validation_book_author = str(quick_seed.get("searchBookAuthor") or "")
     start = time.perf_counter()
 
     try:
@@ -13581,7 +15496,10 @@ def validate_single_source(
                 )
             except Exception:
                 pass
+            # Legado ScriptException in searchUrl/exploreUrl/bookList/item rules fails the stage.
+            stage_sink = begin_script_error_stage(runtime)
             book_urls, search_base = fetch_book_candidates(session, src, runtime)
+            finish_script_error_stage(runtime, stage_sink, detail, "search")
         if not book_urls:
             if (runtime.variables or {}).get("__searchChallenge") == "1":
                 detail["failureReason"] = "webView/paid content"
@@ -13600,7 +15518,9 @@ def validate_single_source(
             first_book_url = recovered_detail_url
             detail["sampleBookUrl"] = first_book_url
         ensure_source_validation_time_remaining()
+        stage_sink = begin_script_error_stage(runtime)
         ok, name, toc_url, detail_error = fetch_book_info(session, src, runtime, first_book_url)
+        finish_script_error_stage(runtime, stage_sink, detail, "detail")
         normalized_toc_url = (toc_url or "").strip()
         if not ok:
             detail["failureReason"] = "detail failed"
@@ -13609,7 +15529,7 @@ def validate_single_source(
             return ValidationOutcome(False, reason="detail failed", response_time_ms=detail["responseTimeMs"], book_url=first_book_url), None, detail
         detail["stages"]["detail"] = True
         detail["detailBookName"] = name
-        detail["detailBookAuthor"] = runtime.book_author.strip()
+        detail["detailBookAuthor"] = (runtime.book_author or runtime.validation_book_author or "").strip()
         detail["detailTocUrl"] = normalized_toc_url
         runtime.book_name = name
         runtime.book_url = first_book_url
@@ -13618,6 +15538,7 @@ def validate_single_source(
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
             return ValidationOutcome(False, reason="download-only source", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         ensure_source_validation_time_remaining()
+        stage_sink = begin_script_error_stage(runtime)
         toc_ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages, toc_first_page, toc_unique_chapters = resolve_toc_source(
             session,
             src,
@@ -13625,6 +15546,7 @@ def validate_single_source(
             first_book_url,
             normalized_toc_url or first_book_url,
         )
+        finish_script_error_stage(runtime, stage_sink, detail, "toc")
         detail["tocFirstPageItemCount"] = toc_first_page
         detail["tocPagesWalked"] = toc_pages
         detail["tocUniqueChapterCount"] = toc_unique_chapters
@@ -13635,6 +15557,7 @@ def validate_single_source(
         detail["stages"]["toc"] = True
         detail["firstChapterTitle"] = first_chapter_title
         ensure_source_validation_time_remaining()
+        stage_sink = begin_script_error_stage(runtime)
         content_ok, content_preview, content_pages = resolve_chapter_content(
             session,
             src,
@@ -13643,6 +15566,7 @@ def validate_single_source(
             first_chapter_title,
             name or str(src.get("bookSourceName") or ""),
         )
+        finish_script_error_stage(runtime, stage_sink, detail, "content")
         detail["contentPages"] = content_pages
         detail["contentPreviewChars"] = min(len(content_preview), 50_000) if content_preview else 0
         if content_ok and is_browser_deferred_content_source(src):
@@ -13666,22 +15590,32 @@ def validate_single_source(
         detail["ok"] = True
         detail["failureReason"] = ""
         detail["responseTimeMs"] = elapsed
-        merged = dict(src)
-        merged["customTag"] = "✅ 书籍+详情+目录+正文通过"
+        merged = dict(original)
+        merged["customTag"] = app_profiles.VALIDATED_PASS_TAG
         merged["respondTime"] = elapsed
-        merged["bookSourceGroup"] = current_validation_group_tag()
+        merged["bookSourceGroup"] = _validated_group_value(original, app_profiles.current_app_version())
+        # Internal aggregation metadata; stripped before any output is written.
         merged["__readoriValidation"] = {
             "bookTitle": name,
-            "bookAuthor": runtime.book_author.strip(),
+            "bookAuthor": detail["detailBookAuthor"],
             "sampleBookUrl": first_book_url,
-            "sourceSiteKey": canonical_source_site_key(src),
-            "ruleFingerprint": source_rule_fingerprint(src),
+            "sourceSiteKey": canonical_source_site_key(original),
+            "ruleFingerprint": source_rule_fingerprint(original),
         }
         if content_preview and not merged.get("bookSourceComment"):
             merged["bookSourceComment"] = f"tocPages={toc_pages};tocFirstPageItems={toc_first_page};tocUniqueChapters={toc_unique_chapters};contentPages={content_pages}"
         return ValidationOutcome(True, search_mode="search_or_explore", source_name=str(src.get("bookSourceName") or ""), book_url=first_book_url, detail_name=name, detail_toc_url=toc_final_url or normalized_toc_url, response_time_ms=elapsed), merged, detail
     except SourceValidationDeadlineExceeded:
         raise
+    except RuleScriptError as exc:
+        # Uncaught source-script exception (Legado ScriptException) -> js失效.
+        runtime.script_error_sink = None
+        detail["error"] = str(exc)
+        detail["scriptError"] = str(exc)
+        detail["failureReason"] = "js error"
+        detail["failureGroup"] = "js失效"
+        detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
+        return ValidationOutcome(False, reason="js error", response_time_ms=detail["responseTimeMs"]), None, detail
     except Exception as exc:
         detail["error"] = str(exc)
         detail["failureReason"] = "exception"
@@ -13715,8 +15649,8 @@ def validate_group(
             normalized = normalize_book_source_url(str(record.get("bookSourceUrl") or ""))
             merged = dict(record)
             merged["bookSourceUrl"] = normalized
-            merged["customTag"] = "✅ 书籍+详情+目录+正文通过"
-            merged["bookSourceGroup"] = current_validation_group_tag()
+            merged["customTag"] = app_profiles.VALIDATED_PASS_TAG
+            merged["bookSourceGroup"] = _validated_group_value(record, app_profiles.current_app_version())
             detail["bookSourceUrl"] = normalized
             return normalized, merged, detail
     if last_detail is not None:
@@ -13773,9 +15707,10 @@ def run_round_with_idle_timeout(
                 return
             try:
                 begin_source_validation_deadline(source_timeout)
-                # Preserve the scheduled composite group key.  The validator
-                # may return a candidate's serialized URL after fallback, but
-                # the queue and remaining-set are keyed by source_dedupe_key.
+                # Preserve the scheduled group key. The validator may return a
+                # candidate's serialized URL (another cosmetic variant of the
+                # same dedupe group), but the queue and remaining-set are keyed
+                # by the scheduled key.
                 _, record, detail = validate_group(url, groups[url])
                 result_q.put((url, record, detail))
             except SourceValidationDeadlineExceeded:
@@ -13795,7 +15730,8 @@ def run_round_with_idle_timeout(
 
     worker_count = max(1, min(max_workers, total_r))
     for _ in range(worker_count):
-        threading.Thread(target=worker, daemon=True).start()
+        # Threads do not inherit contextvars: bind the App profile once per thread (R143).
+        threading.Thread(target=app_profiles.bind_current_profile(worker), daemon=True).start()
 
     done_r = 0
     last_result_at = time.monotonic()
@@ -13891,7 +15827,7 @@ def run_parallel_stage(
             except Exception as exc:
                 detail = _empty_detail({
                     "bookSourceName": str(groups.get(url, [{}])[0].get("bookSourceName") or "") if groups.get(url) else "",
-                    "bookSourceUrl": url,
+                    "bookSourceUrl": _group_source_url(url, groups.get(url, [])),
                 })
                 detail["pipelineStage"] = stage
                 detail["failureReason"] = "worker exception"
@@ -13906,7 +15842,12 @@ def run_parallel_stage(
 
     worker_count = max(1, min(max_workers, total))
     for _ in range(worker_count):
-        threading.Thread(target=worker, daemon=True, name=f"source-validator-{stage}").start()
+        # Threads do not inherit contextvars: bind the App profile once per thread (R143).
+        threading.Thread(
+            target=app_profiles.bind_current_profile(worker),
+            daemon=True,
+            name=f"source-validator-{stage}",
+        ).start()
 
     done = 0
     last_result_at = time.monotonic()
@@ -13937,18 +15878,39 @@ def run_parallel_stage(
     return passed, records, details, timed_out
 
 
-def run_staged_pipeline(
+@dataclass
+class _StagedOutcome:
+    """Everything the staged stages produced for one App profile, before report assembly."""
+
+    version: str
+    urls: list[str]
+    groups: dict[str, list[dict[str, Any]]]
+    max_workers: int
+    quick_timeout: int
+    source_timeout: int
+    rounds: int
+    min_pass_rounds: int
+    quick_passed: set[str]
+    full_passed: set[str]
+    all_details: dict[str, dict[str, Any]]
+    best_records: dict[str, dict[str, Any]]
+    pass_counts: dict[str, int]
+    final_urls: set[str]
+    stability_timed_out: int = 0
+    stability_completed_rounds: int = 1
+
+
+def _run_staged_stages(
     urls: list[str],
     groups: dict[str, list[dict[str, Any]]],
-    total_records: int,
     max_workers: int,
     quick_timeout: int,
     source_timeout: int,
     rounds: int,
     min_pass_rounds: int,
     idle_timeout: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Execute dedupe → quick scan → full chain → stability re-test."""
+) -> _StagedOutcome:
+    """Execute dedupe → quick scan → full chain → stability re-test under the current App profile."""
     print(f"Pipeline dedupe: {len(urls)} unique source groups (canonical site + rule fingerprint).", flush=True)
     quick_passed, quick_seeds, quick_details, quick_timed_out = run_parallel_stage(
         "quick-scan",
@@ -14020,20 +15982,69 @@ def run_staged_pipeline(
         final_urls = {url for url, count in pass_counts.items() if count >= min_pass_rounds}
     else:
         final_urls = candidate_urls
-    final_entries = [(url, best_records[url], all_details.get(url)) for url in urls if url in final_urls and url in best_records]
+    return _StagedOutcome(
+        version=app_profiles.current_app_version(),
+        urls=list(urls),
+        groups=groups,
+        max_workers=max_workers,
+        quick_timeout=quick_timeout,
+        source_timeout=source_timeout,
+        rounds=rounds,
+        min_pass_rounds=min_pass_rounds,
+        quick_passed=set(quick_passed),
+        full_passed=set(full_passed),
+        all_details=all_details,
+        best_records=best_records,
+        pass_counts=pass_counts,
+        final_urls=set(final_urls),
+        stability_timed_out=stability_timed_out,
+        stability_completed_rounds=stability_completed_rounds,
+    )
+
+
+def _finalize_staged(
+    outcome: _StagedOutcome,
+    total_records: int,
+    proven_on_111: set[str] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Aggregate by book, assemble the report document and compute each source's App verdict.
+
+    ``proven_on_111`` is only given for the 1.1.2 half of ``both`` mode: groups that already passed on 1.1.1 do
+    not get the `需1.1.2` group token. The outcome itself is never mutated apart from detail verdict fields.
+    """
+    urls = outcome.urls
+    groups = outcome.groups
+    final_urls = outcome.final_urls
+    version = outcome.version
+    verdict_counts: dict[str, int] = {"pass": 0, "invalid": 0, "needsInteraction": 0, "timeout": 0}
+    for url, detail in outcome.all_details.items():
+        verdict = "pass" if url in final_urls else app_profiles.app_verdict(detail, False, version)
+        detail["appVerdict"] = verdict
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+
+    final_entries: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
+    for url in urls:
+        if url in final_urls and url in outcome.best_records:
+            record = dict(outcome.best_records[url])
+            if proven_on_111 is not None:
+                record["bookSourceGroup"] = _validated_group_value(record, version, url in proven_on_111)
+            final_entries.append((url, record, outcome.all_details.get(url)))
     passed, book_aggregation = aggregate_validated_sources(final_entries)
     for record in passed:
         record.pop("__readoriValidation", None)
-    passed.sort(key=lambda item: (canonical_source_site_key(item), str(item.get("bookSourceName") or "")))
-    report_results = list(all_details.values())
+    passed.sort(key=lambda item: (normalize_book_source_url(str(item.get("bookSourceUrl") or "")), str(item.get("bookSourceName") or "")))
+    report_results = list(outcome.all_details.values())
     report_results.sort(key=lambda item: (normalize_book_source_url(str(item.get("bookSourceUrl") or "")), str(item.get("bookSourceName") or "")))
     canonical_sites = {canonical_source_site_key(candidates[0]) for candidates in groups.values() if candidates and canonical_source_site_key(candidates[0])}
     rule_fingerprints = {source_rule_fingerprint(candidates[0]) for candidates in groups.values() if candidates}
+    max_workers = outcome.max_workers
+    quick_timeout = outcome.quick_timeout
+    source_timeout = outcome.source_timeout
     pipeline = {
         "dedupe": {"records": total_records, "uniqueSourceUrls": len(urls), "uniqueSourceGroups": len(urls), "canonicalSites": len(canonical_sites), "ruleFingerprints": len(rule_fingerprints)},
-        "quickScan": {"candidates": len(urls), "passed": len(quick_passed), "timeoutSeconds": max(0, quick_timeout), "workers": max_workers},
-        "fullValidation": {"candidates": len(quick_passed), "passed": len(full_passed), "timeoutSeconds": max(0, source_timeout), "workers": max_workers},
-        "stabilityRetest": {"roundsRequested": rounds, "roundsCompleted": stability_completed_rounds, "initialCandidates": len(full_passed), "finalPassed": len(final_urls), "timedOut": stability_timed_out, "workers": max_workers},
+        "quickScan": {"candidates": len(urls), "passed": len(outcome.quick_passed), "timeoutSeconds": max(0, quick_timeout), "workers": max_workers},
+        "fullValidation": {"candidates": len(outcome.quick_passed), "passed": len(outcome.full_passed), "timeoutSeconds": max(0, source_timeout), "workers": max_workers},
+        "stabilityRetest": {"roundsRequested": outcome.rounds, "roundsCompleted": outcome.stability_completed_rounds, "initialCandidates": len(outcome.full_passed), "finalPassed": len(final_urls), "timedOut": outcome.stability_timed_out, "workers": max_workers},
         "bookAggregation": book_aggregation,
     }
     summary = {
@@ -14048,15 +16059,172 @@ def run_staged_pipeline(
         "workers": max_workers,
         "quickScanTimeoutSeconds": max(0, quick_timeout),
         "sourceTimeoutSeconds": max(0, source_timeout),
-        "stabilityRounds": rounds,
-        "minPassRounds": min_pass_rounds,
+        "stabilityRounds": outcome.rounds,
+        "minPassRounds": outcome.min_pass_rounds,
         "pipeline": pipeline,
         "checks": ["connectivity", "search_or_explore", "book_detail_name_or_tocUrl", "toc_first_chapter", "chapter_content_non_empty"],
+        "appVersion": version,
+        "appProfile": asdict(app_profiles.APP_PROFILES[version]),
+        "appVerdicts": verdict_counts,
     }
     return {"summary": summary, "results": report_results, "passedSources": passed}, passed
 
 
-def main() -> int:
+def run_staged_pipeline(
+    urls: list[str],
+    groups: dict[str, list[dict[str, Any]]],
+    total_records: int,
+    max_workers: int,
+    quick_timeout: int,
+    source_timeout: int,
+    rounds: int,
+    min_pass_rounds: int,
+    idle_timeout: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Execute dedupe → quick scan → full chain → stability re-test under the current App profile."""
+    outcome = _run_staged_stages(
+        urls, groups, max_workers, quick_timeout, source_timeout, rounds, min_pass_rounds, idle_timeout
+    )
+    return _finalize_staged(outcome, total_records)
+
+
+def _combine_with_reused_111(
+    base: _StagedOutcome,
+    rerun: _StagedOutcome | None,
+    rerun_urls: set[str],
+) -> _StagedOutcome:
+    """1.1.2 view of a ``both`` run: re-validated groups come from ``rerun``, every other group reuses 1.1.1."""
+    reused = [url for url in base.urls if url not in rerun_urls]
+    reused_set = set(reused)
+    details: dict[str, dict[str, Any]] = {}
+    for url in base.urls:
+        if url in reused_set:
+            source_detail = base.all_details.get(url)
+            if source_detail is None:
+                continue
+            detail = copy.deepcopy(source_detail)
+            detail["appVersion"] = "1.1.2"
+            detail["reusedFrom"] = "1.1.1"
+            details[url] = detail
+        elif rerun is not None and url in rerun.all_details:
+            details[url] = rerun.all_details[url]
+    best_records = {url: dict(base.best_records[url]) for url in reused if url in base.best_records}
+    pass_counts = {url: base.pass_counts[url] for url in reused if url in base.pass_counts}
+    quick_passed = {url for url in base.quick_passed if url in reused_set}
+    full_passed = {url for url in base.full_passed if url in reused_set}
+    final_urls = {url for url in base.final_urls if url in reused_set}
+    stability_timed_out = 0
+    stability_rounds = base.stability_completed_rounds
+    if rerun is not None:
+        best_records.update(rerun.best_records)
+        pass_counts.update(rerun.pass_counts)
+        quick_passed |= rerun.quick_passed
+        full_passed |= rerun.full_passed
+        final_urls |= rerun.final_urls
+        stability_timed_out = rerun.stability_timed_out
+        stability_rounds = max(stability_rounds, rerun.stability_completed_rounds)
+    return _StagedOutcome(
+        version="1.1.2",
+        urls=list(base.urls),
+        groups=base.groups,
+        max_workers=base.max_workers,
+        quick_timeout=base.quick_timeout,
+        source_timeout=base.source_timeout,
+        rounds=base.rounds,
+        min_pass_rounds=base.min_pass_rounds,
+        quick_passed=quick_passed,
+        full_passed=full_passed,
+        all_details=details,
+        best_records=best_records,
+        pass_counts=pass_counts,
+        final_urls=final_urls,
+        stability_timed_out=stability_timed_out,
+        stability_completed_rounds=stability_rounds,
+    )
+
+
+def run_staged_pipeline_both(
+    urls: list[str],
+    groups: dict[str, list[dict[str, Any]]],
+    total_records: int,
+    max_workers: int,
+    quick_timeout: int,
+    source_timeout: int,
+    rounds: int,
+    min_pass_rounds: int,
+    idle_timeout: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate under App 1.1.1, re-validate only the profile-sensitive groups under 1.1.2, and compare.
+
+    Returns ``(report_doc, passed_on_111, passed_on_112)``. ``report_doc`` keeps the 1.1.1 structure and only adds
+    fields (``summary.profiles`` / ``summary.compatibility`` / ``results[].compatibility`` /
+    ``passedSourcesByAppVersion``).
+    """
+    stage_args = (max_workers, quick_timeout, source_timeout, rounds, min_pass_rounds, idle_timeout)
+    with app_profiles.app_profile_scope("1.1.1"):
+        print(f"=== App 1.1.1: validating {len(urls)} source groups ===", flush=True)
+        outcome_111 = _run_staged_stages(urls, groups, *stage_args)
+    sensitive_urls = [
+        url for url in urls if any(app_profiles.app_profile_sensitivity(candidate) for candidate in groups.get(url, []))
+    ]
+    sensitive_set = set(sensitive_urls)
+    outcome_112_rerun: _StagedOutcome | None = None
+    with app_profiles.app_profile_scope("1.1.2"):
+        print(
+            f"=== App 1.1.2: re-validating {len(sensitive_urls)}/{len(urls)} profile-sensitive groups ===",
+            flush=True,
+        )
+        if sensitive_urls:
+            outcome_112_rerun = _run_staged_stages(
+                sensitive_urls, {url: groups[url] for url in sensitive_urls}, *stage_args
+            )
+    outcome_112 = _combine_with_reused_111(outcome_111, outcome_112_rerun, sensitive_set)
+
+    report_doc, passed_111 = _finalize_staged(outcome_111, total_records)
+    report_112, passed_112 = _finalize_staged(outcome_112, total_records, proven_on_111=outcome_111.final_urls)
+
+    labels: dict[str, int] = {}
+    for url, detail in outcome_111.all_details.items():
+        detail_112 = outcome_112.all_details.get(url) or {}
+        verdict_111 = str(detail.get("appVerdict") or "invalid")
+        verdict_112 = str(detail_112.get("appVerdict") or "invalid")
+        label = app_profiles.compatibility_label(verdict_111, verdict_112)
+        labels[label] = labels.get(label, 0) + 1
+        detail["compatibility"] = {
+            "1.1.1": verdict_111,
+            "1.1.2": verdict_112,
+            "label": label,
+            "app112": {
+                "failureReason": str(detail_112.get("failureReason") or ""),
+                "error": str(detail_112.get("error") or ""),
+                "appVerdict": verdict_112,
+                "suppressedInteractions": list(detail_112.get("suppressedInteractions") or []),
+                "reusedFrom": str(detail_112.get("reusedFrom") or ""),
+            },
+        }
+
+    def profile_summary(summary: dict[str, Any], **extra: Any) -> dict[str, Any]:
+        keys = ("passed", "sourceGroupsPassed", "failed", "appVerdicts", "appProfile")
+        out = {key: summary[key] for key in keys if key in summary}
+        out.update(extra)
+        return out
+
+    summary = report_doc["summary"]
+    summary["appVersion"] = "both"
+    summary["profiles"] = {
+        "1.1.1": profile_summary(summary, rerunGroups=len(urls)),
+        "1.1.2": profile_summary(
+            report_112["summary"],
+            rerunGroups=len(sensitive_urls),
+            reusedFrom111Groups=len(urls) - len(sensitive_urls),
+        ),
+    }
+    summary["compatibility"] = labels
+    report_doc["passedSourcesByAppVersion"] = {"1.1.2": passed_112}
+    return report_doc, passed_111, passed_112
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="验证书源：搜索/发现 → 详情 → 目录 → 正文（与 iOS BookSourceValidator 四阶段一致）")
     parser.add_argument("--json-dir", type=Path, default=JSON_DIR, help="默认书源 JSON 目录（默认 docs/Json）")
     parser.add_argument("--input", type=Path, action="append", default=[], help="额外输入文件或目录；可重复传入，传入后不再自动扫描 --json-dir")
@@ -14074,8 +16242,23 @@ def main() -> int:
     parser.add_argument("--min-pass-rounds", type=int, default=3, help="最终交付至少需通过几轮（默认 3，不超过 --rounds）")
     parser.add_argument("--idle-timeout", type=int, default=180, help="单轮无任何书源完成的最长等待秒数；超时后剩余源判失败，避免坏源拖死整批")
     parser.add_argument("--source-timeout", type=int, default=60, help="单个书源完整搜索/详情/目录/正文链路的硬截止秒数；0 表示不限制")
-    args = parser.parse_args()
+    parser.add_argument("--app-version", choices=("1.1.1", "1.1.2", "both"), default=DEFAULT_APP_VERSION, help="模拟的 App 版本：1.1.1=当前公开版（默认）；1.1.2=下一版；both=两版对比（只重跑受版本影响的书源，额外输出 *.app-1.1.2.json）")
+    args = parser.parse_args(argv)
 
+    if args.app_version == "both":
+        if args.pipeline == "legacy":
+            print("--app-version both requires --pipeline staged.", file=sys.stderr, flush=True)
+            return 2
+        return _run_main(args, "both")
+    with app_profiles.app_profile_scope(args.app_version):
+        return _run_main(args, args.app_version)
+
+
+def _app_112_output_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.app-1.1.2{path.suffix}")
+
+
+def _run_main(args: argparse.Namespace, app_version: str) -> int:
     root_resolved = ROOT.resolve()
     json_dir = Path(args.json_dir).expanduser().resolve()
     if args.input:
@@ -14101,7 +16284,8 @@ def main() -> int:
         groups = {u: groups[u] for u in urls}
 
     canonical_sites = {canonical_source_site_key(candidates[0]) for candidates in groups.values() if candidates and canonical_source_site_key(candidates[0])}
-    print(f"Loaded {len(sources)} records from {len(input_files)} file(s), {len(urls)} unique source groups ({len(canonical_sites)} canonical sites).", flush=True)
+    print(f"Loaded {len(sources)} records from {len(input_files)} file(s), {len(urls)} unique source URLs ({len(canonical_sites)} canonical sites; deduped by site + rule fingerprint).", flush=True)
+    print(f"App profile: {app_version}", flush=True)
     if input_files:
         for name in input_files[:12]:
             print(f"  - {name}", flush=True)
@@ -14112,7 +16296,8 @@ def main() -> int:
     max_workers = args.workers if args.workers > 0 else min(20, max(8, cpu * 2))
 
     if args.pipeline == "staged":
-        report_doc, passed = run_staged_pipeline(
+        passed_112: list[dict[str, Any]] | None = None
+        pipeline_args = (
             urls,
             groups,
             len(sources),
@@ -14123,6 +16308,10 @@ def main() -> int:
             max(1, args.min_pass_rounds),
             max(0, args.idle_timeout),
         )
+        if app_version == "both":
+            report_doc, passed, passed_112 = run_staged_pipeline_both(*pipeline_args)
+        else:
+            report_doc, passed = run_staged_pipeline(*pipeline_args)
         try:
             json_dir_rel = str(json_dir.relative_to(root_resolved))
         except ValueError:
@@ -14152,6 +16341,12 @@ def main() -> int:
             validated_output_full.write_text(payload, encoding="utf-8")
             print(f"Wrote {len(passed)} validated sources to {validated_output}", flush=True)
             print(f"Wrote {len(passed)} validated sources to {validated_output_full}", flush=True)
+            if passed_112 is not None:
+                payload_112 = json.dumps(passed_112, ensure_ascii=False, indent=2)
+                for target in (validated_output, validated_output_full):
+                    target_112 = _app_112_output_path(target)
+                    target_112.write_text(payload_112, encoding="utf-8")
+                    print(f"Wrote {len(passed_112)} validated sources (App 1.1.2) to {target_112}", flush=True)
         return 0
 
     # ─── 多轮验证：只有连续通过的书源才视为生产可用 ───────────────────────────
@@ -14201,6 +16396,8 @@ def main() -> int:
 
     report_results: list[dict[str, Any]] = list(all_round_details.values())
     passed = [round_best_record[url] for url in urls if url in final_url_set]
+    for record in passed:
+        record.pop("__readoriValidation", None)
     pass_count = len(passed)
     # ───────────────────────────────────────────────────────────────────────────
 
@@ -14215,6 +16412,7 @@ def main() -> int:
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "jsonDir": json_dir_rel,
         "inputFiles": input_files,
+        "appVersion": app_version,
         "uniqueSourceUrls": len(urls),
         "totalRecordsLoaded": len(sources),
         "passed": pass_count,

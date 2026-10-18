@@ -98,7 +98,8 @@ jobs:
           python -m py_compile `
             (Join-Path $validatorRoot "source_validator_gui.py") `
             (Join-Path $validatorRoot "source_validator_cli.py") `
-            (Join-Path $validatorRoot "validator\validate_source_packages.py")
+            (Join-Path $validatorRoot "validator\validate_source_packages.py") `
+            (Join-Path $validatorRoot "validator\app_profiles.py")
           $verifyScript = Join-Path $validatorRoot "verify_standalone.ps1"
           powershell -NoProfile -ExecutionPolicy Bypass -File $verifyScript -Python (Get-Command python).Source
           $repoScript = Join-Path $env:GITHUB_WORKSPACE "scripts\validate_source_packages.py"

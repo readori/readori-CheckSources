@@ -20,6 +20,13 @@ def test_gui_passes_quick_timeout_and_reports_stage() -> None:
     assert "STAGE_RE" in text
 
 
+def test_gui_passes_app_version() -> None:
+    text = (ROOT / "source_validator_gui.py").read_text(encoding="utf-8")
+    assert "app_version_var" in text
+    assert "--app-version" in text
+    assert "PROFILE_RE" in text
+
+
 def test_gui_keeps_file_and_directory_inputs_separate() -> None:
     text = (ROOT / "source_validator_gui.py").read_text(encoding="utf-8")
     assert "file_input_var" in text
