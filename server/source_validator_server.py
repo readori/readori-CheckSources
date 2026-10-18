@@ -40,6 +40,8 @@ from validator import app_profiles
 from validator import net_guard
 from validator import validate_source_packages as core
 
+from . import debug_api
+
 try:  # FastAPI is optional for the Windows one-file validator.
     from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
     from fastapi import Request
@@ -1120,6 +1122,9 @@ def create_app(settings: ServerSettings | None = None) -> Any:
     @app.get("/healthz")
     def health() -> dict[str, Any]:
         return {"ok": True, "service": "readori-source-validator", "time": utc_now()}
+
+    # R146: single-source debug sessions, rule tests, repair suggestions (same authorize dependency as the batch API).
+    debug_api.register_debug_routes(app, runtime_settings, authorize, redact=redact)
 
     @app.post("/v1/jobs", dependencies=[Depends(authorize)])
     def create_job(request: CreateJobModel) -> dict[str, Any]:

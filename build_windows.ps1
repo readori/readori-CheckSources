@@ -38,8 +38,17 @@ $common = @(
     "--workpath", (Join-Path $buildRoot "pyinstaller-work"),
     "--specpath", (Join-Path $buildRoot "spec")
 )
-& $venvPython -m PyInstaller @common "--name" "ReadoriSourceValidatorCLI" "--console" (Join-Path $root "source_validator_cli.py")
-& $venvPython -m PyInstaller @common "--name" "ReadoriSourceValidator" "--windowed" (Join-Path $root "source_validator_gui.py")
+# The workbench sub-commands are imported lazily by source_validator_cli.py; list them so PyInstaller never misses them.
+$cliHidden = @(
+    "--hidden-import", "validator.workbench_cli",
+    "--hidden-import", "validator.debug_engine",
+    "--hidden-import", "validator.debug_trace",
+    "--hidden-import", "validator.rule_tester",
+    "--hidden-import", "validator.fix_suggester",
+    "--hidden-import", "validator.source_edit"
+)
+& $venvPython -m PyInstaller @common @cliHidden "--name" "ReadoriSourceValidatorCLI" "--console" (Join-Path $root "source_validator_cli.py")
+& $venvPython -m PyInstaller @common "--hidden-import" "workbench_gui" "--name" "ReadoriSourceValidator" "--windowed" (Join-Path $root "source_validator_gui.py")
 
 $readmeSource = [System.IO.Path]::GetFullPath((Join-Path $root "README.md"))
 $readmeDestination = [System.IO.Path]::GetFullPath((Join-Path $OutputDir "README.md"))

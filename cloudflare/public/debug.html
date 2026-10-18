@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Readori 书源调试工作台</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; --line: color-mix(in srgb, CanvasText 20%, transparent); --soft: color-mix(in srgb, CanvasText 7%, Canvas); --dim: color-mix(in srgb, CanvasText 62%, transparent); --accent:#2e78a5; --ok:#16834b; --bad:#c52b35; --warn:#b26a00; }
+    * { box-sizing: border-box; }
+    body { max-width: 1280px; margin: 0 auto; padding: 22px 16px 64px; background: Canvas; color: CanvasText; }
+    h1 { margin: 0 0 6px; font-size: 24px; } h2 { margin: 0 0 8px; font-size: 16px; }
+    p, .hint { color: var(--dim); } p { margin: 6px 0; }
+    section { border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin: 14px 0; }
+    input, select, textarea, button { font: inherit; border-radius: 9px; border: 1px solid var(--line); padding: 7px 10px; background: Canvas; color: CanvasText; }
+    input[type=text], input[type=password], input[type=number], select, textarea { width: 100%; }
+    input[type=checkbox] { width: auto; }
+    textarea { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size: 12.5px; resize: vertical; }
+    button { cursor: pointer; margin: 4px 6px 0 0; } button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button.chip { padding: 3px 10px; border-radius: 999px; font-size: 13px; margin: 2px 4px 2px 0; }
+    button.run { padding: 3px 9px; margin: 0 0 0 6px; } button:disabled { opacity: .5; cursor: default; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; } .row > * { flex: 1 1 200px; } .row > .fit { flex: 0 0 auto; }
+    label { display: block; font-weight: 600; margin: 8px 0 4px; font-size: 14px; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--line); margin: 6px 0 10px; }
+    .tab { border: 1px solid transparent; border-bottom: none; border-radius: 9px 9px 0 0; padding: 6px 12px; margin: 0; cursor: pointer; background: transparent; }
+    .tab[aria-selected=true] { border-color: var(--line); background: var(--soft); font-weight: 600; }
+    .panel[hidden] { display: none; }
+    .editor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 4px 18px; }
+    .field .head { display: flex; align-items: center; justify-content: space-between; }
+    .field .hint { font-size: 12px; margin: 2px 0 0; }
+    .rt { margin: 4px 0 6px; padding: 6px 10px; border-radius: 9px; background: var(--soft); font-size: 12.5px; white-space: pre-wrap; word-break: break-all; }
+    .rt.bad { border-left: 3px solid var(--bad); } .rt.good { border-left: 3px solid var(--ok); }
+    #log, .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size: 12.5px; }
+    #log { background: var(--soft); border-radius: 10px; padding: 10px; height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+    #log .line.err { color: var(--bad); } #log .line.ok { color: var(--ok); } #log .line.warn { color: var(--warn); } #log .line.dim { color: var(--dim); }
+    .pause { margin: 6px 0; padding: 8px; border: 1px dashed var(--accent); border-radius: 10px; }
+    .pause button { display: block; width: 100%; text-align: left; font-size: 12.5px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; } th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: top; word-break: break-all; }
+    .split { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr); gap: 12px; }
+    @media (max-width: 800px) { .split { grid-template-columns: 1fr; } }
+    .rawlist { max-height: 420px; overflow: auto; } .rawitem { padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: 12.5px; word-break: break-all; } .rawitem:hover, .rawitem.on { background: var(--soft); }
+    .badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--soft); border: 1px solid var(--line); margin-right: 6px; }
+    pre.view { max-height: 420px; overflow: auto; background: var(--soft); border-radius: 10px; padding: 10px; white-space: pre-wrap; word-break: break-all; margin: 0; }
+    .sugg { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 8px 0; }
+    .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+    #msg { min-height: 1.4em; margin: 6px 0 0; }
+  </style>
+</head>
+<body>
+  <h1>Readori 书源调试工作台</h1>
+  <p>在浏览器里编辑书源，按 App 的规则逐步调试（搜索 → 详情 → 目录 → 正文），看每一步的请求与解析结果，一键验证修复。验证与请求都在服务器上执行；需要访问令牌。<a href="index.html">返回验证控制台</a></p>
+
+  <section>
+    <details id="tokenBox">
+      <summary><strong>访问令牌</strong> <span id="tokenState" class="hint"></span></summary>
+      <div class="row">
+        <div><input id="accessToken" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴管理员提供的访问令牌（与验证控制台共用）"></div>
+        <div class="fit"><button id="saveToken">保存</button><button id="clearToken">清除</button></div>
+      </div>
+    </details>
+  </section>
+
+  <section>
+    <h2>① 书源</h2>
+    <div class="row">
+      <div><label for="sourceFile">选择书源 JSON 文件</label><input id="sourceFile" type="file" accept="application/json,.json"></div>
+      <div><label for="sourceSelect">书源（文件里有多条时选择一条）</label><select id="sourceSelect" disabled></select></div>
+      <div class="fit"><label for="appVersion">App 版本</label>
+        <select id="appVersion"><option value="1.1.1" selected>1.1.1（当前公开版）</option><option value="1.1.2">1.1.2（下一版）</option></select></div>
+    </div>
+    <label for="pasteSource">或粘贴书源 JSON</label>
+    <textarea id="pasteSource" rows="3" placeholder='{"bookSourceName":"…","bookSourceUrl":"https://…", …}'></textarea>
+    <div><button id="loadPaste">载入粘贴的书源</button></div>
+    <p class="hint">单条书源不要超过 256 KB。书源只在本页和服务器内存里存在，不会保存；刷新页面后需要重新载入。</p>
+  </section>
+
+  <section id="editorSection" hidden>
+    <h2>② 编辑</h2>
+    <div class="row">
+      <div class="fit"><button id="undo">撤销</button><button id="redo">重做</button><button id="reset">还原为载入时的样子</button></div>
+      <div class="fit"><label for="itemIndex">列表项序号（测字段用）</label><input id="itemIndex" type="number" min="0" value="0" style="width:90px"></div>
+    </div>
+    <details>
+      <summary class="hint">离线响应体（可选）：粘贴一段网页或接口响应，字段旁的 ▶ 会直接用它测规则，不需要先调试</summary>
+      <div class="row"><div><input id="pasteBase" type="text" placeholder="这段响应的页面地址（用来补全相对链接），例如 https://example.com/search?q=1"></div></div>
+      <textarea id="pasteBody" rows="4" placeholder="HTML 或 JSON 响应体（不超过 1 MB）"></textarea>
+    </details>
+    <div id="editorTabs" class="tabs" role="tablist"></div>
+    <div id="editorPanels"></div>
+  </section>
+
+  <section id="runSection" hidden>
+    <h2>③ 调试</h2>
+    <div class="row">
+      <div><label for="debugKey">调试关键字（留空 = 完整校验，和批量验证同一条路径）</label><input id="debugKey" type="text" spellcheck="false" placeholder="关键词 / 详情页链接 / 标题::发现链接 / ++目录链接 / --正文链接"></div>
+    </div>
+    <div>
+      <button class="chip" id="chipSearch">校验关键字</button>
+      <button class="chip" id="chipAuto">系统（完整校验）</button>
+      <select id="chipExplore" class="chip" style="width:auto"><option value="">发现 ▾</option></select>
+      <button class="chip" id="chipInfo">详情</button>
+      <button class="chip" id="chipToc">++目录</button>
+      <button class="chip" id="chipContent">--正文</button>
+    </div>
+    <div>
+      <button id="btnDebug" class="primary">▶ 调试</button>
+      <button id="btnStep">⏭ 单步</button>
+      <button id="btnStop" disabled>■ 停止</button>
+      <button id="btnValidate">校验此源</button>
+      <button id="btnCompare">修复前后对比</button>
+      <span id="runStatus" class="hint"></span>
+    </div>
+  </section>
+
+  <section id="resultSection" hidden>
+    <h2>④ 结果</h2>
+    <div id="resultTabs" class="tabs" role="tablist"></div>
+    <div id="panel-log" class="panel"><div id="log" aria-live="polite"></div></div>
+    <div id="panel-raw" class="panel" hidden>
+      <div class="split">
+        <div class="rawlist" id="rawList"></div>
+        <div><div id="rawMeta" class="hint">点左边的一条查看原始响应（最多 256 KB，敏感请求头已隐藏）。</div><pre id="rawBody" class="view mono"></pre></div>
+      </div>
+    </div>
+    <div id="panel-sugg" class="panel" hidden><div id="suggList" class="hint">调试结束后这里会列出修复建议。</div></div>
+    <div id="panel-diff" class="panel" hidden>
+      <div><button id="btnDiff">刷新差异</button><label style="display:inline"><input type="checkbox" id="diffUnified"> 显示统一 diff</label></div>
+      <div id="diffView"></div>
+    </div>
+    <div id="panel-compare" class="panel" hidden><div id="compareView" class="hint">点「修复前后对比」后这里显示原书源与当前书源的逐阶段结果。</div></div>
+    <div id="panel-export" class="panel" hidden>
+      <p>导出当前书源（带 <code>// Fixed:</code> 注释和更新时间）与修复报告 <code>fix-report.json</code>。</p>
+      <label style="font-weight:400"><input type="checkbox" id="exOnlyChanged"> 没有修改就不导出</label>
+      <label style="font-weight:400"><input type="checkbox" id="exKeepUrl"> 保持原来的 bookSourceUrl（域名迁移时不新增一条书源）</label>
+      <div><button id="btnExport" class="primary">下载 fixed.json 和 fix-report.json</button></div>
+      <div id="exportInfo" class="hint"></div>
+    </div>
+  </section>
+
+  <p id="msg" role="status"></p>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// ---- DOM helper (all dynamic text goes through textContent / text nodes, never innerHTML) -----------------
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") el.className = value;
+    else if (key === "text") el.textContent = value;
+    else if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
+    else if (value === true) el.setAttribute(key, "");
+    else if (value !== false && value != null) el.setAttribute(key, value);
+  }
+  for (const kid of kids.flat()) if (kid != null) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+
+// ---- access token (same key as the console) --------------------------------------------------------------
+const TOKEN_KEY = "readori-validator-access-token";
+let accessToken = "";
+try { accessToken = localStorage.getItem(TOKEN_KEY) || ""; } catch (_) {}
+const UNAUTHORIZED = "访问令牌无效或缺失，请展开页面顶部的「访问令牌」填写并保存";
+class AuthError extends Error {}
+function showTokenState() {
+  $("accessToken").value = accessToken;
+  $("tokenState").textContent = accessToken ? "（已保存，仅在本浏览器）" : "（尚未填写）";
+}
+function saveToken() {
+  accessToken = $("accessToken").value.trim();
+  try { accessToken ? localStorage.setItem(TOKEN_KEY, accessToken) : localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+  showTokenState(); message(accessToken ? "访问令牌已保存" : "访问令牌已清除");
+}
+function clearToken() {
+  accessToken = ""; $("accessToken").value = "";
+  try { localStorage.removeItem(TOKEN_KEY); } catch (_) {}
+  showTokenState(); message("访问令牌已清除");
+}
+function needToken() { $("tokenBox").open = true; $("accessToken").focus(); return new AuthError(UNAUTHORIZED); }
+function authHeaders(extra) { return { ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}), ...(extra || {}) }; }
+function message(text, bad = false) { const el = $("msg"); el.textContent = text; el.className = bad ? "bad" : "ok"; }
+
+async function failure(response) {
+  if (response.status === 401) return needToken();
+  let body = null;
+  try { body = (response.headers.get("content-type") || "").includes("json") ? await response.json() : null; } catch (_) {}
+  if (response.status === 429) return new Error(`调试服务器忙（已有调试在运行），请 ${body?.retryAfter || 10} 秒后重试`);
+  if (response.status === 413) return new Error("内容太大，被服务器拒绝");
+  const detail = body?.error || body?.detail;
+  return new Error(typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : `HTTP ${response.status}`));
+}
+async function api(path, options = {}) {
+  if (!accessToken) throw needToken();
+  const headers = authHeaders(options.body ? { "content-type": "application/json" } : {});
+  const response = await fetch(path, { ...options, headers });
+  if (!response.ok) throw await failure(response);
+  return response.json();
+}
+const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body) });
+
+// ---- editor model -----------------------------------------------------------------------------------------
+const FIELD_SPEC = [
+  { group: "基本", path: "bookSourceName", label: "书源名称", hint: "显示在书源列表里的名字" },
+  { group: "基本", path: "bookSourceUrl", label: "书源地址", hint: "站点首页，相对链接都以它为基准；也是书源的唯一标识，改了会变成新书源" },
+  { group: "基本", path: "bookSourceGroup", label: "分组", hint: "逗号分隔" },
+  { group: "基本", path: "bookSourceType", label: "类型", hint: "0 文字 · 1 音频 · 2 图片 · 3 文件", type: "num" },
+  { group: "基本", path: "enabled", label: "启用", hint: "关掉的书源批量验证直接判失效", type: "bool" },
+  { group: "基本", path: "header", label: "请求头", hint: "JSON 对象，例如 {\"User-Agent\":\"Mozilla/5.0 …\",\"Referer\":\"https://…\"}（键区分大小写）", multi: true },
+  { group: "基本", path: "searchUrl", label: "搜索地址", hint: "可用 {{key}} {{page}}；POST 写成 地址,{\"method\":\"POST\",\"body\":\"k={{key}}\"}；GBK 站加 {\"charset\":\"gbk\"}", multi: true },
+  { group: "基本", path: "exploreUrl", label: "发现地址", hint: "每行 标题::链接，或 JSON 数组 [{\"title\":\"…\",\"url\":\"…\"}]", multi: true },
+  { group: "基本", path: "jsLib", label: "JS 库", hint: "规则里 @js: 可以直接调用这里定义的函数", multi: true },
+  { group: "基本", path: "bookSourceComment", label: "备注", hint: "导出时会写入 // Fixed: 修复记录", multi: true },
+  { group: "搜索", path: "ruleSearch.checkKeyWord", label: "校验关键字", hint: "验证时用它搜索；留空则用站点常见词", plain: true },
+  ...["bookList:书籍列表:每一项就是一本书；JSON 用 $.data[*]，网页用 class.x@tag.li 或 @CSS:ul>li", "name:书名:相对列表项求值", "author:作者:", "kind:分类:", "wordCount:字数:", "lastChapter:最新章节:", "intro:简介:", "coverUrl:封面链接:懒加载图常在 data-original / data-src，不是 src", "bookUrl:详情页链接:相对链接会按搜索页地址补全"]
+    .map((s) => s.split(":")).map(([n, l, hint]) => ({ group: "搜索", path: `ruleSearch.${n}`, label: l, hint, multi: n === "bookList" })),
+  ...["bookList:书籍列表:为空时沿用搜索规则", "name:书名:", "author:作者:", "kind:分类:", "wordCount:字数:", "lastChapter:最新章节:", "intro:简介:", "coverUrl:封面链接:", "bookUrl:详情页链接:"]
+    .map((s) => s.split(":")).map(([n, l, hint]) => ({ group: "发现", path: `ruleExplore.${n}`, label: l, hint })),
+  ...["init:预处理:先取出一段，下面的规则都在这段上求值", "name:书名:", "author:作者:", "kind:分类:", "wordCount:字数:", "lastChapter:最新章节:", "intro:简介:", "coverUrl:封面链接:", "tocUrl:目录链接:为空时 App 把详情页当目录页"]
+    .map((s) => s.split(":")).map(([n, l, hint]) => ({ group: "详情", path: `ruleBookInfo.${n}`, label: l, hint })),
+  ...["chapterList:目录列表:每一项就是一章", "chapterName:章节名称:", "chapterUrl:章节链接:", "nextTocUrl:目录下一页:多页目录必填；返回多个链接 = 并发抓取", "updateTime:更新时间:", "isVolume:是否卷名:", "isVip:是否 VIP:", "isPay:是否付费:"]
+    .map((s) => s.split(":")).map(([n, l, hint]) => ({ group: "目录", path: `ruleToc.${n}`, label: l, hint })),
+  ...["content:正文内容:@html / @text；末尾 ##正则##替换 可内联净化", "title:章节名称:", "nextContentUrl:正文下一页:分页正文才需要", "webJs:webJs:需要浏览器渲染的页面，App 内才能执行", "replaceRegex:正文净化:##正则 或 ##正则##替换；多个用 | 合并"]
+    .map((s) => s.split(":")).map(([n, l, hint]) => ({ group: "正文", path: `ruleContent.${n}`, label: l, hint, multi: n === "content" })),
+];
+const GROUPS = ["基本", "搜索", "发现", "详情", "目录", "正文", "JSON"];
+const RULE_KEYS = ["ruleSearch", "ruleExplore", "ruleBookInfo", "ruleToc", "ruleContent"];
+const STAGE_OF = { ruleSearch: "search", ruleExplore: "explore", ruleBookInfo: "info", ruleToc: "toc", ruleContent: "content" };
+
+const state = {
+  sources: [], index: 0, original: null, working: null, changes: [], undo: [], redo: [],
+  session: null, abort: null, running: false, raw: [], rawSelected: null, suggestions: [], lastPauseEl: null,
+  beforeResult: null, afterResult: null,
+};
+const fieldEls = {};
+const clone = (value) => JSON.parse(JSON.stringify(value));
+const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+function getPath(obj, path) {
+  let cur = obj;
+  for (const part of path.split(".")) { if (cur == null || typeof cur !== "object" || !(part in cur)) return undefined; cur = cur[part]; }
+  return cur;
+}
+function setPath(obj, path, value) {
+  const parts = path.split(".");
+  let cur = obj;
+  for (const part of parts.slice(0, -1)) { if (cur[part] == null || typeof cur[part] !== "object") cur[part] = {}; cur = cur[part]; }
+  const last = parts[parts.length - 1];
+  if (value === undefined || value === "") delete cur[last]; else cur[last] = value;
+}
+function diffObjects(a, b, prefix = "") {
+  const out = [];
+  const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+  for (const key of new Set([...Object.keys(a || {}), ...Object.keys(b || {})])) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (isObj(a?.[key]) && isObj(b?.[key])) out.push(...diffObjects(a[key], b[key], path));
+    else if (!same(a?.[key], b?.[key])) out.push({ path, old: a?.[key] ?? null, new: b?.[key] ?? null });
+  }
+  return out;
+}
+
+function snapshot() { return JSON.stringify({ working: state.working, changes: state.changes }); }
+function restore(text) { const data = JSON.parse(text); state.working = data.working; state.changes = data.changes; refreshEditor(); }
+function pushUndo() { state.undo.push(snapshot()); if (state.undo.length > 100) state.undo.shift(); state.redo.length = 0; }
+function recordChange(path, oldValue, newValue, reason, origin) {
+  const last = state.changes[state.changes.length - 1];
+  if (origin === "manual" && last && last.origin === "manual" && last.path === path) {
+    last.new = newValue ?? null;
+    if (same(last.old, last.new)) state.changes.pop();
+    return;
+  }
+  state.changes.push({ path, old: oldValue ?? null, new: newValue ?? null, reason, origin });
+}
+function commitField(path, value) {
+  const old = getPath(state.working, path);
+  if (same(old, value) || (old === undefined && (value === "" || value === undefined))) return;
+  pushUndo();
+  setPath(state.working, path, value);
+  recordChange(path, old, value === "" ? null : value, "手动修改", "manual");
+  refreshEditor();
+}
+
+function renderEditor() {
+  const tabs = $("editorTabs"), panels = $("editorPanels");
+  tabs.replaceChildren(); panels.replaceChildren();
+  for (const name of GROUPS) {
+    tabs.append(h("button", { class: "tab", role: "tab", "data-tab": name, "aria-selected": name === "基本" ? "true" : "false", onclick: () => selectTab("editor", name), text: name }));
+    const panel = h("div", { class: "panel", "data-panel": name, hidden: name !== "基本" });
+    if (name === "JSON") {
+      const area = h("textarea", { id: "jsonText", rows: 18, spellcheck: "false" });
+      panel.append(area, h("div", {}, h("button", { onclick: applyJson, text: "应用 JSON" }), h("button", { onclick: formatJson, text: "格式化" })));
+    } else {
+      const grid = h("div", { class: "editor-grid" });
+      for (const spec of FIELD_SPEC.filter((s) => s.group === name)) grid.append(renderField(spec));
+      panel.append(grid);
+    }
+    panels.append(panel);
+  }
+}
+function renderField(spec) {
+  const id = `f-${spec.path.replace(/\./g, "-")}`;
+  let input;
+  if (spec.type === "bool") input = h("input", { type: "checkbox", id, onchange: (e) => commitField(spec.path, e.target.checked) });
+  else if (spec.multi) input = h("textarea", { id, rows: 3, spellcheck: "false", onchange: (e) => commitField(spec.path, e.target.value) });
+  else input = h("input", { type: "text", id, spellcheck: "false", onchange: (e) => commitField(spec.path, spec.type === "num" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value) });
+  fieldEls[spec.path] = input;
+  const testable = spec.path.startsWith("rule") && !spec.plain;
+  const head = h("div", { class: "head" }, h("label", { for: id, text: spec.label }), testable ? h("button", { class: "run", title: "用保存的响应（或上面粘贴的响应体）离线测这条规则", onclick: () => testRule(spec.path), text: "▶" }) : null);
+  return h("div", { class: "field", "data-path": spec.path }, head, input, spec.hint ? h("div", { class: "hint", text: spec.hint }) : null, h("div", { class: "rt-slot" }));
+}
+function refreshEditor() {
+  if (!state.working) return;
+  for (const spec of FIELD_SPEC) {
+    const el = fieldEls[spec.path]; if (!el) continue;
+    const value = getPath(state.working, spec.path);
+    if (spec.type === "bool") el.checked = value === undefined ? true : Boolean(value);
+    else el.value = value === undefined || value === null ? "" : (typeof value === "string" ? value : JSON.stringify(value));
+  }
+  const json = $("jsonText"); if (json) json.value = JSON.stringify(state.working, null, 2);
+  $("undo").disabled = !state.undo.length; $("redo").disabled = !state.redo.length;
+  refreshExploreChips();
+}
+function selectTab(kind, name) {
+  const root = kind === "editor" ? $("editorSection") : $("resultSection");
+  for (const tab of root.querySelectorAll(".tabs > .tab")) tab.setAttribute("aria-selected", tab.dataset.tab === name ? "true" : "false");
+  if (kind === "editor") for (const panel of $("editorPanels").children) panel.hidden = panel.dataset.panel !== name;
+  else for (const panel of root.querySelectorAll(":scope > .panel")) panel.hidden = panel.id !== `panel-${name}`;
+  if (kind === "result" && name === "diff") refreshDiff();
+}
+function applyJson() {
+  try {
+    const parsed = JSON.parse($("jsonText").value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("需要一个书源对象");
+    const changes = diffObjects(state.working, parsed);
+    if (!changes.length) return message("没有变化");
+    pushUndo(); state.working = parsed;
+    for (const c of changes) recordChange(c.path, c.old, c.new, "手动修改（JSON）", "manual");
+    refreshEditor(); message(`已应用 JSON（${changes.length} 处变化）`);
+  } catch (error) { message(`JSON 无法应用：${error.message}`, true); }
+}
+function formatJson() {
+  try { $("jsonText").value = JSON.stringify(JSON.parse($("jsonText").value), null, 2); } catch (error) { message(`JSON 格式错误：${error.message}`, true); }
+}
+function undo() { if (!state.undo.length) return; state.redo.push(snapshot()); restore(state.undo.pop()); }
+function redo() { if (!state.redo.length) return; state.undo.push(snapshot()); restore(state.redo.pop()); }
+function resetSource() {
+  if (!state.original) return;
+  pushUndo(); state.working = normalizeSource(clone(state.original)); state.changes = []; refreshEditor(); message("已还原");
+}
+
+// ---- loading sources --------------------------------------------------------------------------------------
+function normalizeSource(src) {
+  for (const key of RULE_KEYS) {
+    if (typeof src[key] === "string") { try { const parsed = JSON.parse(src[key]); if (parsed && typeof parsed === "object") src[key] = parsed; } catch (_) {} }
+  }
+  return src;
+}
+function extractSources(payload) {
+  const list = Array.isArray(payload) ? payload : (Array.isArray(payload?.sources) ? payload.sources : (Array.isArray(payload?.bookSources) ? payload.bookSources : (Array.isArray(payload?.data) ? payload.data : [payload])));
+  return list.filter((item) => item && typeof item === "object" && !Array.isArray(item) && typeof item.bookSourceUrl === "string");
+}
+function loadSources(text) {
+  let payload;
+  try { payload = JSON.parse(text.replace(/^﻿/, "")); } catch (error) { return message(`不是有效的 JSON：${error.message}`, true); }
+  const list = extractSources(payload);
+  if (!list.length) return message("没有找到带 bookSourceUrl 的书源", true);
+  state.sources = list;
+  const select = $("sourceSelect");
+  select.replaceChildren(...list.map((src, i) => h("option", { value: String(i), text: `${i + 1}. ${src.bookSourceName || "(无名称)"}  ${src.bookSourceUrl}` })));
+  select.disabled = list.length < 2;
+  chooseSource(0);
+  message(`已载入 ${list.length} 条书源`);
+}
+function chooseSource(index) {
+  state.index = index;
+  state.original = clone(state.sources[index]);
+  state.working = normalizeSource(clone(state.sources[index]));
+  state.changes = []; state.undo = []; state.redo = [];
+  state.beforeResult = null; state.afterResult = null;
+  if (JSON.stringify(state.original).length > 256 * 1024) message("这条书源超过 256 KB，服务器会拒绝", true);
+  stopStream(); resetResults();
+  for (const id of ["editorSection", "runSection", "resultSection"]) $(id).hidden = false;
+  refreshEditor();
+}
+
+// ---- rule test ---------------------------------------------------------------------------------------------
+function showRuleResult(path, result, error) {
+  const slot = document.querySelector(`.field[data-path="${path}"] .rt-slot`); if (!slot) return;
+  slot.replaceChildren();
+  if (error) return slot.append(h("div", { class: "rt bad", text: error }));
+  const lines = [];
+  lines.push(result.ok ? `✓ 命中 ${result.count ?? (result.values || []).length} 项${result.items_count != null ? `（列表 ${result.items_count} 项）` : ""}` : `✗ ${result.error || "没有结果"}`);
+  if (result.value) lines.push(result.value.length > 600 ? `${result.value.slice(0, 600)}…` : result.value);
+  if ((result.values || []).length > 1) lines.push(...result.values.slice(1, 6).map((v) => `· ${v.length > 160 ? `${v.slice(0, 160)}…` : v}`));
+  for (const warning of result.warnings || []) lines.push(`⚠ ${warning}`);
+  slot.append(h("div", { class: `rt ${result.ok ? "good" : "bad"}`, text: lines.join("\n") }));
+}
+async function testRule(path) {
+  if (!state.working) return;
+  const body = { source: state.working, field: path, appVersion: $("appVersion").value, itemIndex: Math.max(0, Number($("itemIndex").value) || 0) };
+  const pasted = $("pasteBody").value;
+  if (pasted.trim()) { body.body = pasted; if ($("pasteBase").value.trim()) body.baseUrl = $("pasteBase").value.trim(); }
+  else if (state.session) {
+    body.sessionId = state.session.id;
+    const sel = state.raw.find((r) => r.raw_id === state.rawSelected);
+    if (sel && sel.stage === STAGE_OF[path.split(".")[0]]) body.rawId = sel.raw_id;
+  } else return showRuleResult(path, null, "还没有可用的响应：先调试一次，或在上面粘贴一段响应体");
+  showRuleResult(path, null, "测试中…");
+  try { showRuleResult(path, await post("/api/debug/test-rule", body)); }
+  catch (error) { showRuleResult(path, null, error.message); if (error instanceof AuthError) message(error.message, true); }
+}
+
+// ---- debug key chips ---------------------------------------------------------------------------------------
+function exploreEntries() {
+  const raw = getPath(state.working || {}, "exploreUrl");
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  const text = raw.trim();
+  if (text.startsWith("[")) {
+    try { return JSON.parse(text).filter((e) => e && e.url).map((e) => `${e.title || "发现"}::${e.url}`); } catch (_) { return []; }
+  }
+  return text.split(/&&|\n/).map((s) => s.trim()).filter((s) => s.includes("::") && !s.startsWith("<js>") && !s.startsWith("@js:"));
+}
+function refreshExploreChips() {
+  const select = $("chipExplore");
+  select.replaceChildren(h("option", { value: "", text: "发现 ▾" }), ...exploreEntries().slice(0, 50).map((e) => h("option", { value: e, text: e.length > 60 ? `${e.slice(0, 60)}…` : e })));
+}
+const setKey = (value) => { $("debugKey").value = value; $("debugKey").focus(); };
+
+// ---- running a session -------------------------------------------------------------------------------------
+function setRunning(running) {
+  state.running = running;
+  for (const id of ["btnDebug", "btnStep", "btnValidate", "btnCompare"]) $(id).disabled = running;
+  $("btnStop").disabled = !running;
+}
+function resetResults() {
+  $("log").replaceChildren(); $("rawList").replaceChildren(); $("rawBody").textContent = ""; $("rawMeta").textContent = "点左边的一条查看原始响应（最多 256 KB，敏感请求头已隐藏）。";
+  $("suggList").textContent = "调试结束后这里会列出修复建议。"; $("suggList").className = "hint";
+  $("compareView").textContent = "点「修复前后对比」后这里显示原书源与当前书源的逐阶段结果。"; $("compareView").className = "hint";
+  $("diffView").replaceChildren(); $("runStatus").textContent = "";
+  state.session = null; state.raw = []; state.rawSelected = null; state.suggestions = [];
+}
+function stopStream() { if (state.abort) { state.abort.abort(); state.abort = null; } setRunning(false); }
+
+function logLine(event) {
+  const log = $("log");
+  if (!event.text) { if (event.kind === "pause") renderPause(event); return; }
+  const near = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  const cls = event.state === -1 || event.kind === "error" || event.kind === "fetch_error" ? "err" : (event.state === 1000 ? "ok" : (event.kind === "warn" ? "warn" : ""));
+  for (const line of String(event.text).split("\n")) log.append(h("div", { class: `line ${cls}`.trim(), text: line }));
+  if (event.kind === "pause") renderPause(event);
+  if (near) log.scrollTop = log.scrollHeight;
+}
+function renderPause(event) {
+  const data = event.data || {};
+  const box = h("div", { class: "pause" }, h("div", { class: "hint", text: `请选择要继续调试的${data.what === "chapter" ? "章节" : "书籍"}：` }));
+  for (const c of data.choices || []) {
+    box.append(h("button", { text: `[${c.index}] ${c.name || ""}  ${c.url || ""}`, onclick: () => resumeRun(c.index, box) }));
+  }
+  state.lastPauseEl = box; $("log").append(box); $("log").scrollTop = $("log").scrollHeight;
+  $("runStatus").textContent = "已暂停，等待选择…";
+}
+async function resumeRun(choice, box) {
+  try {
+    await post(`/api/debug/sessions/${encodeURIComponent(state.session.id)}/resume`, { choice });
+    for (const b of box.querySelectorAll("button")) b.disabled = true;
+    $("runStatus").textContent = "运行中…";
+  } catch (error) { message(error.message, true); }
+}
+
+function makeSSEParser(onFrame) {
+  let buffer = "";
+  return (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const match = /\r?\n\r?\n/.exec(buffer); if (!match) return;
+      const block = buffer.slice(0, match.index); buffer = buffer.slice(match.index + match[0].length);
+      const frame = { event: "message", id: null, data: [] };
+      for (const line of block.split(/\r?\n/)) {
+        if (!line || line.startsWith(":")) continue;
+        const colon = line.indexOf(":"); const field = colon < 0 ? line : line.slice(0, colon);
+        let value = colon < 0 ? "" : line.slice(colon + 1); if (value.startsWith(" ")) value = value.slice(1);
+        if (field === "event") frame.event = value; else if (field === "id") frame.id = value; else if (field === "data") frame.data.push(value);
+      }
+      if (frame.data.length) onFrame({ event: frame.event, id: frame.id, data: frame.data.join("\n") });
+    }
+  };
+}
+
+// Reads the SSE stream with fetch + ReadableStream (EventSource cannot send Authorization). Reconnects with
+// ?after=lastSeq up to 3 times, then falls back to polling /events every 2 s.
+async function followSession(id, signal, handle) {
+  let after = 0, failures = 0, finished = false;
+  const onFrame = (frame) => {
+    let data; try { data = JSON.parse(frame.data); } catch (_) { return; }
+    if (frame.id != null && /^\d+$/.test(frame.id)) after = Number(frame.id);
+    failures = 0;
+    if (frame.event === "done") { finished = true; handle({ type: "done", data }); } else handle({ type: frame.event, data });
+  };
+  while (!finished && failures <= 3 && !signal.aborted) {
+    try {
+      const response = await fetch(`/api/debug/sessions/${encodeURIComponent(id)}/stream?after=${after}`, { headers: authHeaders({ accept: "text/event-stream" }), signal });
+      if (response.status === 401) throw needToken();
+      if (!response.ok) throw await failure(response);
+      const reader = response.body.getReader(); const decoder = new TextDecoder("utf-8"); const parse = makeSSEParser(onFrame);
+      for (;;) { const { done, value } = await reader.read(); if (done) break; parse(decoder.decode(value, { stream: true })); }
+      if (!finished) failures += 1;
+    } catch (error) {
+      if (signal.aborted) return;
+      if (error instanceof AuthError) throw error;
+      failures += 1;
+      await new Promise((resolve) => setTimeout(resolve, 600 * failures));
+    }
+  }
+  if (finished || signal.aborted) return;
+  message("流式连接不可用，已切换为每 2 秒轮询", true);
+  while (!signal.aborted) {
+    const page = await api(`/api/debug/sessions/${encodeURIComponent(id)}/events?after=${after}&limit=500`);
+    for (const event of page.items) { after = event.seq; handle({ type: event.kind === "pause" ? "pause" : "trace", data: event }); }
+    if (page.done) { handle({ type: "done", data: page.final || { status: page.status } }); return; }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+}
+
+async function startRun(mode, step = false) {
+  if (!state.working || state.running) return;
+  if (!accessToken) return message(needToken().message, true);
+  commitFocused();
+  stopStream(); resetResults(); selectTab("result", "log");
+  const body = { mode, source: state.working, key: mode === "debug" ? $("debugKey").value.trim() : "", step: step && mode === "debug", appVersion: $("appVersion").value, timeoutSeconds: 60 };
+  if (mode === "compare") body.original = state.original;
+  setRunning(true); $("runStatus").textContent = "启动中…"; message("");
+  const abort = new AbortController(); state.abort = abort;
+  try {
+    const created = await post("/api/debug/sessions", body);
+    state.session = { id: created.sessionId, mode };
+    $("runStatus").textContent = "运行中…";
+    await followSession(created.sessionId, abort.signal, (item) => handleStream(item, mode));
+  } catch (error) {
+    if (!abort.signal.aborted) { message(error.message, true); $("runStatus").textContent = ""; }
+  } finally {
+    if (state.abort === abort) { state.abort = null; setRunning(false); }
+  }
+}
+function handleStream(item, mode) {
+  if (item.type === "trace" || item.type === "pause") return logLine(item.data);
+  if (item.type !== "done") return;
+  const done = item.data || {};
+  const okText = { pass: "通过", fail: "未通过", needsInteraction: "需要登录/验证", timeout: "超时", cancelled: "已停止", error: "出错" };
+  $("runStatus").textContent = `完成：${okText[done.status] || done.status}`;
+  if (state.lastPauseEl) { for (const b of state.lastPauseEl.querySelectorAll("button")) b.disabled = true; }
+  if (mode === "validate" && done.result) { state.afterResult = done.result; if (!state.beforeResult) state.beforeResult = null; }
+  if (mode === "compare" && done.result) { state.beforeResult = done.result.before; state.afterResult = done.result.after; renderCompare(done.result); selectTab("result", "compare"); }
+  if (state.session) { loadRaw(); if (mode === "debug" && done.status !== "cancelled") loadSuggestions(); }
+}
+async function cancelRun() {
+  if (!state.session || !state.running) return;
+  try { await post(`/api/debug/sessions/${encodeURIComponent(state.session.id)}/cancel`, {}); $("runStatus").textContent = "正在停止…"; }
+  catch (error) { message(error.message, true); }
+}
+function commitFocused() { const el = document.activeElement; if (el && el.blur && el.closest && el.closest("#editorPanels")) el.blur(); }
+
+// ---- raw responses -----------------------------------------------------------------------------------------
+async function loadRaw() {
+  try {
+    const data = await api(`/api/debug/sessions/${encodeURIComponent(state.session.id)}/raw`);
+    state.raw = data.items; const list = $("rawList"); list.replaceChildren();
+    if (!data.items.length) list.append(h("div", { class: "hint", text: "没有保存的响应（请求被拦截或还没发出）" }));
+    for (const item of data.items) {
+      list.append(h("div", { class: "rawitem", "data-id": item.raw_id, onclick: () => showRaw(item.raw_id) },
+        h("span", { class: "badge", text: item.stage || "-" }), `${item.method} ${item.status} · ${item.size}B · ${item.elapsed_ms}ms `, h("div", { class: "hint", text: item.url })));
+    }
+  } catch (error) { message(error.message, true); }
+}
+async function showRaw(rawId) {
+  state.rawSelected = rawId;
+  for (const el of $("rawList").children) el.classList.toggle("on", Number(el.dataset.id) === rawId);
+  try {
+    const entry = await api(`/api/debug/sessions/${encodeURIComponent(state.session.id)}/raw/${rawId}?maxBytes=262144`);
+    $("rawMeta").textContent = `${entry.method} ${entry.status} ${entry.final_url || entry.url} · 字符集 ${entry.charset || "-"} · ${entry.size}B${entry.truncated ? " · 已截断" : ""}`;
+    const headers = (title, map) => `${title}\n${Object.entries(map || {}).map(([k, v]) => `${k}: ${v}`).join("\n") || "(无)"}`;
+    $("rawBody").textContent = `${headers("— 请求头 —", entry.request_headers)}${entry.request_body ? `\n— 请求体 —\n${entry.request_body}` : ""}\n\n${headers("— 响应头 —", entry.response_headers)}\n\n— 响应体 —\n${entry.body || "(空)"}`;
+  } catch (error) { message(error.message, true); }
+}
+
+// ---- suggestions -------------------------------------------------------------------------------------------
+async function loadSuggestions() {
+  const box = $("suggList");
+  try {
+    const data = await post(`/api/debug/sessions/${encodeURIComponent(state.session.id)}/suggestions`, { source: state.working });
+    state.suggestions = data.items; box.replaceChildren(); box.className = "";
+    if (!data.items.length) { box.className = "hint"; box.textContent = "没有发现可以自动修复的问题。"; return; }
+    for (const s of data.items) box.append(renderSuggestion(s));
+  } catch (error) { box.className = "hint"; box.textContent = `修复建议不可用：${error.message}`; }
+}
+function renderSuggestion(s) {
+  const result = h("div", { class: "rt", hidden: true });
+  const apply = h("button", { class: "primary", disabled: !(s.patch && s.patch.length && s.apply_allowed), onclick: () => applySuggestion(s), text: "应用" });
+  const previewButton = (online) => h("button", { onclick: () => previewSuggestion(s, online, result, apply), text: online ? "联网预览（占用一个调试名额）" : "预览" });
+  const buttons = h("div", {});
+  if (s.patch && s.patch.length) buttons.append(...[previewButton(false), s.preview_kind === "online" ? previewButton(true) : null, apply].filter(Boolean));
+  return h("div", { class: "sugg", "data-code": s.code },
+    h("div", {}, h("span", { class: "badge", text: s.code }), h("strong", { text: s.title }), h("span", { class: "hint", text: `  ${s.confidence} · ${s.preview_kind === "none" ? "仅提示" : (s.preview_kind === "online" ? "需联网预览" : "离线预览")}` })),
+    h("div", { class: "hint", text: s.reason }),
+    ...(s.patch || []).map((op) => h("div", { class: "mono hint", text: `${op.path}: ${JSON.stringify(op.old)} → ${JSON.stringify(op.new)}` })),
+    buttons, result);
+}
+async function previewSuggestion(s, online, result, apply) {
+  result.hidden = false; result.className = "rt"; result.textContent = online ? "联网预览中（最长约 1 分钟）…" : "预览中…";
+  try {
+    const data = await post("/api/debug/preview", { sessionId: state.session.id, suggestionId: s.id, source: state.working, online, appVersion: $("appVersion").value });
+    result.className = `rt ${data.ok ? "good" : "bad"}`;
+    result.textContent = `${data.summary || ""}${(data.warnings || []).length ? `\n⚠ ${data.warnings.join("；")}` : ""}`;
+    if (data.apply_allowed) apply.disabled = false;
+  } catch (error) { result.className = "rt bad"; result.textContent = error.message; }
+}
+function applySuggestion(s) {
+  const stale = s.patch.filter((op) => !same(getPath(state.working, op.path), op.old) && !(op.old == null && getPath(state.working, op.path) === undefined));
+  if (stale.length && !confirm(`这条建议基于旧版本的书源（${stale.map((o) => o.path).join("、")} 已经变了），仍要覆盖吗？`)) return;
+  pushUndo();
+  for (const op of s.patch) {
+    const old = getPath(state.working, op.path);
+    if (op.op === "delete") setPath(state.working, op.path, undefined); else setPath(state.working, op.path, op.new);
+    state.changes.push({ path: op.path, old: old ?? null, new: op.op === "delete" ? null : op.new, reason: s.title, origin: `suggestion:${s.code}` });
+  }
+  refreshEditor(); message(`已应用：${s.title}（可以撤销）`);
+}
+
+// ---- diff / compare / export -------------------------------------------------------------------------------
+async function refreshDiff() {
+  if (!state.working) return;
+  const view = $("diffView"); view.replaceChildren(h("div", { class: "hint", text: "计算中…" }));
+  try {
+    const data = await post("/api/debug/diff", { original: state.original, working: state.working });
+    view.replaceChildren();
+    if ($("diffUnified").checked) return view.append(h("pre", { class: "view mono", text: data.unified || "(没有差异)" }));
+    if (!data.changes.length) return view.append(h("div", { class: "hint", text: "没有差异。" }));
+    const show = (v) => (v === null || v === undefined ? "∅" : (typeof v === "string" ? v : JSON.stringify(v)));
+    view.append(h("table", {}, h("tr", {}, h("th", { text: "字段" }), h("th", { text: "原来" }), h("th", { text: "现在" })),
+      ...data.changes.map((c) => h("tr", {}, h("td", { text: c.path }), h("td", { class: "mono", text: c.note || show(c.old) }), h("td", { class: "mono", text: c.note ? "" : show(c.new) })))));
+  } catch (error) { view.replaceChildren(h("div", { class: "bad", text: error.message })); }
+}
+function renderCompare(result) {
+  const box = $("compareView"); box.className = ""; box.replaceChildren();
+  const mark = (v) => (v ? "✓" : "✗");
+  const change = { improved: "变好", regressed: "变差", same: "" };
+  box.append(h("table", {}, h("tr", {}, h("th", { text: "阶段" }), h("th", { text: "修复前" }), h("th", { text: "修复后" }), h("th", { text: "变化" })),
+    ...result.rows.map((r) => h("tr", {}, h("td", { text: r.label }), h("td", { class: r.before ? "ok" : "bad", text: mark(r.before) }), h("td", { class: r.after ? "ok" : "bad", text: mark(r.after) }), h("td", { class: r.change === "improved" ? "ok" : (r.change === "regressed" ? "bad" : ""), text: change[r.change] || "" })))));
+  box.append(h("p", { class: "hint", text: `耗时：修复前 ${result.elapsedMs.before} ms · 修复后 ${result.elapsedMs.after} ms。修复前：${result.before.verdictZh}${result.before.failureReason ? `（${result.before.failureReason}）` : ""}；修复后：${result.after.verdictZh}${result.after.failureReason ? `（${result.after.failureReason}）` : ""}` }));
+}
+function download(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+  const a = h("a", { href: url, download: name }); document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+}
+async function exportFiles() {
+  if (!state.working) return;
+  const codes = []; for (const c of state.changes) { const code = c.origin.startsWith("suggestion:") ? c.origin.slice(11) : "manual"; if (!codes.includes(code)) codes.push(code); }
+  try {
+    const data = await post("/api/debug/export", {
+      entries: [{ original: state.original, working: state.working, changes: state.changes, codes, before: state.beforeResult, after: state.afterResult }],
+      onlyChanged: $("exOnlyChanged").checked, keepSourceUrl: $("exKeepUrl").checked, appVersion: $("appVersion").value,
+    });
+    if (!data.count) return ($("exportInfo").textContent = "没有可导出的内容（书源没有修改）。");
+    download("fixed.json", JSON.stringify(data.sources, null, 2));
+    download("fix-report.json", JSON.stringify(data.fixReport, null, 2));
+    $("exportInfo").textContent = `已下载 fixed.json（${data.count} 条）和 fix-report.json。${state.afterResult ? "" : "提示：还没有「校验此源」结果，报告里没有修复后结论。"}`;
+  } catch (error) { message(error.message, true); }
+}
+
+// ---- wiring ------------------------------------------------------------------------------------------------
+function buildResultTabs() {
+  const tabs = $("resultTabs");
+  for (const [name, label] of [["log", "日志"], ["raw", "原始响应"], ["sugg", "建议"], ["diff", "差异"], ["compare", "对比"], ["export", "导出"]]) {
+    tabs.append(h("button", { class: "tab", role: "tab", "data-tab": name, "aria-selected": name === "log" ? "true" : "false", onclick: () => selectTab("result", name), text: label }));
+  }
+}
+$("saveToken").addEventListener("click", saveToken);
+$("clearToken").addEventListener("click", clearToken);
+$("sourceFile").addEventListener("change", async (e) => { const file = e.target.files[0]; if (file) loadSources(await file.text()); });
+$("loadPaste").addEventListener("click", () => loadSources($("pasteSource").value));
+$("sourceSelect").addEventListener("change", (e) => chooseSource(Number(e.target.value)));
+$("undo").addEventListener("click", undo); $("redo").addEventListener("click", redo); $("reset").addEventListener("click", resetSource);
+$("chipSearch").addEventListener("click", () => setKey(getPath(state.working || {}, "ruleSearch.checkKeyWord") || "我的"));
+$("chipAuto").addEventListener("click", () => setKey(""));
+$("chipInfo").addEventListener("click", () => setKey("https://"));
+$("chipToc").addEventListener("click", () => setKey("++"));
+$("chipContent").addEventListener("click", () => setKey("--"));
+$("chipExplore").addEventListener("change", (e) => { if (e.target.value) setKey(e.target.value); e.target.value = ""; });
+$("btnDebug").addEventListener("click", () => startRun("debug"));
+$("btnStep").addEventListener("click", () => startRun("debug", true));
+$("btnStop").addEventListener("click", cancelRun);
+$("btnValidate").addEventListener("click", () => startRun("validate"));
+$("btnCompare").addEventListener("click", () => startRun("compare"));
+$("btnDiff").addEventListener("click", refreshDiff);
+$("diffUnified").addEventListener("change", refreshDiff);
+$("btnExport").addEventListener("click", exportFiles);
+showTokenState(); renderEditor(); buildResultTabs();
+if (!accessToken) $("tokenBox").open = true;
+</script>
+</body>
+</html>

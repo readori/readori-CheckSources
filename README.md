@@ -170,6 +170,36 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 - 运行器在执行书源代码前去掉宿主域的逃逸入口：宿主 `Function.prototype.constructor`（`constructor.constructor('return process')()`）、`process`、`require`、`console`、`fetch`、`WebSocket`、`Error.prepareStackTrace` 等。Node 权限模型不限制网络，所以这一步同时堵住逃逸后直连内网。
 - 残余风险：`vm` 与宿主共用同一进程与 V8 堆，未知的 V8 / Node 逃逸仍可能执行任意 JS（但无 fs 写 / 子进程 / 环境变量，网络入口已移除）；Node 子进程仍可使用本机 CPU / 内存（每次有超时）；`--block-private-network` 之外的 DNS 解析发生在本机解析器，需要出口防火墙作为最后一道防线。
 
+## 书源工作台（R146）
+
+单个书源的编辑、单步调试、修复建议和修复前后对比。批量验证的参数和行为不变；工作台有三个入口，共用同一套引擎（`validator/debug_engine.py` 等），调试走的链路与批量验证一致，只是开着跟踪。
+
+### 命令行子命令
+
+第一个参数是子命令时进入工作台；否则仍是批量验证（批量参数都以 `--` 开头）。`<file>` 是书源 JSON / JSON5；文件里有多条书源时用 `--source URL|名称`（先精确 URL → 规范化 URL → 精确名称 → 名称子串，歧义会列出候选并退出 2）或 `--index N`（从 0 开始）。`--app-version 1.1.1|1.1.2`（默认 1.1.1）；`--jsonl` 每行输出一个 JSON 事件；`--json` 结束时输出摘要 JSON（单独使用时日志改走 stderr）；`--block-private-network` 拒绝私网地址（默认允许，方便调试本机站点）。
+
+| 子命令 | 用途 | 示例 |
+|---|---|---|
+| `debug` | Legado / App 风格单步调试；`--key` 缺省 = 完整校验，`关键词` / `标题::发现URL` / `详情URL` / `++目录URL` / `--正文URL`；`--step`（终端里在选书 / 选章处暂停）、`--pick-book N`、`--pick-chapter N`、`--timeout 60`、`--save-raw DIR` | `source_validator_cli.py debug sources.json --source 笔趣阁 --key "++https://x/book/1/"` |
+| `test-rule` | 在保存的响应上重放一条规则：`--field ruleSearch.name`、`--rule R`（缺省用书源里的）、`--body-file F`（`-` = stdin）或 `--raw DIR [--raw-id N]`（`debug --save-raw` 的目录）、`--base-url`、`--item N`、`--online`（允许规则内 JS 联网，默认离线） | `source_validator_cli.py test-rule sources.json --field ruleToc.chapterList --raw raw/` |
+| `fix` | 调试 → 建议 → 预览 → 应用 → 导出：`--apply F5,F7` / `--apply-safe`（全部离线且预览通过的）、`--online-preview`、`--revalidate`、`--keep-source-url`、`--out`、`--report`、`--dry-run`（不写任何文件） | `source_validator_cli.py fix sources.json --source 笔趣阁 --apply-safe --revalidate --out fixed.json --report fix-report.json` |
+| `validate-one` | 按批量流水线（快速扫描 → 完整验证 → 稳定复测）校验一个书源：`--quick-timeout 8 --source-timeout 60 --rounds 1`、`--trace`（打印事件）、`--app-version both`（两版各跑一次并给出兼容结论） | `source_validator_cli.py validate-one sources.json --index 3 --trace` |
+| `export` | 导出书源；`--from-report fix-report.json` 把报告里的改动应用到对应书源（按 `originalBookSourceUrl` 匹配），`--only-changed`、`--only-passed`、`--keep-source-url`、`--out` | `source_validator_cli.py export sources.json --from-report fix-report.json --only-changed --out fixed.json` |
+| `rpc` | stdin / stdout JSON-lines 服务，仅供桌面工作台使用 | |
+
+退出码：0 通过 / 规则有结果；1 书源失效或规则结果为空；2 用法或输入错误；3 需要登录 / 验证；4 超时；130 Ctrl+C。
+
+- `fix` 只导出被选中的那一条书源（`<输入>.fixed.json`，或 `--out`）；修复报告 `fix-report.json`（`readori.fix-report/1`）记录每处改动的路径、旧值、新值、原因和修复前后结论。修复过的书源会写入 `// Fixed: <洛杉矶时间> <建议代码>: <原因>` 注释和 `lastUpdateTime`；不会写验证标签。
+- 域名迁移（F1）默认连 `bookSourceUrl` 一起改（它是书源在 App 里的主键，导入后会成为新书源、旧源仍保留；报告里的 `originalBookSourceUrl` 记着旧值）。不想改主键就加 `--keep-source-url`。
+- `--apply` 指定的建议只有在预览通过（或联网类建议未被预览否决）时才会应用；被拒绝的会列出原因。
+- 日志和时间一律使用洛杉矶时区（夏令时由系统时区库处理）。
+
+### 桌面工作台
+
+批量验证器窗口的「书源工作台…」按钮会打开工作台窗口（单例；批量验证运行时也能用）。左：书源列表（名称 / 上次结论 / 耗时，可过滤，导入 / 导出已修改）；中：按 Legado 编辑器分组的字段（基本 / 搜索 / 发现 / 详情 / 目录 / 正文 / JSON），每个规则字段有提示文案和「▶」单字段测试，工具条有撤销 / 重做 / 还原；右：日志、原始响应、规则测试、建议（预览 / 应用）、差异、对比、帮助。顶栏是调试 key 输入和芯片（校验关键字 / 系统 / 发现 / 详情 / ++目录 / --正文）、调试 / 单步 / 停止、校验此源、修复前后对比、App 版本。
+
+工作台自己不加载校验器：它启动一个常驻子进程 `ReadoriSourceValidatorCLI.exe rpc`（开发时是 `python -u source_validator_cli.py rpc`），UI 线程只写请求，后台线程读响应并经 `after()` 回到 UI 线程。「停止」先发取消请求，3 秒内没有结束就强制结束并重启子进程（已编辑的书源会自动恢复）。`python workbench_gui.py --self-test` 可在没有窗口的情况下检查控件树。
+
 ## 与 iOS 验证器的关系
 
 本目录中的 Python 核心是服务器/Windows 侧验证实现；iOS 的 Swift 验证器仍负责 App 内的运行时语义和 UI。两者应通过固定 JSON/响应夹具做差异回归，不应直接复制 Swift 文件到 Windows。

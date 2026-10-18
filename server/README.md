@@ -92,3 +92,49 @@ sudo --preserve-env=READORI_VALIDATOR_API_KEY,READORI_VALIDATOR_HOST,READORI_VAL
 | 日志脱敏 | 事件 / 明细里含 `cookie`、`token`、`password`、`secret`、`api key`、`authorization`、`auth`、`credential`、`session` 的键会被替换为 `[redacted]`；`author` / `authors` / `authority` 不再被误伤。 |
 | 设备门槛 | `detail_is_device_compatible`（搜索 / 详情 / 目录 / 正文四段、章节数、正文预览长度、交互验证、WebView 延迟内容、搜索页落地检查）只在服务器 `device` profile 下生效；命令行与 GUI 没有，三条路径结果可能不同。 |
 | 书源 JS | Node 以权限模型（`--permission`）运行：禁止文件读写（只读运行器临时目录）、子进程、worker、原生模块；环境变量最小化，拿不到服务器令牌；运行前删除 `fetch` / `process` / `require` 等宿主入口。`vm` 与宿主仍同进程，服务器仍应用低权限用户、`ProtectSystem=strict`、限制出口网络运行。 |
+
+## 调试 API（R146 书源工作台）
+
+`server/debug_api.py` 在同一个 FastAPI 应用里加了一组 `/v1/debug/*` 路由，给网页工作台（`cloudflare/public/debug.html`）用：对**一条**书源做单步调试、单源校验、修复前后对比，保存每个请求的原始响应，离线重放单条规则，生成修复建议并预览，导出修复后的书源与 `fix-report.json`。会话只在**内存**里，不写盘、不改 SQLite 表结构；进程重启或会话结束 `READORI_VALIDATOR_DEBUG_TTL` 秒后即消失。
+
+### 鉴权与限额
+
+- 全部路由与批量接口使用同一个 `authorize` 依赖：`x-api-key` 或 `Authorization: Bearer`（未设置 `READORI_VALIDATOR_API_KEY` 时同样不鉴权，只限本机开发）。
+- 请求体限制（读到超限立即 413，不等读完）：单条书源序列化后 ≤ 256 KB；`/test-rule` 的粘贴响应体 ≤ 1 MB；`/export` 请求 ≤ 2 MB、≤ 100 条。
+- 并发：运行中的调试会话与联网预览共用名额，默认 2 个，`amd-micro` 固定 1 个（批量任务运行时也允许）；满了返回 `429 {"error":"debug busy","retryAfter":10}` 并带 `Retry-After`。内存里最多保留 `READORI_VALIDATOR_DEBUG_RETAIN` 个会话（默认 8，amd-micro 为 4），满了先淘汰最旧的已结束会话。
+- 每个会话：事件 ≤ 3000 条（超出后只保留请求 / 阶段 / 结论事件）、原始响应 ≤ 60 条 / 每条 256 KB / 合计 8 MB；调试超时默认 60 秒、上限 90 秒；单步等待选择最多 300 秒。
+- 网络安全：会话线程在 `network_policy_scope(settings.allow_private_network)` 内运行，引擎的 `net_guard` 对每次请求、每一跳重定向都拒绝私网 / 回环 / 链路本地 / 云元数据地址并固定连接 IP，与批量任务一致（默认禁内网；`READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1` 只用于本机夹具）。被拦截的请求显示为 `blocked: non-public address`。
+- 原始响应相当于「持令牌的人可以让服务器抓取公网页面并看到响应」，所以必须带令牌；响应头里的 `cookie` / `authorization` / `token` 等经 `redact` 隐藏，事件流里不带请求 / 响应头（头只在 `/raw/{id}` 里，且已脱敏）。
+
+### 环境变量
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `READORI_VALIDATOR_DEBUG_SESSIONS` | 2（amd-micro 固定 1） | 并发会话数（1–4） |
+| `READORI_VALIDATOR_DEBUG_TIMEOUT` | 60 | 默认超时秒数 |
+| `READORI_VALIDATOR_DEBUG_TIMEOUT_MAX` | 90 | 请求可以要求的最大超时 |
+| `READORI_VALIDATOR_DEBUG_TTL` | 900 | 会话结束后保留秒数 |
+| `READORI_VALIDATOR_DEBUG_RETAIN` | 8（amd-micro 4） | 内存里最多保留的会话数 |
+| `READORI_VALIDATOR_DEBUG_RAW_BYTES` | 262144 | 单条原始响应字节上限 |
+
+### 路由
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /v1/debug/sessions` | `{source, key="", mode:"debug"\|"validate"\|"compare", original?, appVersion:"1.1.1", step:false, timeoutSeconds:60}` → `201 {sessionId, mode, status:"running", expiresAt}`；400 非法参数；413 过大；429 名额已满。`mode=compare` 必须带 `original`。`key` 与 App 调试输入一致：空 = 完整校验，`关键词` / `详情页链接` / `标题::发现链接` / `++目录链接` / `--正文链接`。 |
+| `GET /v1/debug/sessions/{id}` | 会话状态摘要。 |
+| `GET /v1/debug/sessions/{id}/stream?after=0` | SSE：`id: {seq}` + `event: trace\|pause\|done`；`data` 是事件 JSON（只需显示 `text`）。先发 `: connected`，空闲时每 15 秒 `: ping`；支持 `Last-Event-ID`；`done` 帧 `{status, ok, verdict, result}` 后关闭。头：`Cache-Control: no-store`、`X-Accel-Buffering: no`。 |
+| `GET /v1/debug/sessions/{id}/events?after=0&limit=500` | 轮询回退：`{items, done, status, nextAfter}`，结束时多一个 `final`。`status`：`running` / `paused` / `pass` / `fail` / `needsInteraction` / `timeout` / `cancelled` / `error`。 |
+| `POST /v1/debug/sessions/{id}/resume` | `{choice}`：单步模式收到 `pause` 事件后选择第几本书 / 第几章；不在等待时 409。 |
+| `POST /v1/debug/sessions/{id}/cancel` | 停止（最多延迟一次请求）。 |
+| `GET /v1/debug/sessions/{id}/raw` | 已保存响应的列表（不含正文）。 |
+| `GET /v1/debug/sessions/{id}/raw/{rawId}?maxBytes=262144` | 一条响应（正文按字节截断，请求 / 响应头已脱敏）。 |
+| `GET\|POST /v1/debug/sessions/{id}/suggestions` | 修复建议 F1–F8；`GET` 用会话运行时的书源（`?source=working`），`POST {source}` 用编辑后的书源。会话还在运行时 409。 |
+| `POST /v1/debug/test-rule` | `{sessionId?, rawId?, body?, baseUrl?, source, field, rule?, itemIndex?, appVersion}` → 离线重放结果（10 秒上限，超时 504）。优先级：`body` > `rawId` > 该字段所属阶段最近一次成功响应。 |
+| `POST /v1/debug/preview` | `{sessionId, suggestionId, source, online:false, appVersion}`；`online:true` 且建议需要联网预览时占用一个会话名额（满了 429）。 |
+| `POST /v1/debug/diff` | `{original, working}` → `{changes, unified}`。 |
+| `POST /v1/debug/export` | `{entries:[{original, working, changes, codes, before?, after?}], onlyChanged?, onlyPassed?, keepSourceUrl?, appVersion}` → `{sources, fixReport, count}`；导出的书源带 `// Fixed:` 注释和 `lastUpdateTime`，去掉 `__readoriValidation`，不写验证标签。 |
+
+### 升级
+
+新增了 `validator/debug_engine.py`、`rule_tester.py`、`fix_suggester.py`、`source_edit.py` 与 `server/debug_api.py`，**服务器必须重跑 `install_amd_micro.sh`**（或把这些文件一并同步）并重启服务，否则服务无法启动；安装脚本在只检出 `server/` 时会把这些 `validator/` 模块一起下载。安装完成后的 `verify_runtime` 会 `import server.debug_api`，缺文件时安装失败而不是服务起不来。

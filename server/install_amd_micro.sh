@@ -127,8 +127,13 @@ install_os_dependencies() {
 }
 
 bootstrap_minimal_runtime_files() {
-  [ -f "$SOURCE_ROOT/validator/__init__.py" ] && \
-    [ -f "$SOURCE_ROOT/validator/validate_source_packages.py" ] &&     [ -f "$SOURCE_ROOT/validator/app_profiles.py" ] &&     [ -f "$SOURCE_ROOT/validator/net_guard.py" ] &&     [ -f "$SOURCE_ROOT/validator/debug_trace.py" ] && \
+  # Every module server/debug_api.py imports must be here, or the service cannot start (R146).
+  local runtime_modules="__init__ validate_source_packages app_profiles net_guard debug_trace debug_engine rule_tester fix_suggester source_edit"
+  local module missing=0
+  for module in $runtime_modules; do
+    [ -f "$SOURCE_ROOT/validator/$module.py" ] || missing=1
+  done
+  [ "$missing" -eq 0 ] && \
     [ -f "$SOURCE_ROOT/requirements-validate-sources.txt" ] && \
     [ -f "$SOURCE_ROOT/requirements.txt" ] && return
 
@@ -158,11 +163,9 @@ bootstrap_minimal_runtime_files() {
   }
 
   info "Only server/ was checked out; bootstrapping validator runtime files from $SOURCE_REPOSITORY@$SOURCE_REF"
-  fetch_runtime_file validator/__init__.py
-  fetch_runtime_file validator/validate_source_packages.py
-  fetch_runtime_file validator/app_profiles.py
-  fetch_runtime_file validator/net_guard.py
-  fetch_runtime_file validator/debug_trace.py
+  for module in $runtime_modules; do
+    fetch_runtime_file "validator/$module.py"
+  done
   fetch_runtime_file requirements-validate-sources.txt
   fetch_runtime_file requirements.txt
   mkdir -p "$SOURCE_ROOT/validator"
@@ -230,7 +233,15 @@ create_virtualenv() {
     -r "$INSTALL_DIR/server/requirements.txt"
   "$INSTALL_DIR/.venv/bin/python" -m py_compile \
     "$INSTALL_DIR/server/source_validator_server.py" \
-    "$INSTALL_DIR/validator/validate_source_packages.py"     "$INSTALL_DIR/validator/app_profiles.py"     "$INSTALL_DIR/validator/net_guard.py"     "$INSTALL_DIR/validator/debug_trace.py"
+    "$INSTALL_DIR/server/debug_api.py" \
+    "$INSTALL_DIR/validator/validate_source_packages.py" \
+    "$INSTALL_DIR/validator/app_profiles.py" \
+    "$INSTALL_DIR/validator/net_guard.py" \
+    "$INSTALL_DIR/validator/debug_trace.py" \
+    "$INSTALL_DIR/validator/debug_engine.py" \
+    "$INSTALL_DIR/validator/rule_tester.py" \
+    "$INSTALL_DIR/validator/fix_suggester.py" \
+    "$INSTALL_DIR/validator/source_edit.py"
 }
 
 existing_api_key_line() {
@@ -350,7 +361,7 @@ EOF
 }
 
 verify_runtime() {
-  "$INSTALL_DIR/.venv/bin/python" -c 'import requests, quickjs, fastapi; import server.source_validator_server; print("python runtime: ok")'
+  "$INSTALL_DIR/.venv/bin/python" -c 'import requests, quickjs, fastapi; import server.source_validator_server, server.debug_api; print("python runtime: ok")'
   command -v node >/dev/null 2>&1 || die "node is required by JavaScript source rules"
   node --version
   command -v 7z >/dev/null 2>&1 || info "7z is unavailable; RAR/7z source rules will be marked unsupported"

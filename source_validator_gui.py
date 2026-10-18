@@ -155,6 +155,7 @@ class ValidatorApp(tk.Tk):
         self.cancel_button.pack(side="left", padx=(8, 0))
         self.open_button = ttk.Button(actions, text="打开输出目录", command=self._open_output, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="书源工作台…", command=self._open_workbench).pack(side="left", padx=(8, 0))
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
         progress = ttk.Frame(outer)
@@ -364,6 +365,34 @@ class ValidatorApp(tk.Tk):
             self.process.terminate()
         except OSError:
             pass
+
+    def _open_workbench(self) -> None:
+        """R146: single-source editor / step debugger window (its own rpc child process, independent of batch runs)."""
+        existing = getattr(self, "workbench", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        try:
+            from workbench_gui import WorkbenchWindow
+
+            child_command()  # fail early (with the usual message) if the CLI executable is missing
+        except (ImportError, FileNotFoundError) as exc:
+            messagebox.showerror("无法打开书源工作台", str(exc))
+            return
+        input_value = self.file_input_var.get().strip() or self.directory_input_var.get().strip()
+        version = APP_VERSION_CHOICES.get(self.app_version_var.get(), "1.1.1")
+        self.workbench = WorkbenchWindow(
+            self,
+            child_command=child_command,
+            input_path=input_value,
+            app_version="1.1.1" if version == "both" else version,
+            timeouts=(max(1, self.quick_timeout_var.get()), max(1, self.source_timeout_var.get())),
+        )
 
     def _open_output(self) -> None:
         if not self.run_output_dir or not self.run_output_dir.exists():

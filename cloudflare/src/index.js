@@ -1,5 +1,9 @@
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const MAX_PROXY_BODY_BYTES = 64 * 1024 * 1024;
+// R146 workbench: debug request bodies are a book source (<= 256 KB), a pasted response (<= 1 MB) or an export list.
+const MAX_DEBUG_BODY_BYTES = 2 * 1024 * 1024;
+const DEBUG_SESSION_ID = /^[A-Za-z0-9_-]{8,64}$/;
+const DEBUG_RAW_ID = /^\d{1,6}$/;
 
 function corsHeaders(request, env, extra = {}) {
   const configured = String(env.FRONTEND_ORIGIN || "").trim();
@@ -8,9 +12,9 @@ function corsHeaders(request, env, extra = {}) {
   return {
     ...JSON_HEADERS,
     "access-control-allow-origin": origin,
-    "access-control-allow-headers": "authorization, content-type, x-api-key",
+    "access-control-allow-headers": "authorization, content-type, x-api-key, last-event-id",
     "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-expose-headers": "content-length, etag",
+    "access-control-expose-headers": "content-length, etag, retry-after",
     "cache-control": "no-store",
     ...extra,
   };
@@ -66,6 +70,7 @@ function publicJob(row) {
 
 function transformPayload(path, payload) {
   if (!payload || typeof payload !== "object") return payload;
+  if (path.startsWith("/v1/debug/")) return payload; // the workbench API is already in the shape the page expects
   if (path === "/v1/jobs" && payload.job) return { ...payload, job: publicJob(payload.job) };
   if (/^\/v1\/jobs\/[^/]+$/.test(path)) return publicJob(payload);
   if (/\/events$/.test(path) && Array.isArray(payload.items)) {
@@ -107,7 +112,81 @@ const JOB_ACTIONS = {
   resume: ["POST"],
 };
 
-// Returns { path, query, public? } for a known route, { methodNotAllowed: true } for a known path with the
+// --- workbench (R146): /api/debug/* -> /v1/debug/* -------------------------------------------------------
+// Only the routes the debug page uses are forwarded; ids are validated here as well as on the server.
+const DEBUG_SESSION_ACTIONS = {
+  "": ["GET"],
+  stream: ["GET"],
+  events: ["GET"],
+  raw: ["GET"],
+  suggestions: ["GET", "POST"],
+  resume: ["POST"],
+  cancel: ["POST"],
+};
+const DEBUG_POST_ENDPOINTS = new Set(["test-rule", "preview", "diff", "export"]);
+
+function debugUpstream(request, url, parts) {
+  const rest = parts.slice(2);
+  // POST bodies are forwarded without a query string; GET keeps ?after= / ?limit= / ?maxBytes= / ?source=.
+  const query = request.method === "GET" ? url.search : "";
+  if (rest[0] === "sessions") {
+    if (rest.length === 1) {
+      return request.method === "POST" ? { path: "/v1/debug/sessions", query: "", debug: true } : { methodNotAllowed: true };
+    }
+    if (!DEBUG_SESSION_ID.test(rest[1])) return null;
+    const id = encodeURIComponent(rest[1]);
+    const action = rest[2] || "";
+    if (action === "raw" && rest.length === 4) {
+      if (!DEBUG_RAW_ID.test(rest[3])) return null;
+      return request.method === "GET"
+        ? { path: `/v1/debug/sessions/${id}/raw/${rest[3]}`, query, debug: true }
+        : { methodNotAllowed: true };
+    }
+    if (rest.length > 3) return null;
+    const methods = Object.prototype.hasOwnProperty.call(DEBUG_SESSION_ACTIONS, action) ? DEBUG_SESSION_ACTIONS[action] : null;
+    if (!methods) return null;
+    if (!methods.includes(request.method)) return { methodNotAllowed: true };
+    return {
+      path: action ? `/v1/debug/sessions/${id}/${action}` : `/v1/debug/sessions/${id}`,
+      query,
+      debug: true,
+      stream: action === "stream",
+    };
+  }
+  if (rest.length === 1 && DEBUG_POST_ENDPOINTS.has(rest[0])) {
+    return request.method === "POST" ? { path: `/v1/debug/${rest[0]}`, query: "", debug: true } : { methodNotAllowed: true };
+  }
+  return null;
+}
+
+// Reads a request body but gives up (null) as soon as it is bigger than `limit`, even without a content-length.
+async function readBodyBounded(request, limit) {
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (declared > limit) return null;
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      try { await reader.cancel(); } catch { /* the caller gets a 413 either way */ }
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+// Returns { path, query, public?, debug?, stream? } for a known route, { methodNotAllowed: true } for a known path with the
 // wrong method, or null.  `public` marks the only route that needs no access token (health check).
 function upstreamPath(request) {
   const url = new URL(request.url);
@@ -119,6 +198,7 @@ function upstreamPath(request) {
   if (parts[1] === "uploads" && parts.length === 2) {
     return request.method === "POST" ? { path: "/v1/jobs/upload", query: url.search } : { methodNotAllowed: true };
   }
+  if (parts[1] === "debug") return debugUpstream(request, url, parts);
   if (parts[1] !== "jobs") return null;
   if (parts.length === 2) {
     return request.method === "POST" ? { path: "/v1/jobs", query: url.search } : { methodNotAllowed: true };
@@ -186,10 +266,20 @@ async function proxy(request, env, target) {
   headers.delete("authorization"); // the caller's access token stops here
   headers.delete("x-api-key");
   if (!target.public) headers.set("x-api-key", config.token);
-  headers.set("accept", "application/json");
+  headers.set("accept", target.stream ? "text/event-stream" : "application/json");
 
   let body = request.body;
-  if (request.method === "POST" && request.headers.get("content-type")?.includes("application/json")) {
+  if (target.debug) {
+    // Workbench calls: forward the bytes untouched (no JSON parse / re-serialise), but never more than the cap.
+    body = undefined;
+    if (request.method === "POST") {
+      const bytes = await readBodyBounded(request, MAX_DEBUG_BODY_BYTES);
+      if (bytes === null) return textError(request, env, 413, "payload too large");
+      body = bytes;
+      headers.set("content-type", "application/json");
+      headers.delete("content-length");
+    }
+  } else if (request.method === "POST" && request.headers.get("content-type")?.includes("application/json")) {
     const declared = Number(request.headers.get("content-length") || 0);
     if (declared > MAX_PROXY_BODY_BYTES) return textError(request, env, 413, "payload too large");
     try {
@@ -214,13 +304,23 @@ async function proxy(request, env, target) {
   const upstreamURL = new URL(`${config.base.toString().replace(/\/$/, "")}${target.path}${target.query}`);
   let response;
   try {
-    response = await fetch(upstreamURL, { method: request.method, headers, body, redirect: "manual" });
+    const init = { method: request.method, headers, body, redirect: "manual" };
+    if (target.stream && request.signal) init.signal = request.signal; // browser went away -> stop the upstream stream
+    response = await fetch(upstreamURL, init);
   } catch (error) {
     console.error("validator server proxy failed", error instanceof Error ? error.message : String(error));
     return textError(request, env, 502, "validator server unavailable");
   }
 
   const contentType = response.headers.get("content-type") || "application/json; charset=utf-8";
+  if (target.debug) {
+    // Workbench responses (JSON and the SSE stream) pass through as a stream: never parsed, never buffered.
+    const extra = { "content-type": contentType };
+    const retryAfter = response.headers.get("retry-after");
+    if (retryAfter) extra["retry-after"] = retryAfter;
+    if (contentType.includes("text/event-stream")) extra["x-accel-buffering"] = "no";
+    return new Response(response.body, { status: response.status, headers: corsHeaders(request, env, extra) });
+  }
   if (!contentType.includes("json")) {
     return new Response(response.body, { status: response.status, headers: corsHeaders(request, env, { "content-type": contentType }) });
   }

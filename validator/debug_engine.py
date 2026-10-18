@@ -496,7 +496,8 @@ def render_event(event: dict[str, Any], session: Any = None) -> str:
             mark = "⚠ " if kind == "warn" else "ⓘ "
             lines = [mark + str(value or code or "")]
     elif kind == "error":
-        lines = [f"✗ {value or ''}"]
+        text = str(value or "")
+        lines = [text if text.startswith(("✗", "✓")) else f"✗ {text}"]
     elif kind == "log":
         lines = [f"[log] {_one_line(value, 500)}"]
     elif kind == "pause":
@@ -521,7 +522,7 @@ def render_event(event: dict[str, Any], session: Any = None) -> str:
             lines = ["■ 已停止"]
         else:
             text = str(value or "")
-            lines = [text if text.startswith("︽") else (("✓ " if ok else "✗ ") + text)]
+            lines = [text if text.startswith(("︽", "✓", "✗")) else (("✓ " if ok else "✗ ") + text)]
     elif value not in (None, ""):
         lines = [str(value)]
 
