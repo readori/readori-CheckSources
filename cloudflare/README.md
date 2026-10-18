@@ -11,7 +11,7 @@
                                                     └─ 单并发验证核心
 ```
 
-AMD Micro 只有 1GB RAM，服务固定 `workers=1`、每域名并发 1、最多两轮稳定性复测。Worker 保存 `VALIDATOR_SERVER_TOKEN`，浏览器不会接触服务器 API token。
+AMD Micro 只有 1GB RAM，服务固定 `workers=1`、每域名并发 1、最多两轮稳定性复测。Worker 保存 `VALIDATOR_SERVER_TOKEN`，浏览器不会接触服务器 API token；浏览器只持有访问令牌 `READORI_VALIDATOR_ACCESS_TOKEN`，且只有访问令牌校验通过的请求才会被注入服务器 token。
 
 ## AMD Micro 安装
 
@@ -45,10 +45,13 @@ journalctl -u readori-source-validator.service -n 50 --no-pager
 ```bash
 # Put the AMD Micro HTTPS URL in wrangler.toml [vars].
 npx wrangler secret put VALIDATOR_SERVER_TOKEN
+npx wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN   # 必填：控制台访问令牌（长随机字符串，例如 openssl rand -hex 32）
 npx wrangler deploy
 ```
 
-`VALIDATOR_SERVER_URL` 必须是 AMD Micro 的 HTTPS 主机名，本项目默认使用 `https://syyz-api.readori.com`；不能填写裸 IPv4/IPv6 地址，也不能填写前端 Worker 的 `syyz.readori.com`；`VALIDATOR_SERVER_TOKEN` 必须等于服务器的 `READORI_VALIDATOR_API_KEY`。Worker 公共页面不要求用户输入 API key，但服务器 token 只保存在 Worker secret 和服务器的 0600 环境文件中。请在 Cloudflare DNS 中为后端主机创建 A/AAAA 记录，并在 AMD Micro 上用 Caddy/Nginx 配置该主机名的公信 TLS 证书后反代到 `127.0.0.1:8787`。
+**未设置 `READORI_VALIDATOR_ACCESS_TOKEN` 时 Worker 对所有受保护接口返回 503（`未配置访问令牌`），不会以开放模式运行。**
+
+`VALIDATOR_SERVER_URL` 必须是 AMD Micro 的 HTTPS 主机名，本项目默认使用 `https://syyz-api.readori.com`；不能填写裸 IPv4/IPv6 地址，也不能填写前端 Worker 的 `syyz.readori.com`；`VALIDATOR_SERVER_TOKEN` 必须等于服务器的 `READORI_VALIDATOR_API_KEY`。控制台页面要求填写访问令牌（页面里的“访问令牌”输入框，保存在本浏览器 localStorage，可点“清除令牌”删除）；服务器 token 只保存在 Worker secret 和服务器的 0600 环境文件中，访问令牌与服务器 token 是两个不同的值，不要设成相同。请在 Cloudflare DNS 中为后端主机创建 A/AAAA 记录，并在 AMD Micro 上用 Caddy/Nginx 配置该主机名的公信 TLS 证书后反代到 `127.0.0.1:8787`。
 
 用户访问入口固定为 [`https://syyz.readori.com/`](https://syyz.readori.com/)，接口健康检查为 [`https://syyz.readori.com/api/healthz`](https://syyz.readori.com/api/healthz)。Cloudflare 控制台中已经绑定该 Custom Domain 时，重新部署同一 Worker 即可；不要再为同一主机添加 `/*` Route。
 
@@ -64,10 +67,15 @@ npx wrangler deploy
 
 服务器 API 使用本地 `JobStore` 的 SQLite WAL 模式，进程重启后会自动恢复 queued/running/resuming 任务。详细阶段和结果不再写入 D1/R2。
 
-## 公网使用边界
+## 访问控制与公网使用边界
 
-控制台是公开的，任何人都可以创建验证任务；因此必须在 Caddy/Nginx 或 Cloudflare WAF 设置 IP 限流、上传大小限制和任务频率限制。单台 AMD Micro 只适合单并发，不能通过提高线程数提速；需要更高吞吐时应增加第二台服务器，而不是提高 1GB 实例并发。
+- `/api/healthz` 是唯一免令牌接口（只返回服务状态，不带服务器 token）。其余 `/api/*`（创建 / 上传 / 查看 / 事件 / 来源 / 结果 / 取消 / 恢复）都要求 `Authorization: Bearer <READORI_VALIDATOR_ACCESS_TOKEN>`：缺失或错误返回 401，令牌用 SHA-256 摘要做常量时间比较；通过后 Worker 丢弃调用者的 `Authorization` / `Cookie` / `x-api-key`，再注入服务器 token。
+- Worker 只放行已知路由和方法（未知路径 404，方法不符 405），并且会删除 `/api/jobs` 请求体里的 `input_path` / `inputPath`，调用者无法借 Worker 读取服务器文件。
+- 轮换访问令牌：`npx wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN` 重新写入即可，旧令牌立刻失效，无需重新部署。
+- 令牌属于受信任的验证人员；书源 JS 在服务器执行，泄露令牌等于允许对方让服务器访问任意网址并运行脚本。令牌一旦外泄必须立即轮换。
+
+即使有令牌，仍应在 Caddy/Nginx 或 Cloudflare WAF 设置 IP 限流、上传大小限制和任务频率限制（401 重试也应限速以防暴力猜测）。单台 AMD Micro 只适合单并发，不能通过提高线程数提速；需要更高吞吐时应增加第二台服务器，而不是提高 1GB 实例并发。
 
 ## 部署工作流
 
-`test-env-setup` 仓库的部署工作流仍只接受 `workflow_dispatch`。它只部署 Worker/Pages 并写入 `VALIDATOR_SERVER_URL`、`VALIDATOR_SERVER_TOKEN`，不再解析、创建或迁移 D1，也不需要 `CLOUDFLARE_D1_DATABASE_ID`、D1 权限或 Queue 权限。
+`test-env-setup` 仓库的部署工作流仍只接受 `workflow_dispatch`。它只部署 Worker/Pages 并写入 `VALIDATOR_SERVER_URL`、`VALIDATOR_SERVER_TOKEN`、`READORI_VALIDATOR_ACCESS_TOKEN`（三者在 production 环境缺一不可，缺访问令牌时部署前检查失败），不再解析、创建或迁移 D1，也不需要 `CLOUDFLARE_D1_DATABASE_ID`、D1 权限或 Queue 权限。

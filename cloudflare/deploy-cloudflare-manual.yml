@@ -30,6 +30,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
       VALIDATOR_SERVER_URL: ${{ secrets.VALIDATOR_SERVER_URL || vars.VALIDATOR_SERVER_URL || 'https://syyz-api.readori.com' }}
       VALIDATOR_SERVER_TOKEN: ${{ secrets.VALIDATOR_SERVER_TOKEN }}
+      READORI_VALIDATOR_ACCESS_TOKEN: ${{ secrets.READORI_VALIDATOR_ACCESS_TOKEN }}
       FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN || vars.FRONTEND_ORIGIN }}
       DEPLOY_MODE: ${{ inputs.mode }}
     steps:
@@ -45,14 +46,17 @@ jobs:
           [ -n "${VALIDATOR_SERVER_URL:-}" ] || missing+=(VALIDATOR_SERVER_URL)
           if [ "${DEPLOY_MODE}" != "dry-run" ]; then
             [ -n "${VALIDATOR_SERVER_TOKEN:-}" ] || missing+=(VALIDATOR_SERVER_TOKEN)
+            # Without the console access token the Worker answers 503 to every protected route.
+            [ -n "${READORI_VALIDATOR_ACCESS_TOKEN:-}" ] || missing+=(READORI_VALIDATOR_ACCESS_TOKEN)
           fi
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Missing deployment secrets/variables: ${missing[*]}"
-            echo "::error::D1/R2/Queue credentials are no longer used. Configure VALIDATOR_SERVER_URL and VALIDATOR_SERVER_TOKEN instead."
+            echo "::error::D1/R2/Queue credentials are no longer used. Configure VALIDATOR_SERVER_URL, VALIDATOR_SERVER_TOKEN and READORI_VALIDATOR_ACCESS_TOKEN instead."
             exit 1
           fi
           echo "::add-mask::$CLOUDFLARE_API_TOKEN"
           [ -z "${VALIDATOR_SERVER_TOKEN:-}" ] || echo "::add-mask::$VALIDATOR_SERVER_TOKEN"
+          [ -z "${READORI_VALIDATOR_ACCESS_TOKEN:-}" ] || echo "::add-mask::$READORI_VALIDATOR_ACCESS_TOKEN"
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v5
@@ -92,6 +96,7 @@ jobs:
         run: |
           npx wrangler deploy --config wrangler-ci.toml
           printf '%s' "$VALIDATOR_SERVER_TOKEN" | npx wrangler secret put VALIDATOR_SERVER_TOKEN --config wrangler-ci.toml
+          printf '%s' "$READORI_VALIDATOR_ACCESS_TOKEN" | npx wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN --config wrangler-ci.toml
 
       - name: Summary
         if: always()
@@ -103,4 +108,5 @@ jobs:
             echo '- R2: **not used**'
             echo '- Queue: **not used**'
             echo '- AMD Micro: local FastAPI + SQLite server'
+            echo '- Access: every /api/* route except /api/healthz requires the READORI_VALIDATOR_ACCESS_TOKEN bearer token'
           } >> "$GITHUB_STEP_SUMMARY"

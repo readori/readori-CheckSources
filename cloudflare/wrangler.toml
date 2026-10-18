@@ -18,3 +18,9 @@ not_found_handling = "single-page-application"
 VALIDATOR_SERVER_URL = "https://syyz-api.readori.com"
 PUBLIC_CONTROL_PLANE = "true"
 FRONTEND_ORIGIN = "https://syyz.readori.com"
+
+# Secrets (never put these in [vars]; set them with `wrangler secret put`):
+#   VALIDATOR_SERVER_TOKEN          backend API key the Worker injects (must equal READORI_VALIDATOR_API_KEY on the server)
+#   READORI_VALIDATOR_ACCESS_TOKEN  console access token; every /api/* route except /api/healthz requires
+#                                   `Authorization: Bearer <token>`. When it is not set the Worker answers 503
+#                                   (fail closed) instead of running open.

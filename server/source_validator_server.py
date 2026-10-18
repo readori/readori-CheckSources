@@ -30,13 +30,14 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 from validator import app_profiles
+from validator import net_guard
 from validator import validate_source_packages as core
 
 try:  # FastAPI is optional for the Windows one-file validator.
@@ -48,12 +49,18 @@ except ImportError:  # pragma: no cover - exercised only without server extras
     Depends = FastAPI = File = Form = HTTPException = Query = UploadFile = None  # type: ignore[assignment]
     Request = JSONResponse = BaseModel = Field = None  # type: ignore[assignment,misc]
 
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+# multipart framing (boundaries, headers, the config field) on top of the file itself
+BODY_OVERHEAD_BYTES = 1024 * 1024
+
 
 LOG = logging.getLogger("readori.validator.server")
+# ``auth`` must not match book metadata such as ``author`` / ``authors`` / ``authority``.
 SENSITIVE_KEY_RE = re.compile(
-    r"(?:cookie|token|password|passwd|secret|api[-_]?key|authorization|auth|credential|session)",
+    r"(?:cookie|token|password|passwd|secret|api[-_]?key|authorization|auth(?!or)(?!ority)|credential|session)",
     re.I,
 )
+NET_GUARD_CACHE_SECONDS = 300.0
 
 
 def _safe_count(value: Any) -> int:
@@ -86,6 +93,16 @@ class ServerSettings:
     default_domain_concurrency: int = 2
     max_upload_bytes: int = 64 * 1024 * 1024
     amd_micro: bool = False
+    # R145a: sources whose hosts resolve to private/loopback/link-local/metadata addresses are refused unless the
+    # operator opts in (READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1, local development only).
+    allow_private_network: bool = False
+
+    def input_root(self) -> Path:
+        """Directory ``input_path`` must stay inside: the configured root, else ``<data dir>/inputs``."""
+
+        if self.allowed_input_root is not None:
+            return Path(self.allowed_input_root).expanduser().resolve()
+        return (Path(self.db_path).expanduser().resolve().parent / "inputs").resolve()
 
     @classmethod
     def from_env(cls) -> "ServerSettings":
@@ -109,6 +126,7 @@ class ServerSettings:
             default_domain_concurrency=configured_domain_concurrency,
             max_upload_bytes=_env_int("READORI_VALIDATOR_MAX_UPLOAD_BYTES", 64 * 1024 * 1024, 1_024, 512 * 1024 * 1024),
             amd_micro=amd_micro,
+            allow_private_network=net_guard.allow_private_from_env(),
         )
 
 
@@ -155,6 +173,23 @@ def source_domain(source: dict[str, Any]) -> str:
             if host:
                 return host
     return "unknown"
+
+
+def source_hosts(source: dict[str, Any], limit: int = 8) -> list[str]:
+    """Distinct hosts a source will contact first (site, search and explore URLs)."""
+
+    hosts: list[str] = []
+    for key in ("bookSourceUrl", "searchUrl", "exploreUrl"):
+        for match in re.finditer(r"https?://[^\s'\"<>`{},]+", str(source.get(key) or ""), re.I):
+            try:
+                host = (urlparse(match.group(0)).hostname or "").lower()
+            except ValueError:
+                host = ""
+            if host and host not in hosts:
+                hosts.append(host)
+            if len(hosts) >= limit:
+                return hosts
+    return hosts
 
 
 def prepare_source_groups(sources: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -428,6 +463,43 @@ class JobStore:
             connection.commit()
             return result.rowcount > 0
 
+    def cancel_queued(self, job_id: str) -> bool:
+        """Cancel a job that has not started yet.  Takes effect immediately and cannot be lost.
+
+        A queued job is not polling its cancel flag, and the worker used to clear the flag when it started, so
+        the old flag-only cancel could vanish.  Marking the job cancelled here lets ``begin_run`` skip it.
+        """
+
+        with self._lock, self._connection() as connection:
+            result = connection.execute(
+                "UPDATE jobs SET status='cancelled', stage='cancelled', cancel_requested=0, updated_at=? WHERE id=? AND status='queued'",
+                (utc_now(), job_id),
+            )
+            connection.commit()
+            return result.rowcount > 0
+
+    def begin_run(self, job_id: str) -> bool:
+        """Atomically move a startable job to running; False when it was cancelled/finished meanwhile."""
+
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT status, cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or str(row["status"]) not in {"queued", "resuming", "running"}:
+                return False
+            if int(row["cancel_requested"] or 0):
+                # A cancel that arrived before the worker picked the job up (or before a restart) still counts.
+                connection.execute(
+                    "UPDATE jobs SET status='cancelled', stage='cancelled', cancel_requested=0, updated_at=? WHERE id=?",
+                    (utc_now(), job_id),
+                )
+                connection.commit()
+                return False
+            connection.execute(
+                "UPDATE jobs SET status='running', stage='dedupe', progress=0.0, error='', updated_at=? WHERE id=?",
+                (utc_now(), job_id),
+            )
+            connection.commit()
+            return True
+
     def clear_cancel(self, job_id: str) -> None:
         self.update_job(job_id, cancel_requested=0, error="")
 
@@ -467,8 +539,10 @@ class ValidationService:
         self._jobs = ThreadPoolExecutor(max_workers=self.settings.max_jobs, thread_name_prefix="readori-job")
         self._active: set[str] = set()
         self._active_lock = threading.Lock()
-        self._domain_limits: dict[str, threading.BoundedSemaphore] = {}
+        self._domain_limits: dict[str, tuple[int, threading.BoundedSemaphore]] = {}
         self._domain_lock = threading.Lock()
+        self._net_cache: dict[str, tuple[float, str]] = {}
+        self._net_lock = threading.Lock()
         for job_id in self.store.jobs_to_resume():
             self.submit(job_id)
 
@@ -528,12 +602,43 @@ class ValidationService:
         return config
 
     def _domain_slot(self, domain: str, limit: int) -> threading.BoundedSemaphore:
+        """One semaphore per domain, rebuilt only when the requested capacity changes.
+
+        The old check compared the semaphore's *free* permits with the limit, so a busy slot (fewer free permits
+        than its capacity) kept the stale capacity and a lowered limit was never applied.  Capacity is now stored
+        next to the semaphore.  Holders of a replaced semaphore release into the old object, so nothing leaks.
+        """
+
+        limit = max(1, int(limit))
         with self._domain_lock:
-            slot = self._domain_limits.get(domain)
-            if slot is None or getattr(slot, "_value", limit) > limit:
-                slot = threading.BoundedSemaphore(limit)
-                self._domain_limits[domain] = slot
-            return slot
+            entry = self._domain_limits.get(domain)
+            if entry is None or entry[0] != limit:
+                entry = (limit, threading.BoundedSemaphore(limit))
+                self._domain_limits[domain] = entry
+            return entry[1]
+
+    def _blocked_network_reason(self, source: dict[str, Any]) -> str:
+        """Non-empty when a source's first-contact hosts resolve to non-public addresses (SSRF guard)."""
+
+        if self.settings.allow_private_network:
+            return ""
+        now = time.monotonic()
+        for host in source_hosts(source):
+            with self._net_lock:
+                cached = self._net_cache.get(host)
+            if cached is not None and cached[0] > now:
+                reason = cached[1]
+            else:
+                # Unresolvable hosts are left to the engine (it fails with a connectivity error); only addresses
+                # that resolve to private space are refused here.
+                _, reason = net_guard.check_host_allowed(host, False, fail_closed_on_dns_error=False)
+                with self._net_lock:
+                    if len(self._net_cache) > 4096:
+                        self._net_cache.clear()
+                    self._net_cache[host] = (now + NET_GUARD_CACHE_SECONDS, reason)
+            if reason:
+                return f"{host}: {reason}"
+        return ""
 
     @staticmethod
     def _retryable(result: StageResult) -> bool:
@@ -564,6 +669,14 @@ class ValidationService:
             source = json.loads(str(selected or "{}"))
         except json.JSONDecodeError:
             source = {}
+        blocked = self._blocked_network_reason(source) if isinstance(source, dict) else ""
+        if blocked:
+            return StageResult(
+                False,
+                None,
+                {"pipelineStage": stage, "failureReason": "blocked: non-public address"},
+                f"blocked: non-public address ({blocked})",
+            )
         domain = source_domain(source)
         slot = self._domain_slot(domain, domain_limit)
         with slot:
@@ -675,15 +788,16 @@ class ValidationService:
         job = self.store.job(job_id)
         if not job:
             return
-        if job.get("status") == "completed":
+        if job.get("status") in {"completed", "cancelled"}:
             return
         config = self._load_config(job)
+        # Atomic start: a job cancelled while it was queued stays cancelled instead of having its flag cleared here.
+        if not self.store.begin_run(job_id):
+            return
         rows = self.store.all_sources(job_id)
         if not rows:
             self.store.update_job(job_id, status="failed", stage="failed", error="no sources")
             return
-        self.store.clear_cancel(job_id)
-        self.store.update_job(job_id, status="running", stage="dedupe", progress=0.0, error="")
         self.store.event(job_id, "info", "dedupe", f"dedupe complete: {len(rows)} unique source groups")
 
         quick_seeds: dict[str, dict[str, Any]] = {}
@@ -820,6 +934,9 @@ class ValidationService:
         return self.submit(job_id)
 
     def cancel(self, job_id: str) -> bool:
+        if self.store.cancel_queued(job_id):
+            self.store.event(job_id, "info", "cancelled", "cancelled while queued; it will not start")
+            return True
         changed = self.store.request_cancel(job_id)
         if changed:
             self.store.event(job_id, "info", "cancelling", "cancellation requested; in-flight requests finish at their bounded timeout")
@@ -882,6 +999,53 @@ def _payload_sources(payload: Any) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+class BodyLimitMiddleware:
+    """Pure-ASGI request body cap that aborts while the body is still arriving.
+
+    Starlette parses multipart bodies *before* the endpoint runs, so a size check in the endpoint only fires after
+    the whole upload has been received and spooled.  This wrapper refuses an oversized ``Content-Length`` up front
+    and counts bytes for chunked / lying clients, answering 413 as soon as the cap is crossed.
+    """
+
+    def __init__(self, app: Any, max_bytes: int):
+        self.app = app
+        self.max_bytes = max(1, int(max_bytes))
+
+    @staticmethod
+    async def _reject(scope: Any, receive: Any, send: Any, max_bytes: int) -> None:
+        response = JSONResponse({"detail": f"request body is too large (limit {max_bytes} bytes)"}, status_code=413)
+        await response(scope, receive, send)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = None
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = None
+                break
+        if declared is not None and declared > self.max_bytes:
+            await self._reject(scope, receive, send, self.max_bytes)
+            return
+        received = 0
+
+        async def limited_receive() -> Any:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self.max_bytes:
+                    # HTTPException passes through FastAPI's body parsing untouched and becomes a 413 response.
+                    raise HTTPException(status_code=413, detail=f"request body is too large (limit {self.max_bytes} bytes)")
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
 def create_app(settings: ServerSettings | None = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("服务器依赖未安装，请执行 pip install -r server/requirements.txt")
@@ -897,6 +1061,7 @@ def create_app(settings: ServerSettings | None = None) -> Any:
     app = FastAPI(title="Readori Source Validation Service", version="1.0", lifespan=lifespan)
     app.state.validation_service = service
     app.state.validation_settings = runtime_settings
+    app.add_middleware(BodyLimitMiddleware, max_bytes=runtime_settings.max_upload_bytes + BODY_OVERHEAD_BYTES)
 
     def authorize(request: Request) -> None:
         configured = runtime_settings.api_key
@@ -912,11 +1077,24 @@ def create_app(settings: ServerSettings | None = None) -> Any:
             raise HTTPException(status_code=401, detail="invalid API key")
 
     def load_input_path(path_text: str) -> tuple[list[dict[str, Any]], str]:
-        path = Path(path_text).expanduser().resolve()
-        if runtime_settings.allowed_input_root is not None and not path.is_relative_to(runtime_settings.allowed_input_root):
-            raise HTTPException(status_code=403, detail="input path is outside READORI_VALIDATOR_INPUT_ROOT")
+        # Always confined to a root (READORI_VALIDATOR_INPUT_ROOT, default <data dir>/inputs).  Relative paths are
+        # taken relative to the root; resolve() collapses ``..`` and follows symlinks, so the containment check
+        # below judges where the file really lives.
+        root = runtime_settings.input_root()
+        try:
+            candidate = Path(path_text)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            path = candidate.resolve()
+        except (OSError, ValueError, RuntimeError):
+            raise HTTPException(status_code=400, detail="invalid input path") from None
+        if path != root and not path.is_relative_to(root):
+            raise HTTPException(status_code=403, detail="input path is outside the allowed input directory")
         if not path.exists():
             raise HTTPException(status_code=400, detail="input path does not exist")
+        if not path.is_file():
+            # Directories are not accepted: a symlink inside one could point outside the root.
+            raise HTTPException(status_code=400, detail="input path must be a JSON file")
         try:
             sources, names = core.load_sources_from_paths([path])
         except Exception as exc:
@@ -949,9 +1127,17 @@ def create_app(settings: ServerSettings | None = None) -> Any:
 
     @app.post("/v1/jobs/upload", dependencies=[Depends(authorize)])
     async def upload_job(file: UploadFile = File(...), config: str = Form("{}")) -> dict[str, Any]:
-        body = await file.read(runtime_settings.max_upload_bytes + 1)
-        if len(body) > runtime_settings.max_upload_bytes:
-            raise HTTPException(status_code=413, detail="upload is too large")
+        # Read in chunks and stop at the first byte over the limit instead of buffering the whole upload first.
+        limit = runtime_settings.max_upload_bytes
+        buffer = bytearray()
+        while True:
+            chunk = await file.read(min(UPLOAD_CHUNK_BYTES, limit + 1 - len(buffer)))
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            if len(buffer) > limit:
+                raise HTTPException(status_code=413, detail="upload is too large")
+        body = bytes(buffer)
         try:
             sources = _payload_sources(json.loads(body.decode("utf-8-sig")))
             config_model = JobConfigModel.model_validate(json.loads(config or "{}")) if hasattr(JobConfigModel, "model_validate") else JobConfigModel.parse_obj(json.loads(config or "{}"))
@@ -1031,16 +1217,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     settings = ServerSettings.from_env()
     if args.db is not None or args.api_key is not None:
-        settings = ServerSettings(
+        settings = replace(
+            settings,
             db_path=(args.db or settings.db_path).expanduser().resolve(),
             api_key=settings.api_key if args.api_key is None else args.api_key,
-            allowed_input_root=settings.allowed_input_root,
-            max_sources=settings.max_sources,
-            max_workers=settings.max_workers,
-            max_jobs=settings.max_jobs,
-            default_domain_concurrency=settings.default_domain_concurrency,
-            max_upload_bytes=settings.max_upload_bytes,
-            amd_micro=settings.amd_micro,
         )
     if FastAPI is None:
         print("服务器依赖未安装，请执行 pip install -r server/requirements.txt")

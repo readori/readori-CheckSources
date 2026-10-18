@@ -78,6 +78,17 @@ GUI 里的“App 版本”下拉框对应这三种模式（1.1.1（当前公开�
 
 默认版本是 1.1.1；1.1.2 正式上架当天才把 `validator/app_profiles.py` 的 `DEFAULT_APP_VERSION` 改成 1.1.2（同步守卫），不要提前改。
 
+## 判定规则（与 App 对齐）
+
+验证结论以 Readori App 的实际行为为准：**非空规则的结果原样使用**。
+
+- 正文 / 目录 / 详情 / 搜索的兜底与启发式只在对应规则为空时运行；规则写了但没命中，该阶段就失败，不再靠整页文本、链接猜测、JSON 键猜测或书源名救回。
+- 请求只发一次，使用书源自带 Header；不会换默认浏览器 Header 重试。空响应时「无 Cookie 新 Session」重试只用于规则为空且开启 cookie jar 的源；`enabledCookieJar=false` 不保存 Set-Cookie；每个书源独立 Session。
+- 文字书源正文规则为空判失败（App 会把章节网址当正文显示）；音频 / 图片书源除外。replaceRegex 或 `##` 把正文清空判失败。
+- 执行 `ruleSearch.init`（与 App 一致）；无法识别的规则不再按原文返回。
+- 网络错误不再吞掉：failureReason 为 `network error: dns / tls / timed out / connection refused / connection reset / too many redirects / http NNN`，`detail.networkError` 含阶段、类别、URL、状态码。
+- 最终正文门槛（去空白后 30 字 / 信号 15）比 App 的「非空即可」略严，用来排除「请登录」之类的占位页。
+
 ## 生成独立 EXE
 
 在联网的 Windows 电脑上运行：
@@ -110,7 +121,7 @@ Release ZIP 内含 `ReadoriSourceValidator.exe`、`ReadoriSourceValidatorCLI.exe
 
 ## 服务器验证服务
 
-服务器版位于 `server/`，网页只负责提交任务和读取进度，实际请求与 Legado 规则解析在后台 worker 执行。它使用 SQLite WAL 保存去重结果、四阶段检查点、事件日志和可恢复任务，并提供每域名并发限制、瞬时网络失败重试及设备兼容性门槛；Cloudflare 控制台按公开模式运行，不要求用户输入 API key：
+服务器版位于 `server/`，网页只负责提交任务和读取进度，实际请求与 Legado 规则解析在后台 worker 执行。它使用 SQLite WAL 保存去重结果、四阶段检查点、事件日志和可恢复任务，并提供每域名并发限制、瞬时网络失败重试及设备兼容性门槛；Cloudflare 控制台要求填写访问令牌（见下文“安全与部署”），服务器 API key 只保存在 Worker secret 里：
 
 ```powershell
 python -m pip install -r .\server\requirements.txt
@@ -142,6 +153,14 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 运行依赖见 `requirements-validate-sources.txt`。QuickJS、Node.js、py7zr、rarfile 和 cryptography 用于增强兼容性；缺失时对应能力会降级或标记失败。RAR 解包通常还需要系统安装 7-Zip/UnRAR。
 
 书源内嵌 JavaScript 属于不可信输入。服务器部署时应放在隔离容器、限制 CPU/内存/网络和文件访问，禁止把 Cookie、API Key 等秘密写入报告或日志。
+
+### 安全与部署（R145a）
+
+- Cloudflare Worker 对除 `/api/healthz` 以外的所有 `/api/*` 接口要求 `Authorization: Bearer <READORI_VALIDATOR_ACCESS_TOKEN>`；只有鉴权通过才会给转发请求注入服务器 token。Worker 未配置该 secret 时返回 503（fail closed）。上线前必须先 `wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN`，并在 GitHub 的 production 环境配置同名 secret（手动 workflow 才会部署，见 `cloudflare/README.md`）。
+- 服务器 `input_path` 永远限定在 `READORI_VALIDATOR_INPUT_ROOT`；未设置时为服务数据目录（SQLite 所在目录）下的 `inputs/` 子目录，`..` 与符号链接都会按真实位置判定。
+- 服务器拒绝首个请求地址落在私网 / 回环 / 链路本地 / 云元数据地址的书源（解析 DNS 后检查所有地址）；本地开发需要访问 127.0.0.1 夹具时设置 `READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1`。`validator/net_guard.py` 是可复用的纯函数模块（`is_public_address` / `check_url_allowed`）。验证引擎自己发出的请求（`fetch_text`、JS `ajax`、重定向）目前还没有接入该过滤，仍需后续在引擎里调用。
+- 设备兼容性门槛 `detail_is_device_compatible` 只在服务器的 `device` profile 下生效；命令行与 GUI 没有这道门槛，三条路径对同一书源的结果可能不同。
+- 书源 JS 在 Node `vm` 中执行，不是安全沙箱，仍需依赖服务器隔离（低权限用户、systemd 限制、无内网出口）。
 
 ## 与 iOS 验证器的关系
 

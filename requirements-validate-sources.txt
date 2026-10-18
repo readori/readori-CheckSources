@@ -6,3 +6,4 @@ py7zr
 quickjs
 rarfile
 requests
+tzdata; sys_platform == "win32"

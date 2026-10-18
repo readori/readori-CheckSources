@@ -55,6 +55,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID || vars.CLOUDFLARE_D1_DATABASE_ID }}
       EXECUTOR_TOKEN: ${{ secrets.EXECUTOR_TOKEN }}
+      READORI_VALIDATOR_ACCESS_TOKEN: ${{ secrets.READORI_VALIDATOR_ACCESS_TOKEN }}
       FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN || vars.FRONTEND_ORIGIN }}
       DEPLOY_MODE: ${{ inputs.mode }}
       BOOTSTRAP_RESOURCES: ${{ inputs.bootstrap_resources }}
@@ -71,6 +72,7 @@ jobs:
           [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || missing+=("CLOUDFLARE_ACCOUNT_ID")
           if [ "${DEPLOY_MODE}" != "dry-run" ]; then
             [ -n "${EXECUTOR_TOKEN:-}" ] || missing+=("EXECUTOR_TOKEN")
+            [ -n "${READORI_VALIDATOR_ACCESS_TOKEN:-}" ] || missing+=("READORI_VALIDATOR_ACCESS_TOKEN")
           fi
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::Missing deployment secrets/variables: ${missing[*]}"
@@ -82,6 +84,7 @@ jobs:
           echo "::add-mask::$TARGET_REPO_PAT"
           echo "::add-mask::$CLOUDFLARE_API_TOKEN"
           [ -z "${EXECUTOR_TOKEN:-}" ] || echo "::add-mask::$EXECUTOR_TOKEN"
+          [ -z "${READORI_VALIDATOR_ACCESS_TOKEN:-}" ] || echo "::add-mask::$READORI_VALIDATOR_ACCESS_TOKEN"
           echo "Source repository: ${SOURCE_REPOSITORY}"
           echo "Source ref: ${SOURCE_REF}"
           echo "Mode: ${DEPLOY_MODE}"
@@ -348,6 +351,8 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$EXECUTOR_TOKEN" | npx wrangler secret put EXECUTOR_TOKEN --config wrangler-ci.toml
+          # Browser access token: without it the Worker rejects every non-health API call (fail closed).
+          printf '%s' "$READORI_VALIDATOR_ACCESS_TOKEN" | npx wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN --config wrangler-ci.toml
           if [ -n "${FRONTEND_ORIGIN:-}" ]; then
             printf '%s' "$FRONTEND_ORIGIN" | npx wrangler secret put FRONTEND_ORIGIN --config wrangler-ci.toml
           fi

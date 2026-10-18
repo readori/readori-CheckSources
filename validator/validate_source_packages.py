@@ -13,6 +13,7 @@ import ast
 import base64
 import copy
 import hashlib
+import http.cookiejar
 import io
 import json
 import math
@@ -10104,8 +10105,13 @@ def is_legado_json_text(content: str) -> bool:
 
 def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> list[str]:
     t = rule.strip()
+    # A rule that carries `@get:{key}` is a makeUpRule template (RuleType `.template`): its substituted text is the
+    # result, exactly like Legado (differential fixture rule.template.get.variable: `x@get:{k}` -> `xv`).
+    template_literal = False
     if "@get:{" in t and not (t.startswith("@get:{") and t.endswith("}")):
-        t = substitute_variable_references(t, runtime)
+        substituted_rule = substitute_variable_references(t, runtime)
+        template_literal = substituted_rule != t
+        t = substituted_rule
     if not t:
         return []
 
@@ -10250,7 +10256,13 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     # A newline-delimited nextContentUrl/nextTocUrl value is a URL list, not
     # one XPath expression. Preserve it as one result so the caller can apply
     # Legado getStringList newline splitting before resolving each URL.
-    if "\n" in t:
+    # R144a (F6/#13): the App never returns rule text itself for HTML content. A default-mode rule that matches
+    # nothing is a JSoup selector with no result (RuleEvaluator `.contentDependent`: "字面量形态绝不把规则文本当
+    # 结果"); only JSON content keeps the literal (`.text` rule, bare field names go through JSONPath).
+    literal_allowed = template_literal or is_json_content(content) or (
+        content_type == "json" and not (content or "").lstrip().startswith("<")
+    )
+    if "\n" in t and literal_allowed:
         literal_lines = [line.strip() for line in t.splitlines() if line.strip()]
         if literal_lines and all(
             line.startswith(("http://", "https://", "/", "./", "../"))
@@ -10261,14 +10273,28 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     # except that the isJSON check comes first: on JSON content a bare `/`
     # rule (not @XPath:) is a Jayway path, which practically never matches.
     if t.startswith("/"):
+        # R144a (F14): the App splits `##` off every rule before choosing the mode (RuleType.swift parseSourceRule),
+        # so `/xpath##regex##replace` runs the XPath on the part before `##` and the replace chain on its result.
+        xpath_split = _split_top_level_replace(t)
+        if xpath_split is not None:
+            xpath_base, xpath_chain = xpath_split
+            xpath_base = xpath_base.strip()
+            if xpath_base.startswith("/"):
+                if is_legado_json_text(content):
+                    xpath_values = evaluate_json_rule(xpath_base, content, runtime)
+                else:
+                    xpath_values = evaluate_xpath_rule(xpath_base, content, runtime, content_type)
+                if not xpath_chain:
+                    return xpath_values
+                return [legado_replace_regex(value, xpath_chain) for value in xpath_values]
         if is_legado_json_text(content):
             return evaluate_json_rule(t, content, runtime)
         return evaluate_xpath_rule(t, content, runtime, content_type)
     if contains_json_placeholder(t) and t.startswith(("http://", "https://", "/", "./", "../")):
         substituted = substitute_json_placeholders(t, content)
         return [substituted] if substituted else []
-    if t.startswith(("http://", "https://", "/", "./", "../")):
-        return [t]
+    if t.startswith(("http://", "https://", "/", "./", "../")) and "##" not in t:
+        return [t] if literal_allowed else []
     # ## separates rule from regex replacement (legado: ruleStr.split("##"))
     # Must check before CSS to avoid CSS evaluating the ## fragment
     if "##" in t:
@@ -10322,7 +10348,7 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     if t.lower() in bare_attrs:
         return _evaluate_bare_html_attribute(content, t, runtime)
 
-    return [t]
+    return [t] if literal_allowed else []
 
 
 def _apply_css_index(elems: list[Any], index: int | None) -> list[Any]:
@@ -11708,6 +11734,136 @@ def decode_response_text(resp: requests.Response, charset_override: str | None =
     return data.decode("utf-8", errors="replace")
 
 
+# ---- R144a network diagnostics + App HTTP status semantics (F16) ----------------------------------------------
+# fetch_text used to swallow every transport error into ("", url, 0), so a DNS / TLS / timeout failure looked like an
+# empty search result. The cause is now recorded per thread (record_network_event) and surfaced by the validation
+# stages as detail["networkError"] + a `network error: <category>` failureReason. The verdict itself is unchanged:
+# like the App, a failed request is a failed stage.
+
+NETWORK_ERROR_REASON_PREFIX = "network error: "
+
+
+def classify_network_error(exc: BaseException | str) -> tuple[str, str]:
+    """Map a transport exception to (category, message). Categories: dns, tls, timed out, connection refused,
+    connection reset, too many redirects, connection failed, other. (Never contains the substring "timeout":
+    app_verdict() reserves that word for the App's whole-chain 校验超时.)"""
+    message = str(exc) if not isinstance(exc, str) else exc
+    lowered = message.lower()
+    exc_name = type(exc).__name__.lower() if not isinstance(exc, str) else ""
+    if isinstance(exc, requests.exceptions.SSLError) or "ssl" in exc_name or "certificate verify" in lowered or "sslerror" in lowered:
+        return "tls", message
+    if isinstance(exc, requests.exceptions.Timeout) or "timed out" in lowered or "timeout" in lowered:
+        return "timed out", message
+    if isinstance(exc, requests.exceptions.TooManyRedirects) or "too many redirects" in lowered or "exceeded 30 redirects" in lowered:
+        return "too many redirects", message
+    if any(token in lowered for token in (
+        "name or service not known", "getaddrinfo failed", "nameresolutionerror", "nodename nor servname",
+        "temporary failure in name resolution", "failed to resolve", "no address associated",
+    )):
+        return "dns", message
+    if "refused" in lowered or "10061" in lowered:
+        return "connection refused", message
+    if "reset" in lowered or "10054" in lowered or "aborted" in lowered or "remotedisconnected" in lowered or "connection broken" in lowered:
+        return "connection reset", message
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "connection failed", message
+    return "other", message
+
+
+def begin_network_stage() -> None:
+    """Forget the transport errors of the previous stage (per thread)."""
+    _thread_local.network_events = []
+
+
+def record_network_event(url: str, exc: BaseException | str, status: int = 0) -> dict[str, Any]:
+    category, message = classify_network_error(exc)
+    event = {"category": category, "message": message[:300], "url": str(url or ""), "status": int(status or 0)}
+    events = getattr(_thread_local, "network_events", None)
+    if events is None:
+        events = []
+        _thread_local.network_events = events
+    events.append(event)
+    return event
+
+
+def record_http_status_event(url: str, status: int) -> dict[str, Any]:
+    event = {"category": f"http {int(status)}", "message": f"HTTP {int(status)}", "url": str(url or ""), "status": int(status)}
+    events = getattr(_thread_local, "network_events", None)
+    if events is None:
+        events = []
+        _thread_local.network_events = events
+    events.append(event)
+    return event
+
+
+def first_network_event() -> dict[str, Any] | None:
+    events = getattr(_thread_local, "network_events", None) or []
+    return dict(events[0]) if events else None
+
+
+def attach_network_error(detail: dict[str, Any], stage: str, reason_is_generic: bool = True) -> bool:
+    """If the stage that just failed recorded a transport/HTTP error, put it into `detail` and make the
+    failureReason `network error: <category>`. Returns whether an event was attached."""
+    event = first_network_event()
+    if not event:
+        return False
+    detail["networkError"] = dict(event, stage=stage)
+    if reason_is_generic:
+        detail["failureReason"] = NETWORK_ERROR_REASON_PREFIX + str(event["category"])
+    if not detail.get("error"):
+        detail["error"] = f"{event['category']}: {event['message']}"
+    return True
+
+
+def app_http_error_blocks_rules(status: int, body: str, operation: str, has_login_check: bool = False) -> bool:
+    """Whether the App refuses to hand an HTTP response to the rules (BookSourceEngine.executeRequestWithRetry
+    :571-577 + shouldPassHTTPErrorBodyToRules :10353): any non-2xx status throws httpError unless the source has a
+    loginCheckJs, or the status is a 4xx other than 401/403/407/408/429 whose body is non-empty without error-page
+    signals and is JSON (HTML is accepted for search/explore only). status 0 = transport failure (handled apart)."""
+    status = int(status or 0)
+    # Only real HTTP status codes (100-599) are judged: 0 is a transport failure (recorded apart) and test stubs /
+    # synthetic responses use small placeholder numbers.
+    if status < 100 or 200 <= status < 300 or has_login_check:
+        return False
+    if not (400 <= status < 500) or status in (401, 403, 407, 408, 429):
+        return True
+    trimmed = (body or "").strip()
+    if not trimmed or contains_http_error_page_signals(trimmed):
+        return True
+    if (trimmed.startswith("{") and trimmed.endswith("}")) or (trimmed.startswith("[") and trimmed.endswith("]")):
+        try:
+            json.loads(trimmed)
+            return False
+        except Exception:
+            return True
+    return operation not in ("search", "explore")
+
+
+def app_http_failure(url: str, status: int, body: str, operation: str, src: dict[str, Any] | None = None) -> bool:
+    """app_http_error_blocks_rules + record the HTTP status for the report. True = the stage's request failed."""
+    has_login_check = bool(str((src or {}).get("loginCheckJs") or "").strip())
+    if app_http_error_blocks_rules(status, body, operation, has_login_check):
+        record_http_status_event(url, status)
+        return True
+    return False
+
+
+def make_source_session(src: dict[str, Any] | None = None) -> requests.Session:
+    """A fresh Session for one source (R144a F11): nothing is inherited from another source, and
+    `enabledCookieJar: false` stops Set-Cookie from being stored (App: the flag only controls saving)."""
+    session = requests.Session()
+    if isinstance(src, dict) and src.get("enabledCookieJar") is False:
+        session.cookies.set_policy(_NoStoreCookiePolicy())
+    return session
+
+
+class _NoStoreCookiePolicy(http.cookiejar.DefaultCookiePolicy):
+    """Cookie policy that refuses to store any cookie a response sets (cookies sent explicitly still work)."""
+
+    def set_ok(self, cookie: Any, request: Any) -> bool:  # noqa: D401 - cookielib hook
+        return False
+
+
 def fetch_text(
     session: requests.Session,
     url: str,
@@ -11742,72 +11898,74 @@ def fetch_text(
 
     last_error: Exception | None = None
     for candidate_url in _candidate_retry_urls(url):
-        for attempt in range(2 if retry_with_default_headers else 1):
-            # 第一次按原 headers；第二次退回到浏览器基础 headers 以规避部分站点 header 校验
-            req_headers = dict(base_headers) if attempt == 0 else dict(DEFAULT_BROWSER_HEADERS)
-            try:
-                if method == "POST":
-                    resp = session.post(
-                        candidate_url,
-                        headers=req_headers,
-                        data=data,
-                        timeout=request_timeout,
-                        allow_redirects=allow_redirects,
-                    )
-                elif method == "HEAD":
-                    resp = session.head(
-                        candidate_url,
-                        headers=req_headers,
-                        timeout=request_timeout,
-                        allow_redirects=allow_redirects,
-                    )
-                else:
-                    resp = session.get(
-                        candidate_url,
-                        headers=req_headers,
-                        timeout=request_timeout,
-                        allow_redirects=allow_redirects,
-                    )
-                text = decode_response_text(resp, charset_override=charset)
-                if response_meta is not None:
-                    response_meta["headers"] = {
-                        str(key): str(value)
-                        for key, value in dict(resp.headers or {}).items()
-                    }
-                    response_meta["cookies"] = {
-                        str(key): str(value)
-                        for key, value in resp.cookies.get_dict().items()
-                    }
-                verify_redirect_url = loading_verify_redirect_url(text, str(resp.url))
-                if allow_redirects and verify_redirect_url and method == "GET":
-                    try:
-                        verify_resp = session.get(verify_redirect_url, headers=req_headers, timeout=request_timeout, allow_redirects=True)
-                        verify_text = decode_response_text(verify_resp, charset_override=charset)
-                        if verify_text and not contains_http_error_page_signals(verify_text):
-                            if response_meta is not None:
-                                response_meta["headers"] = {
-                                    str(key): str(value)
-                                    for key, value in dict(verify_resp.headers or {}).items()
-                                }
-                                response_meta["cookies"] = {
-                                    str(key): str(value)
-                                    for key, value in verify_resp.cookies.get_dict().items()
-                                }
-                            return verify_text, str(verify_resp.url), int(verify_resp.status_code)
-                    except Exception:
-                        pass
-                if attempt == 0 and not has_request_header(base_headers, "User-Agent") and contains_http_error_page_signals(text):
-                    continue
-                return text, str(resp.url), int(resp.status_code)
-            except requests.RequestException as exc:
-                last_error = exc
-                continue
-            except Exception as exc:
-                last_error = exc
-                continue
+        # R144a (F9): exactly one attempt with the headers the source configured. The App never retries with a
+        # replacement browser header set, so the validator no longer "rescues" a source whose headers are wrong
+        # (`retry_with_default_headers` is accepted for call compatibility and ignored).
+        req_headers = dict(base_headers)
+        try:
+            if method == "POST":
+                resp = session.post(
+                    candidate_url,
+                    headers=req_headers,
+                    data=data,
+                    timeout=request_timeout,
+                    allow_redirects=allow_redirects,
+                )
+            elif method == "HEAD":
+                resp = session.head(
+                    candidate_url,
+                    headers=req_headers,
+                    timeout=request_timeout,
+                    allow_redirects=allow_redirects,
+                )
+            else:
+                resp = session.get(
+                    candidate_url,
+                    headers=req_headers,
+                    timeout=request_timeout,
+                    allow_redirects=allow_redirects,
+                )
+            text = decode_response_text(resp, charset_override=charset)
+            if response_meta is not None:
+                response_meta["headers"] = {
+                    str(key): str(value)
+                    for key, value in dict(resp.headers or {}).items()
+                }
+                response_meta["cookies"] = {
+                    str(key): str(value)
+                    for key, value in resp.cookies.get_dict().items()
+                }
+            verify_redirect_url = loading_verify_redirect_url(text, str(resp.url))
+            if allow_redirects and verify_redirect_url and method == "GET":
+                try:
+                    verify_resp = session.get(verify_redirect_url, headers=req_headers, timeout=request_timeout, allow_redirects=True)
+                    verify_text = decode_response_text(verify_resp, charset_override=charset)
+                    if verify_text and not contains_http_error_page_signals(verify_text):
+                        if response_meta is not None:
+                            response_meta["headers"] = {
+                                str(key): str(value)
+                                for key, value in dict(verify_resp.headers or {}).items()
+                            }
+                            response_meta["cookies"] = {
+                                str(key): str(value)
+                                for key, value in verify_resp.cookies.get_dict().items()
+                            }
+                        return verify_text, str(verify_resp.url), int(verify_resp.status_code)
+                except Exception:
+                    pass
+            return text, str(resp.url), int(resp.status_code)
+        except SourceValidationDeadlineExceeded:
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            continue
 
     if last_error is not None:
-        return "", (url or ""), 0
+        # R144a (F16): a transport failure is no longer swallowed silently; the cause is kept for the report.
+        record_network_event(url, last_error)
     return "", (url or ""), 0
 
 
@@ -11817,19 +11975,21 @@ def fetch_bytes(session: requests.Session, url: str, headers: dict[str, str] | N
     base_headers = dict(headers or {})
     last_error: Exception | None = None
     for candidate_url in _candidate_retry_urls(url):
-        for attempt in range(2):
-            req_headers = dict(base_headers) if attempt == 0 else dict(DEFAULT_BROWSER_HEADERS)
-            try:
-                resp = session.get(candidate_url, headers=req_headers, timeout=request_timeout, allow_redirects=True)
-                return bytes(resp.content or b""), str(resp.url), int(resp.status_code)
-            except requests.RequestException as exc:
-                last_error = exc
-                continue
-            except Exception as exc:
-                last_error = exc
-                continue
+        # R144a (F9): single attempt with the source's own headers (no replacement browser header retry).
+        req_headers = dict(base_headers)
+        try:
+            resp = session.get(candidate_url, headers=req_headers, timeout=request_timeout, allow_redirects=True)
+            return bytes(resp.content or b""), str(resp.url), int(resp.status_code)
+        except SourceValidationDeadlineExceeded:
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            continue
     if last_error is not None:
-        return b"", (url or ""), 0
+        record_network_event(url, last_error)
     return b"", (url or ""), 0
 
 
@@ -13308,7 +13468,73 @@ def html_declares_search_results_for_keyword(html: str, keyword: str) -> bool:
     return any(marker.lower() in low for marker in markers)
 
 
+def evaluate_init_rule_nonthrowing(rule: str, html: str, runtime: RuleRuntime, content_type: str) -> str:
+    """`ruleSearch.init` (BookSourceEngine.swift:238-244): evaluateString, never throwing; a non-empty result
+    replaces the response body. Script errors inside the init rule do not fail the stage."""
+    sink = getattr(runtime, "script_error_sink", None)
+    mark = len(sink) if sink is not None else 0
+    previous_error = getattr(runtime, "script_error", "")
+    try:
+        values = evaluate_rule(rule, html, runtime, content_type)
+    finally:
+        if sink is not None:
+            sink[mark:] = [entry for entry in sink[mark:] if entry.get("kind") != "error"]
+        runtime.script_error = previous_error
+    text = values[0] if values else ""
+    return text if str(text).strip() else ""
+
+
+def collect_app_book_candidates(
+    src: dict[str, Any],
+    rule: dict[str, Any],
+    items: list[str],
+    runtime2: RuleRuntime,
+) -> tuple[list[str], dict[str, str] | None, str]:
+    """Per-item extraction exactly like BookSourceEngine.parseSearchResult / parseExploreResult (R144a F4).
+
+    * name: the rule result; the `<a>` / title / JSON-key recovery runs only when the name rule is blank
+      (App E:931-957: `lacksRule`). A non-blank rule that yields nothing skips the item. No placeholder name.
+    * bookUrl: the rule result; an empty result is the response URL (Legado isUrl fallback, E:1083-1085); the
+      heuristic `href` recovery runs only when the bookUrl rule is blank. A URL that is not usable
+      (`isUsableRuleExtractedBookUrl`) skips the item - there is no second guess from the item's own links.
+    Returns (book_urls, variables of the first selected item, that item's author).
+    """
+    name_rule = str(rule.get("name") or "")
+    url_rule = str(rule.get("bookUrl") or "")
+    name_rule_blank = not name_rule.strip()
+    url_rule_blank = not url_rule.strip()
+    book_urls: list[str] = []
+    selected_variables: dict[str, str] | None = None
+    selected_author = ""
+    for item in items:
+        item_runtime = RuleRuntime(**{**runtime2.__dict__, "variables": dict(runtime2.variables or {})})
+        name = "" if name_rule_blank else first_result_to_text(item, name_rule, item_runtime)
+        name_recovered = False
+        if not name.strip() and name_rule_blank:
+            name = fallback_name_from_item(item)
+            name_recovered = bool(name.strip())
+        if not name.strip():
+            continue
+        if name_recovered and not is_usable_search_book_title(name):
+            continue
+        if url_rule_blank:
+            book_url = fallback_url_from_item(item, runtime2.base_url, item_runtime)
+        else:
+            book_url = first_result_to_book_url(src, item, url_rule, item_runtime, str(rule.get("kind") or ""))
+        if not str(book_url or "").strip():
+            book_url = runtime2.base_url
+        if not str(book_url or "").strip() or not is_usable_rule_extracted_book_url(book_url, item, name, item_runtime):
+            continue
+        item_author = capture_search_item_rule_variables(rule, item, item_runtime)
+        book_urls.append(book_url)
+        if selected_variables is None:
+            selected_variables = dict(item_runtime.variables or {})
+            selected_author = item_author
+    return book_urls, selected_variables, selected_author
+
+
 def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime) -> tuple[list[str], str]:
+    begin_network_stage()
     search_rule = src.get("ruleSearch") or {}
     explore_rule = src.get("ruleExplore") or {}
     if isinstance(search_rule, dict) and isinstance(explore_rule, dict) and not str(explore_rule.get("bookList") or "").strip():
@@ -13344,6 +13570,8 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             )
             if status == 0 and not html:
                 return [], final_url
+            if app_http_failure(base_url, status, html, "explore", src):
+                return [], final_url
             login_ok, html, final_url = apply_login_check_js(
                 src, runtime, html, final_url, base_url, status,
                 request_headers=runtime.headers,
@@ -13361,51 +13589,19 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             if is_likely_empty_search_json(html):
                 return [], final_url
             runtime2 = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url})
+            # R144a (F4): bookList has a rule here (has_explore), and the App's list heuristics (JSON wrapper
+            # recovery, JSON key lists, HTML selector guesses) run only when the bookList rule is blank.
             items = evaluate_book_list(str(explore_rule.get("bookList") or ""), html, runtime2)
-            if is_json_content(html):
-                items = recover_json_search_items_if_wrapper_noise(items, html)
-            if not items and is_json_content(html):
-                items = fallback_search_items_from_content(html)
-            if not items and not is_json_content(html):
-                items = heuristic_book_items_from_html(html, final_url)
             if not items:
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
                 return [], ""
-            book_urls: list[str] = []
-            selected_variables: dict[str, str] | None = None
-            for item in items:
-                item_runtime = RuleRuntime(**{**runtime2.__dict__, "variables": dict(runtime2.variables or {})})
-                name = first_result_to_text(item, str(explore_rule.get("name") or ""), item_runtime) if str(explore_rule.get("name") or "").strip() else "x"
-                if not name.strip():
-                    name = fallback_name_from_item(item)
-                book_url = first_result_to_book_url(
-                    src,
-                    item,
-                    str(explore_rule.get("bookUrl") or ""),
-                    item_runtime,
-                    str(explore_rule.get("kind") or ""),
-                ) if str(explore_rule.get("bookUrl") or "").strip() else ""
-                if (
-                    not book_url.strip()
-                    or not is_usable_rule_extracted_book_url(book_url, item, name, item_runtime)
-                ):
-                    book_url = fallback_url_from_item(item, runtime2.base_url, item_runtime)
-                if (
-                    name.strip()
-                    and is_usable_search_book_title(name)
-                    and book_url.strip()
-                    and is_usable_rule_extracted_book_url(book_url, item, name, item_runtime)
-                ):
-                    item_author = capture_search_item_rule_variables(explore_rule, item, item_runtime)
-                    book_urls.append(book_url)
-                    if selected_variables is None:
-                        selected_variables = dict(item_runtime.variables or {})
-                        runtime.validation_book_author = item_author
+            book_urls, selected_variables, selected_author = collect_app_book_candidates(src, explore_rule, items, runtime2)
             if selected_variables:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables.update(selected_variables)
+                runtime.validation_book_author = selected_author
             if not book_urls and error_page:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables["__searchChallenge"] = "1"
@@ -13429,6 +13625,8 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             )
             if status == 0 and not html:
                 return [], final_url
+            if app_http_failure(url, status, html, "search", src):
+                return [], final_url
             login_ok, html, final_url = apply_login_check_js(
                 src, runtime, html, final_url, url, status,
                 request_method=method,
@@ -13439,6 +13637,15 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             )
             if not login_ok:
                 continue
+            # R144a (#12): ruleSearch.init runs after the login check and before the redirect guard (App E:236-244).
+            search_init_rule = str(search_rule.get("init") or search_rule.get("initJs") or "").strip()
+            if search_init_rule:
+                init_runtime = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url})
+                transformed_html = evaluate_init_rule_nonthrowing(
+                    search_init_rule, html, init_runtime, "json" if is_json_content(html) else "html"
+                )
+                if transformed_html:
+                    html = transformed_html
             if is_likely_search_or_explore_landing_url(final_url, runtime):
                 continue
             # Rule-first parity with the iOS runtime and Legado. Only classify
@@ -13450,53 +13657,19 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
             if matches_book_url_pattern(src, final_url):
                 return [final_url], final_url
             runtime2 = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url})
+            # R144a (F4): no list heuristics after a rule-driven bookList (App: blank bookList only).
             items = evaluate_book_list(str(search_rule.get("bookList") or ""), html, runtime2)
-            if is_json_content(html):
-                items = recover_json_search_items_if_wrapper_noise(items, html)
-            if not items and is_json_content(html):
-                items = fallback_search_items_from_content(html)
-            if not items and not is_json_content(html):
-                items = heuristic_book_items_from_html(html, final_url, kw)
             if not items:
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
                 continue
-            book_urls: list[str] = []
-            selected_variables: dict[str, str] | None = None
-            for item in items:
-                item_runtime = RuleRuntime(**{**runtime2.__dict__, "variables": dict(runtime2.variables or {})})
-                field_item = select_json_search_field_item(item, search_rule, item_runtime) if is_json_content(item) else item
-                name = first_result_to_text(field_item, str(search_rule.get("name") or ""), item_runtime) if str(search_rule.get("name") or "").strip() else "x"
-                if not name.strip():
-                    name = fallback_name_from_item(field_item)
-                book_url = first_result_to_book_url(
-                    src,
-                    field_item,
-                    str(search_rule.get("bookUrl") or ""),
-                    item_runtime,
-                    str(search_rule.get("kind") or ""),
-                ) if str(search_rule.get("bookUrl") or "").strip() else ""
-                if (
-                    not book_url.strip()
-                    or not is_usable_rule_extracted_book_url(book_url, field_item, name, item_runtime)
-                ):
-                    book_url = fallback_url_from_item(field_item, runtime2.base_url, item_runtime)
-                if (
-                    name.strip()
-                    and is_usable_search_book_title(name)
-                    and book_url.strip()
-                    and is_usable_rule_extracted_book_url(book_url, field_item, name, item_runtime)
-                ):
-                    item_author = capture_search_item_rule_variables(search_rule, field_item, item_runtime)
-                    book_urls.append(book_url)
-                    if selected_variables is None:
-                        selected_variables = dict(item_runtime.variables or {})
-                        runtime.validation_book_author = item_author
+            book_urls, selected_variables, selected_author = collect_app_book_candidates(src, search_rule, items, runtime2)
             if book_urls:
                 if selected_variables:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables.update(selected_variables)
+                    runtime.validation_book_author = selected_author
                 return book_urls, final_url
             if error_page:
                 runtime.variables = dict(runtime.variables or {})
@@ -13507,17 +13680,64 @@ def fetch_book_candidates(session: requests.Session, src: dict[str, Any], runtim
     if search_urls:
         return search_urls, search_base
     if has_search:
-        # A real search failure: any interaction blocked from here on is not the cause of the failure group
-        # the App would already have recorded (BookSourceSuppressedInteractionRecorder.failureCountAtFirstRecord).
+        # R144a (F4): the App's batch validation runs search and discovery as independent checks
+        # (BookSourceValidator.doCheckSource 2226-2317); an empty search is a `搜索失效` failure on its own and
+        # a working discovery does not rescue it. A real search failure also means any interaction blocked from
+        # here on is not the cause of the failure group the App already recorded
+        # (BookSourceSuppressedInteractionRecorder.failureCountAtFirstRecord).
         note_app_validation_failure(runtime)
+        # Discovery still runs like in the App (it can block an interaction, which BookSourceValidator records),
+        # but its result never turns the failed search into a pass.
+        rescued_urls, _rescued_base = try_mode("explore") if has_explore else ([], "")
+        if rescued_urls:
+            runtime.variables = dict(runtime.variables or {})
+            runtime.variables["__exploreOnlyRescue"] = "1"
+        return [], ""
     explore_urls, explore_base = try_mode("explore")
     return explore_urls, explore_base
 
 
+def rule_text_is_blank(value: Any) -> bool:
+    """App `lacksRule` / `isEmpty` after trimming: nil, non-string containers and whitespace are blank."""
+    if value is None or isinstance(value, (dict, list)):
+        return True
+    return not str(value).strip()
+
+
+def detail_rules_are_blank(info_rule: dict[str, Any]) -> bool:
+    """BookSourceEngine `detailRulesAreBlank` (E:9207-9214): every ruleBookInfo field is blank. The App's detail
+    heuristics (error / landing page rejection, cookie-free retry) exist only for such sources."""
+    return all(rule_text_is_blank(value) for value in (info_rule or {}).values())
+
+
+def is_heuristic_http_error_page(html: str, status: int) -> bool:
+    """Swift `isHeuristicHttpErrorPage` (BookSourceEngine.swift:2363): non-2xx -> body signals; 2xx -> `<title>` only."""
+    if not html:
+        return False
+    if status > 0 and not (200 <= status < 300):
+        return contains_http_error_page_signals(html)
+    match = re.search(r"<title[^>]*>([\s\S]*?)</title>", html[:65536], flags=re.I)
+    if not match:
+        return False
+    title = re.sub(r"\s+", " ", match.group(1)).strip()
+    return bool(title) and contains_http_error_page_signals(f"<title>{title}</title>")
+
+
 def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str) -> tuple[bool, str, str, str]:
+    begin_network_stage()
     info_rule = src.get("ruleBookInfo") or {}
     if not isinstance(info_rule, dict):
         info_rule = {}
+    # R144a: every detail heuristic is gated by the same "rule is blank" test the App uses (F3 / F9 / F10).
+    detail_blank = detail_rules_are_blank(info_rule)
+    name_rule_blank = rule_text_is_blank(info_rule.get("name"))
+    kind_rule_blank = rule_text_is_blank(info_rule.get("kind"))
+    toc_rule_blank = rule_text_is_blank(info_rule.get("tocUrl"))
+    toc_ruleset = src.get("ruleToc") if isinstance(src.get("ruleToc"), dict) else {}
+    chapter_list_blank = rule_text_is_blank((toc_ruleset or {}).get("chapterList"))
+    # App E:9147-9190: the tocUrl guesses (JSON keys, og:novel:read_url, links in the page) run only when neither
+    # a tocUrl rule nor a chapterList rule exists; otherwise tocUrl falls back to the book URL.
+    toc_heuristics_allowed = toc_rule_blank and chapter_list_blank
     abs_url, request_options = resolve_url_with_options(book_url, runtime.base_url)
     request_url = request_url_preserving_typed_data_options(abs_url, request_options)
     request_method = str(request_options.get("method") or "GET")
@@ -13536,7 +13756,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
         charset=request_charset,
         response_meta=response_meta,
     )
-    if request_method != "POST" and not html.strip():
+    # App E:8759-8773: the cookie-free retry also needs `source.cookieJarEnabled`.
+    if detail_blank and request_method != "POST" and src.get("enabledCookieJar") is not False and not html.strip():
         retry_meta: dict[str, Any] = {}
         retry_html, retry_final_url, retry_status = fetch_text(
             requests.Session(),
@@ -13552,6 +13773,8 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             final_url = retry_final_url
             status = retry_status
             response_meta = retry_meta
+    if app_http_failure(request_url, status, html, "book_info", src):
+        return False, "", "", f"HTTP {int(status)}"
     login_ok, html, final_url = apply_login_check_js(
         src, runtime, html, final_url, request_url, status,
         request_method=request_method,
@@ -13564,13 +13787,13 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
         return False, "", "", "loginCheckJs did not return StrResponse"
     if not html.strip():
         return False, "", "", "detail empty response"
-    if final_url and normalized_book_candidate_url_for_comparison(final_url) != normalized_book_candidate_url_for_comparison(abs_url):
+    if detail_blank and final_url and normalized_book_candidate_url_for_comparison(final_url) != normalized_book_candidate_url_for_comparison(abs_url):
         probe_runtime = RuleRuntime(**{**runtime.__dict__, "source_url": request_url, "book_url": book_url})
         if is_likely_search_or_explore_landing_url(final_url, probe_runtime):
             return False, "", "", "detail redirected to source landing page"
     original_html = html
     next_data_json = extract_next_data_json(html) if not is_json_content(html) else ""
-    if html.strip() and not is_json_content(html) and not next_data_json and contains_http_error_page_signals(html):
+    if detail_blank and html.strip() and not is_json_content(html) and not next_data_json and is_heuristic_http_error_page(html, status):
         return False, "", "", "detail http error page"
     # Legado analyzes the response with baseUrl=book.bookUrl and keeps the
     # redirect URL separately. For typed aggregation carriers the response URL
@@ -13608,7 +13831,7 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
         kind_values = evaluate_rule(str(info_rule.get("kind")), html, runtime2, "json" if is_json_content(html) else "html")
         if kind_values:
             kind = legado_joined_string_list(kind_values).strip()
-    if not kind and is_json_content(html):
+    if not kind and kind_rule_blank and is_json_content(html):
         try:
             detail_json = json.loads(extract_json(html) or html)
         except Exception:
@@ -13650,7 +13873,7 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             json_obj = None
 
     if isinstance(json_obj, dict):
-        if not name.strip():
+        if name_rule_blank and not name.strip():
             name = json_first_text(json_obj, [
                 "name", "bookName", "book_name", "title", "bookTitle", "novelName", "novel_name",
                 "data.name", "data.bookName", "data.title", "result.name", "result.bookName", "result.title",
@@ -13659,7 +13882,7 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
             name = clean_recovered_book_name(name)
             if name and not is_usable_search_book_title(name):
                 name = ""
-        if not toc_url.strip():
+        if toc_heuristics_allowed and not toc_url.strip():
             raw_toc = json_first_text(json_obj, [
                 "tocUrl", "toc_url", "chapterListUrl", "chapter_list_url", "catalogUrl", "catalog_url",
                 "chaptersUrl", "chapters_url", "listUrl", "list_url", "readUrl", "read_url",
@@ -13673,14 +13896,14 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
                     toc_url = resolved_toc
 
     # Legado 兼容兜底：规则未提取到 name/tocUrl 时，尽量从详情页面推断
-    if not name.strip() and original_html.strip() and not is_json_content(original_html):
+    if name_rule_blank and not name.strip() and original_html.strip() and not is_json_content(original_html):
         name = (
             clean_recovered_book_name(html_meta_content(original_html, ["og:novel:book_name", "og:title", "book_name", "title"]))
             or html_title_book_name(original_html)
             or clean_recovered_book_name(fallback_name_from_item(original_html))
         )
 
-    if not name.strip() and html.strip():
+    if name_rule_blank and not name.strip() and html.strip():
         name = (
             clean_recovered_book_name(html_meta_content(html, ["og:novel:book_name", "og:title", "book_name", "title"]))
             or html_title_book_name(html)
@@ -13700,7 +13923,7 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
     ):
         return False, "", "", ""
 
-    should_recover_toc_from_html = not toc_url.strip() or is_likely_search_or_explore_landing_url(toc_url, runtime2)
+    should_recover_toc_from_html = toc_heuristics_allowed and (not toc_url.strip() or is_likely_search_or_explore_landing_url(toc_url, runtime2))
     html_for_toc_recovery = original_html if original_html.strip() and not is_json_content(original_html) else html
     if should_recover_toc_from_html and html_for_toc_recovery.strip() and not is_json_content(html_for_toc_recovery):
         raw_toc = html_meta_content(html_for_toc_recovery, ["og:novel:read_url", "read_url", "tocUrl", "chapterListUrl"])
@@ -13728,9 +13951,7 @@ def fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Rul
         except Exception:
             pass
 
-    if not name.strip() and html.strip() and not rejected_recovered_name:
-        # 仅作为最后兜底，避免 detail 阶段被空字段阻塞后续可验证链路
-        name = str(src.get("bookSourceName") or "").strip()
+    # R144a (F3): the book source's own name is never a book name (the App has no such fallback).
 
     if name.strip() and not is_usable_search_book_title(name):
         name = ""
@@ -13795,35 +14016,61 @@ def apply_html_content_fallback(page_content: str, html: str) -> str:
 
 
 def _normalized_text_for_quality(text: str) -> str:
-    t = (text or "")
-    # 先剥离 HTML 标签，确保检测的是可见文本而非 HTML 源码
-    t = re.sub(r"<[^>]+>", " ", t)
-    # 移除图片占位和常见导航词，避免把目录/菜单误判为正文
-    t = re.sub(r"\[图片:[^\]]*\]", " ", t)
-    t = re.sub(r"(?i)(上一页|下一页|返回目录|目录|章节目录|加入书签|收藏本站|推荐本书|chapter list)", " ", t)
+    """Swift `normalizedTextForQuality` (BookSourceEngine.swift:6935-6949): drop `[图片:…]` markers and navigation
+    words, collapse whitespace. No HTML tag stripping (the App feeds it already cleaned text)."""
+    t = text or ""
+    t = re.sub(r"\[图片:[^\]]*\]", "", t)
+    t = re.sub(r"(?i)(上一页|下一页|返回目录|目录|章节目录|加入书签|收藏本站|推荐本书|chapter list)", "", t)
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
 
-def is_meaningful_content(text: str) -> bool:
-    normalized = _normalized_text_for_quality(text)
+def is_usable_chapter_text(text: str) -> bool:
+    """The validator's own final "does the chapter hold readable text" gate (unchanged since before R144a: 30 characters,
+    signal 15, digits x0.5). The App's validation (BookSourceValidator.swift:2514) passes any non-empty trimmed text or
+    any image, so this gate is stricter than the App (it only rejects blank / navigation-like leftovers). It is kept
+    separate from `is_meaningful_content` (the App's fallback gate, ported exactly) so that short real chapters are not
+    rejected by the stricter 80 / 40 fallback thresholds."""
+    normalized = re.sub(r"<[^>]+>", " ", text or "")
+    normalized = re.sub(r"\[图片:[^\]]*\]", " ", normalized)
+    normalized = re.sub(r"(?i)(上一页|下一页|返回目录|目录|章节目录|加入书签|收藏本站|推荐本书|chapter list)", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized:
         return False
-    # Legado 对齐：只要有可见文本就算有效，降低阈值
     if len(normalized) < 30:
         return False
-
     cjk_count = len(re.findall(r"[\u4e00-\u9fff]", normalized))
     latin_count = len(re.findall(r"[A-Za-z]", normalized))
     digit_count = len(re.findall(r"\d", normalized))
     punct_count = len(re.findall(r"[，。！？；：、,.!?;:]", normalized))
     signal = cjk_count + latin_count + punct_count
-
-    # 有一定自然语言信号即可
     if signal < 15:
         return False
     if signal > 0 and digit_count > 0 and signal <= digit_count * 0.5:
         return False
+    return True
+
+
+def is_meaningful_content(text: str) -> bool:
+    """Swift `isMeaningfulContent` (BookSourceEngine.swift:6955-6978), ported line for line: at least 80
+    characters, at least 40 signal characters (CJK + Latin + punctuation), signal must exceed 1.2x the digit count,
+    and mostly-CJK text needs a punctuation density of at least 1.5% (navigation menus / tag lists have none).
+    R144a: this used to be 30 characters / signal 15 / digits x0.5 and had no density check."""
+    normalized = _normalized_text_for_quality(text)
+    if not normalized or len(normalized) < 80:
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", normalized))
+    latin = len(re.findall(r"[A-Za-z]", normalized))
+    digits = len(re.findall(r"\d", normalized))
+    punct = len(re.findall(r"[，。！？；：、,.!?;:]", normalized))
+    signal = cjk + latin + punct
+    if signal < 40:
+        return False
+    if signal <= digits * 1.2:
+        return False
+    if cjk >= 60 and cjk / max(1, cjk + latin) > 0.6:
+        if punct / cjk < 0.015:
+            return False
     return True
 
 
@@ -13832,20 +14079,6 @@ def has_meaningful_image_content(text: str) -> bool:
         return False
     sources = re.findall(r"""<img\b[^>]*(?:src|data-src)\s*=\s*["']?([^"'\s>]+)""", text, flags=re.I)
     return any(src and not src.lower().startswith(("javascript:", "#")) for src in sources)
-
-
-def should_keep_pre_replace_content(pre_replace: str, replaced: str) -> bool:
-    pre_norm = _normalized_text_for_quality(pre_replace)
-    replaced_norm = _normalized_text_for_quality(replaced)
-    if not is_meaningful_content(pre_norm):
-        return False
-    if not replaced_norm:
-        return True
-    if not is_meaningful_content(replaced_norm) and len(pre_norm) >= 120:
-        return True
-    if len(pre_norm) >= 400 and len(replaced_norm) < max(80, int(len(pre_norm) * 0.15)):
-        return True
-    return False
 
 
 _LEGADO_FORMAT_WS = "[ \\t\\n\\x0B\\f\\r]"
@@ -14026,16 +14259,10 @@ def evaluate_content_rule_with_inline_replace_guard(
 ) -> str:
     # Legado BookContent: analyzeRule.getString(contentRule.content, unescape = false)
     # -- values joined with "\n", `##` applied once to the joined text, no unescape.
-    page_content = legado_get_string(content_expr, page_html, runtime, content_type, unescape=False).strip() if content_expr else ""
-    if "##" not in content_expr:
-        return page_content
-    base_expr, _ = content_expr.split("##", 1)
-    if not base_expr.strip():
-        return page_content
-    base_content = legado_get_string(base_expr, page_html, runtime, content_type, unescape=False).strip()
-    if should_keep_pre_replace_content(base_content, page_content):
-        return base_content
-    return page_content
+    # R144a (F8): the App's evaluateContentWithInlineReplaceGuard (BookSourceEngine.swift:7008-7016) is a plain
+    # evaluateContent - "规则内 `##` 替换的结果总是生效，不再按质量回退到替换前文本". An inline replacement that
+    # empties the content therefore leaves the chapter empty (and the content stage failed).
+    return legado_get_string(content_expr, page_html, runtime, content_type, unescape=False).strip() if content_expr else ""
 
 
 def fallback_chapter_items_from_content(html: str, final_url: str) -> list[str]:
@@ -14441,15 +14668,22 @@ def fallback_search_items_from_content(html: str) -> list[str]:
 
 def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str, toc_url: str) -> tuple[bool, str, str, str, int, int, int]:
     """返回: ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages_walked, first_page_item_count"""
-    toc_rule = src.get("ruleToc") or {}
+    begin_network_stage()
+    # App getChapterList: `ruleToc == nil` throws noTocRule (E:2576-2578); an existing ruleToc without a
+    # chapterList rule is NOT an error - the page is read by the raw-link / dynamic-catalog heuristics (R144a F15).
+    toc_rule = src.get("ruleToc")
     if not isinstance(toc_rule, dict):
         return False, "", "", "", 0, 0, 0
     chapter_list_rule = str(toc_rule.get("chapterList") or "").strip()
     chapter_name_rule = str(toc_rule.get("chapterName") or "").strip()
     chapter_url_rule = str(toc_rule.get("chapterUrl") or "").strip()
-    # Legado 对齐：缺少 chapterName/chapterUrl 规则时使用 fallback
-    if not chapter_list_rule:
-        return False, "", "", "", 0, 0, 0
+    # BookSourceEngine `tocItemsAreHeuristic` / `tocLacksRule` (E:3018-3023): field heuristics, error-page
+    # rejection and the raw-link fallback exist only for sources without a chapterList rule, or for a field whose
+    # own rule is blank. A non-blank rule result is never replaced.
+    heuristic_toc = not chapter_list_rule
+    name_rule_blank = heuristic_toc or not chapter_name_rule
+    url_rule_blank = heuristic_toc or not chapter_url_rule
+    has_next_toc_rule = bool(str(toc_rule.get("nextTocUrl") or "").strip())
 
     normalized_toc_url = (toc_url or "").strip()
     effective_toc_url = normalized_toc_url or book_url
@@ -14504,7 +14738,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             charset=request_charset,
             response_meta=response_meta,
         )
-        if request_method != "POST" and not html.strip() and status == 0:
+        if heuristic_toc and request_method != "POST" and src.get("enabledCookieJar") is not False and not html.strip():
             retry_meta: dict[str, Any] = {}
             retry_html, retry_final_url, retry_status = fetch_text(
                 requests.Session(),
@@ -14520,6 +14754,13 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 final_url = retry_final_url
                 status = retry_status
                 response_meta = retry_meta
+        if app_http_failure(request_url, status, html, "toc", src):
+            # App E:2793-2809: a page reached through a nextTocUrl rule that answers with an HTTP error counts as an
+            # empty page; any other request error fails the whole table of contents.
+            if pages == 0 or not has_next_toc_rule:
+                return False, "", "", "", pages, first_page_item_count, len(seen_chapter_urls)
+            pages += 1
+            continue
         login_ok, html, final_url = apply_login_check_js(
             src, runtime_seed, html, final_url, request_url, status,
             request_method=request_method,
@@ -14531,7 +14772,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
         if not login_ok:
             pages += 1
             continue
-        if contains_http_error_page_signals(html):
+        if heuristic_toc and not is_json_content(html) and is_heuristic_http_error_page(html, status):
             book_abs = urljoin(runtime_seed.base_url, book_url)
             book_key = f"GET {book_abs} "
             if book_abs and book_key not in visited and book_abs not in queue and book_abs != abs_url:
@@ -14553,26 +14794,21 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
         })
         seed_runtime_variables_from_url(runtime2, final_url)
         content_type = "json" if is_json_content(html) else "html"
-        items = evaluate_book_list(chapter_list_rule, html, runtime2)
+        if chapter_list_rule:
+            items = evaluate_book_list(chapter_list_rule, html, runtime2)
+        else:
+            items = []
         # Legado passes the same mutable Book entity through every TOC page.
         # Preserve chapterList JS side effects (including upCustomIntro) in
         # both the caller-visible runtime and the seed for the next page.
         merge_runtime_book_state(runtime_seed, runtime2)
         merge_runtime_book_state(runtime, runtime2)
-        if not items:
+        # R144a (F2): "原始链接/动态目录兜底仅服务于没有 chapterList 规则的书源，绝不替换规则结果"
+        # (BookSourceEngine.swift:2933). A chapterList rule that matches nothing leaves the page empty.
+        if heuristic_toc:
             items = fallback_chapter_items_from_content(html, final_url)
-        if not items:
-            items = fetch_dynamic_catalog_items_from_html(session, html, final_url, runtime2)
-        elif (
-            (content_type != "json" or "<js>" in chapter_list_rule.lower() or "@js:" in chapter_list_rule.lower())
-            and len(items) < 15
-            and not is_javascript_rule_text(chapter_list_rule)
-        ):
-            fallback_items = fallback_chapter_items_from_content(html, final_url)
-            if fallback_items and len(items) == 1 and fallback_items[0].strip() != items[0].strip():
-                items = fallback_items
-            elif len(fallback_items) >= max(5, len(items) * 2):
-                items = fallback_items
+            if not items:
+                items = fetch_dynamic_catalog_items_from_html(session, html, final_url, runtime2)
         if pages == 0:
             first_page_item_count = len(items)
         pages += 1
@@ -14582,7 +14818,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             normalized_book_candidate_url_for_comparison(final_url),
         }
 
-        if pages == 1:
+        if pages == 1 and not has_next_toc_rule:
             all_chapters_url = guess_all_chapters_url_from_html(html, final_url)
             all_chapters_key = normalized_book_candidate_url_for_comparison(all_chapters_url)
             if all_chapters_url and all_chapters_key not in current_toc_keys and f"GET {all_chapters_url} " not in visited and all_chapters_url not in queue:
@@ -14634,9 +14870,9 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 title = legado_get_string_value(title_values).strip() if title_values else ""
             else:
                 title = ""
-            if not title:
+            if not title and name_rule_blank:
                 title = fallback_name_from_item(item)
-            if not title and item_type == "json":
+            if not title and item_type == "json" and name_rule_blank:
                 title = fallback_json_chapter_title_from_item(item)
             if (not title or title == chapter_name_rule) and re.fullmatch(r"[A-Za-z_][\w:-]*@text", chapter_name_rule):
                 attr_or_tag = chapter_name_rule.split("@", 1)[0]
@@ -14677,12 +14913,12 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             # A bare HTML attribute rule (href/src) cannot address a JSON item
             # (e.g. validator-synthesised app-cover-data chapters); the rule
             # engine no longer guesses JSON aliases, so recover the URL here.
-            if not chapter_url and (not current_element_url_rule or is_json_content(item)):
+            if url_rule_blank and not chapter_url and (not current_element_url_rule or is_json_content(item)):
                 chapter_url = fallback_chapter_url_from_item(item, final_url) or fallback_url_from_item(item, final_url)
-            if chapter_url and not current_element_url_rule and is_same_book_or_toc_url(chapter_url, book_url, final_url):
+            if heuristic_toc and chapter_url and not current_element_url_rule and is_same_book_or_toc_url(chapter_url, book_url, final_url):
                 recovered_url = recover_encoded_chapter_url_from_item(item, final_url)
                 chapter_url = recovered_url or fallback_chapter_url_from_item(item, final_url) or chapter_url
-            if chapter_url:
+            if heuristic_toc and chapter_url:
                 chapter_url = normalize_chapter_url_to_book_host(chapter_url, book_url)
             item_runtime.chapter_url = chapter_url
             item_runtime.variables = dict(item_runtime.variables or {})
@@ -14693,7 +14929,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             if update_time_rule:
                 tag_values = evaluate_rule(update_time_rule, item, item_runtime, item_type)
                 chapter_tag = legado_get_string_value(tag_values).strip() if tag_values else ""
-            if not chapter_tag and toc_item_object:
+            if not chapter_tag and toc_item_object and (heuristic_toc or not update_time_rule):
                 chapter_tag = json_first_text(
                     toc_item_object,
                     [
@@ -14707,9 +14943,9 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             is_volume_rule = str(toc_rule.get("isVolume") or "").strip()
             volume_values = evaluate_rule(is_volume_rule, item, item_runtime, item_type) if is_volume_rule else []
             is_volume_text = legado_get_string_value(volume_values)
-            if not is_volume_text and toc_item_object:
+            if not is_volume_text and toc_item_object and (heuristic_toc or not is_volume_rule):
                 is_volume_text = json_first_text(toc_item_object, ["isVolume", "is_volume", "volume", "isPart"])
-            is_volume = legado_is_true(is_volume_text) or is_likely_volume_title(title)
+            is_volume = legado_is_true(is_volume_text) or (heuristic_toc and is_likely_volume_title(title))
             item_runtime.chapter_is_volume = is_volume
             item_runtime.variables["__chapter.isVolume"] = is_volume
 
@@ -14723,7 +14959,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             is_vip_rule = str(toc_rule.get("isVip") or "").strip()
             vip_values = evaluate_rule(is_vip_rule, item, item_runtime, item_type) if is_vip_rule else []
             is_vip_text = legado_get_string_value(vip_values)
-            if not is_vip_text and toc_item_object:
+            if not is_vip_text and toc_item_object and (heuristic_toc or not is_vip_rule):
                 is_vip_text = json_first_text(toc_item_object, ["isVip", "is_vip", "vip"])
             is_vip = legado_is_true(is_vip_text)
             item_runtime.chapter_is_vip = is_vip
@@ -14732,7 +14968,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             is_pay_rule = str(toc_rule.get("isPay") or "").strip()
             pay_values = evaluate_rule(is_pay_rule, item, item_runtime, item_type) if is_pay_rule else []
             is_pay_text = legado_get_string_value(pay_values)
-            if not is_pay_text and toc_item_object:
+            if not is_pay_text and toc_item_object and (heuristic_toc or not is_pay_rule):
                 is_pay_text = json_first_text(toc_item_object, ["isPay", "is_pay", "pay", "paid"])
             is_pay = legado_is_true(is_pay_text)
             item_runtime.chapter_is_pay = is_pay
@@ -14742,7 +14978,7 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             # the first fetchable text chapter for its content-stage probe.
             if is_volume:
                 continue
-            if is_likely_toc_noise_title(title, chapter_url, final_url):
+            if heuristic_toc and is_likely_toc_noise_title(title, chapter_url, final_url):
                 continue
             low_raw_chapter_url = raw_chapter_url.strip().lower() if chapter_url_rule else ""
             if chapter_url and low_raw_chapter_url.startswith(("#", "javascript:", "mailto:")):
@@ -14800,13 +15036,27 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
 
 
 def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, chapter_url: str, chapter_title: str, book_name: str) -> tuple[bool, str, int]:
-    content_rule = src.get("ruleContent") or {}
-    if not isinstance(content_rule, dict):
-        return True, chapter_url, 0
-    content_expr_raw = str(content_rule.get("content") or "")
-    if content_expr_raw == "":
-        return True, chapter_url, 0
+    begin_network_stage()
+    content_rule = src.get("ruleContent")
+    content_expr_raw = str(content_rule.get("content") or "") if isinstance(content_rule, dict) else ""
+    if not isinstance(content_rule, dict) or content_expr_raw == "":
+        # App getContent (BookSourceEngine.swift:9420-9436): without a ruleContent / content rule the chapter URL
+        # itself is returned as the "text". R144a (F7, user decision): for a text source that is a failure - the
+        # reader would show a bare URL. Sources whose chapter URL really is the content (audio = 1, image = 2)
+        # still pass.
+        try:
+            content_source_type = int(src.get("bookSourceType") or 0)
+        except Exception:
+            content_source_type = 0
+        if content_source_type in (1, 2):
+            return True, chapter_url, 0
+        runtime.variables = dict(runtime.variables or {})
+        runtime.variables["__contentRuleEmpty"] = "1"
+        return False, chapter_url, 0
     content_expr = content_expr_raw.strip()
+    # Only a whitespace-only content rule reaches the App's fallbacks (`contentRuleIsBlank`, E:9726-9751); a rule
+    # that returns nothing is an empty chapter (F1).
+    content_rule_blank = not content_expr
 
     current_url = chapter_url
     visited: set[str] = set()
@@ -14861,7 +15111,7 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
             charset=request_charset,
             response_meta=response_meta,
         )
-        if request_method != "POST" and not html.strip() and status == 0:
+        if content_rule_blank and request_method != "POST" and src.get("enabledCookieJar") is not False and not html.strip():
             retry_meta: dict[str, Any] = {}
             retry_html, retry_final_url, retry_status = fetch_text(
                 requests.Session(),
@@ -14877,8 +15127,16 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                 final_url = retry_final_url
                 status = retry_status
                 response_meta = retry_meta
+        if app_http_failure(request_url, status, html, "content", src):
+            # App E:9601-9638: a failed request throws when nothing has been collected yet, otherwise the parsed
+            # pages are kept.
+            if chunks:
+                break
+            return False, "", page_count
         if request_method.upper() == "GET" and not has_request_header(request_headers, "Referer"):
-            blocked_by_referer = "ref=blocked" in final_url.lower() or contains_http_error_page_signals(html)
+            # App E:9583-9600 (equivalent, kept): a hot-link-protection error page is retried once with the parent
+            # directory as Referer; only a `ref=blocked` URL or a title / non-2xx error page triggers it.
+            blocked_by_referer = "ref=blocked" in final_url.lower() or is_heuristic_http_error_page(html, status)
             if blocked_by_referer:
                 referer = parent_directory_referer(abs_url)
                 if referer:
@@ -14894,7 +15152,11 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                         charset=request_charset,
                         response_meta=referer_meta,
                     )
-                    if retry_html and retry_status < 400 and not contains_http_error_page_signals(retry_html):
+                    if (
+                        retry_html
+                        and not app_http_error_blocks_rules(retry_status, retry_html, "content", bool(str(src.get("loginCheckJs") or "").strip()))
+                        and not is_heuristic_http_error_page(retry_html, retry_status)
+                    ):
                         html, final_url, status = retry_html, retry_final_url, retry_status
                         response_meta = referer_meta
         login_ok, html, final_url = apply_login_check_js(
@@ -14952,35 +15214,39 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                 return False, "webView deferred content", page_count
             break
         page_content = evaluate_content_rule_with_inline_replace_guard(content_expr, page_html, runtime3, content_type)
-        json_text = extract_json(page_html)
-        if not page_content and json_text:
-            try:
-                obj = json.loads(json_text)
-                if isinstance(obj, dict):
-                    page_content = json_first_text(obj, [
-                        "content", "chapterContent", "chapter_content", "body", "text", "html", "article", "articleContent",
-                        "data.content", "data.chapterContent", "data.chapter_content", "data.body", "data.text", "data.html",
-                        "result.content", "result.chapterContent", "result.chapter_content", "result.body", "result.text", "result.html",
-                        "chapter.content", "chapter.text", "chapter.body", "book.content", "novel.content",
-                    ])
-                else:
-                    page_content = json_scalar_text(obj)
-            except Exception:
-                pass
-        if not page_content and content_type == "html" and is_meaningful_content(page_html):
-            head = page_html[:500].lower()
-            if not any(marker in head for marker in ("<html", "<body", "<script", "<!doctype")):
-                if len(re.findall(r"<[A-Za-z][^>]{0,80}>", page_html[:4000])) < 3:
-                    page_content = page_html.strip()
-        if content_type == "html":
-            page_content = apply_html_content_fallback(page_content, page_html)
-        if not page_content and content_type == "html":
-            page_content = html_to_visible_text(page_html)
-        if content_type == "html":
-            if not is_meaningful_content(page_content):
-                recovered_content = recover_deferred_chapter_api_content(session, final_url, request_headers, page_html)
-                if recovered_content:
-                    page_content = recovered_content
+        # R144a (F1 / F10): "非空规则结果原样使用；以下兜底仅用于缺少 content 规则的书源"
+        # (BookSourceEngine.swift:9723-9751). A rule that is present but yields nothing is an empty chapter - no
+        # JSON key guessing, no container fallback, no whole-page text.
+        if content_rule_blank:
+            json_text = extract_json(page_html)
+            if not page_content and json_text:
+                try:
+                    obj = json.loads(json_text)
+                    if isinstance(obj, dict):
+                        page_content = json_first_text(obj, [
+                            "content", "chapterContent", "chapter_content", "body", "text", "html", "article", "articleContent",
+                            "data.content", "data.chapterContent", "data.chapter_content", "data.body", "data.text", "data.html",
+                            "result.content", "result.chapterContent", "result.chapter_content", "result.body", "result.text", "result.html",
+                            "chapter.content", "chapter.text", "chapter.body", "book.content", "novel.content",
+                        ])
+                    else:
+                        page_content = json_scalar_text(obj)
+                except Exception:
+                    pass
+            if not page_content and content_type == "html" and is_meaningful_content(page_html):
+                head = page_html[:500].lower()
+                if not any(marker in head for marker in ("<html", "<body", "<script", "<!doctype")):
+                    if len(re.findall(r"<[A-Za-z][^>]{0,80}>", page_html[:4000])) < 3:
+                        page_content = page_html.strip()
+            if content_type == "html":
+                page_content = apply_html_content_fallback(page_content, page_html)
+            if not page_content and content_type == "html":
+                page_content = html_to_visible_text(page_html)
+            if content_type == "html":
+                if not is_meaningful_content(page_content):
+                    recovered_content = recover_deferred_chapter_api_content(session, final_url, request_headers, page_html)
+                    if recovered_content:
+                        page_content = recovered_content
         if is_likely_access_gated_content_preview(page_content):
             page_count += 1
             if not chunks:
@@ -15046,15 +15312,17 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
                 merged, str(content_rule.get("replaceRegex") or ""), runtime2
             )
             replaced = replaced.strip()
-            merged = pre_replace if should_keep_pre_replace_content(pre_replace, replaced) else replaced
-    if not merged and last_html:
+            # R144a (F8): the App shows the replaced text (BookSourceEngine.swift:9947-9952); a replaceRegex that
+            # empties the chapter leaves it empty instead of silently falling back to the pre-replace text.
+            merged = replaced
+    if content_rule_blank and not merged and last_html:
         merged = html_to_visible_text(last_html)
     merged = merged.strip()
     if did_apply_replace_regex:
         merged = apply_legado_content_replace_indent(merged).strip("\r\n")
     if is_likely_access_gated_content_preview(merged):
         return False, merged, page_count
-    return is_meaningful_content(merged) or has_meaningful_image_content(merged) or (used_source_regex_resource and bool(merged)), merged, page_count
+    return is_usable_chapter_text(merged) or has_meaningful_image_content(merged) or (used_source_regex_resource and bool(merged)), merged, page_count
 
 
 def _empty_detail(src: dict[str, Any]) -> dict[str, Any]:
@@ -15297,13 +15565,14 @@ def _quick_scan_single_source(
 
     runtime = make_runtime(src)
     holder["state"] = runtime.interaction_state
-    session = _thread_local.session if hasattr(_thread_local, "session") else None
-    if session is None:
-        session = requests.Session()
-        _thread_local.session = session
+    # R144a (F11): one fresh Session per source - no cookie of another source (or of an earlier round) leaks in, and
+    # `enabledCookieJar: false` stops Set-Cookie from being stored.
+    session = make_source_session(src)
     try:
         probe_timeout = remaining_source_validation_seconds(CONNECT_TIMEOUT)
-        response = session.get(
+        # R144a (F11): the reachability probe uses a throwaway Session; the App never probes the home page, so its
+        # Set-Cookie must not seed the Session the real search / detail / toc / content requests use.
+        response = requests.Session().get(
             runtime.base_url,
             headers=runtime.headers,
             timeout=(min(REQUEST_CONNECT_TIMEOUT, probe_timeout), probe_timeout),
@@ -15357,6 +15626,9 @@ def _quick_scan_single_source(
                 detail["error"] = "search page requires browser challenge"
             else:
                 detail["failureReason"] = "no search/explore result"
+                attach_network_error(detail, "search")
+                if (runtime.variables or {}).get("__exploreOnlyRescue") == "1":
+                    detail["error"] = "search returned no usable result (App marks 搜索失效); a working discovery entry does not rescue it"
             detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
             return False, None, detail
         first_book_url = str(book_urls[0])
@@ -15452,10 +15724,9 @@ def _validate_single_source(
 
     runtime = make_runtime(src)
     holder["state"] = runtime.interaction_state
-    session = _thread_local.session if hasattr(_thread_local, "session") else None
-    if session is None:
-        session = requests.Session()
-        _thread_local.session = session
+    # R144a (F11): one fresh Session per source - no cookie of another source (or of an earlier round) leaks in, and
+    # `enabledCookieJar: false` stops Set-Cookie from being stored.
+    session = make_source_session(src)
     if quick_seed:
         seeded_interactions = quick_seed.get("interactionState")
         if isinstance(seeded_interactions, dict) and isinstance(runtime.interaction_state, dict):
@@ -15488,7 +15759,7 @@ def _validate_single_source(
         else:
             try:
                 initial_timeout = remaining_source_validation_seconds(CONNECT_TIMEOUT)
-                session.get(
+                requests.Session().get(
                     runtime.base_url,
                     headers=runtime.headers,
                     timeout=(min(REQUEST_CONNECT_TIMEOUT, initial_timeout), initial_timeout),
@@ -15507,8 +15778,11 @@ def _validate_single_source(
                 detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
                 return ValidationOutcome(False, reason="webView/paid content", response_time_ms=detail["responseTimeMs"]), None, detail
             detail["failureReason"] = "no search/explore result"
+            attach_network_error(detail, "search")
+            if (runtime.variables or {}).get("__exploreOnlyRescue") == "1":
+                detail["error"] = "search returned no usable result (App marks 搜索失效); a working discovery entry does not rescue it"
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
-            return ValidationOutcome(False, reason="no search/explore result", response_time_ms=detail["responseTimeMs"]), None, detail
+            return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"]), None, detail
         detail["stages"]["search"] = True
         first_book_url = book_urls[0]
         detail["sampleBookUrl"] = first_book_url
@@ -15525,8 +15799,9 @@ def _validate_single_source(
         if not ok:
             detail["failureReason"] = "detail failed"
             detail["error"] = detail_error or ""
+            attach_network_error(detail, "detail")
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
-            return ValidationOutcome(False, reason="detail failed", response_time_ms=detail["responseTimeMs"], book_url=first_book_url), None, detail
+            return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"], book_url=first_book_url), None, detail
         detail["stages"]["detail"] = True
         detail["detailBookName"] = name
         detail["detailBookAuthor"] = (runtime.book_author or runtime.validation_book_author or "").strip()
@@ -15552,8 +15827,9 @@ def _validate_single_source(
         detail["tocUniqueChapterCount"] = toc_unique_chapters
         if not toc_ok:
             detail["failureReason"] = "toc failed"
+            attach_network_error(detail, "toc")
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
-            return ValidationOutcome(False, reason="toc failed", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
+            return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         detail["stages"]["toc"] = True
         detail["firstChapterTitle"] = first_chapter_title
         ensure_source_validation_time_remaining()
@@ -15573,6 +15849,12 @@ def _validate_single_source(
             detail["failureReason"] = "webView/paid content"
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
             return ValidationOutcome(False, reason="webView/paid content", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
+        if not content_ok and (runtime.variables or {}).get("__contentRuleEmpty") == "1":
+            # R144a (F7): ruleContent.content is empty, so the App would show the chapter URL itself.
+            detail["failureReason"] = "content rule empty"
+            detail["error"] = "ruleContent.content is empty: the App returns the chapter URL as the text"
+            detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
+            return ValidationOutcome(False, reason="content rule empty", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         if not content_ok:
             if (
                 is_webview_or_paid_content_source(src, first_chapter_url)
@@ -15583,8 +15865,9 @@ def _validate_single_source(
                 detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
                 return ValidationOutcome(False, reason="webView/paid content", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
             detail["failureReason"] = "content failed"
+            attach_network_error(detail, "content")
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
-            return ValidationOutcome(False, reason="content failed", response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
+            return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"], book_url=first_book_url, detail_name=name, detail_toc_url=normalized_toc_url), None, detail
         detail["stages"]["content"] = True
         elapsed = int((time.perf_counter() - start) * 1000)
         detail["ok"] = True

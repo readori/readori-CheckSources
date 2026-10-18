@@ -1,7 +1,17 @@
 import time
 from pathlib import Path
 
+import pytest
+
 from server import source_validator_server as server
+from validator import net_guard
+
+
+@pytest.fixture(autouse=True)
+def _offline_public_dns(monkeypatch) -> None:
+    """The server's SSRF gate resolves source hosts; keep these pipeline tests offline and deterministic."""
+
+    monkeypatch.setattr(net_guard, "default_resolver", lambda host: ["93.184.216.34"])
 
 
 def _source(url: str, name: str = "Example") -> dict:

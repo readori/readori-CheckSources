@@ -98,24 +98,38 @@ function transformPayload(path, payload) {
   return payload;
 }
 
+const JOB_ACTIONS = {
+  "": ["GET"],
+  sources: ["GET"],
+  events: ["GET"],
+  result: ["GET"],
+  cancel: ["POST"],
+  resume: ["POST"],
+};
+
+// Returns { path, query, public? } for a known route, { methodNotAllowed: true } for a known path with the
+// wrong method, or null.  `public` marks the only route that needs no access token (health check).
 function upstreamPath(request) {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts[0] !== "api") return null;
-  if (parts[1] === "healthz" && parts.length === 2 && request.method === "GET") {
-    return { path: "/healthz", query: "" };
+  if (parts[1] === "healthz" && parts.length === 2) {
+    return request.method === "GET" ? { path: "/healthz", query: "", public: true } : { methodNotAllowed: true };
   }
-  if (parts[1] === "uploads" && parts.length === 2 && request.method === "POST") {
-    return { path: "/v1/jobs/upload", query: url.search };
+  if (parts[1] === "uploads" && parts.length === 2) {
+    return request.method === "POST" ? { path: "/v1/jobs/upload", query: url.search } : { methodNotAllowed: true };
   }
-  if (parts[1] !== "jobs" || !parts[2]) {
-    if (parts[1] === "jobs" && parts.length === 2 && request.method === "POST") return { path: "/v1/jobs", query: url.search };
-    return null;
+  if (parts[1] !== "jobs") return null;
+  if (parts.length === 2) {
+    return request.method === "POST" ? { path: "/v1/jobs", query: url.search } : { methodNotAllowed: true };
   }
+  if (parts.length > 4) return null;
+  const action = parts[3] || "";
+  const methods = Object.prototype.hasOwnProperty.call(JOB_ACTIONS, action) ? JOB_ACTIONS[action] : null;
+  if (!methods) return null;
+  if (!methods.includes(request.method)) return { methodNotAllowed: true };
   const jobId = encodeURIComponent(parts[2]);
-  const suffix = parts.slice(3);
-  const suffixText = suffix.length ? `/${suffix.map((part) => encodeURIComponent(part)).join("/")}` : "";
-  const target = `/v1/jobs/${jobId}${suffixText}`;
+  const target = action ? `/v1/jobs/${jobId}/${action}` : `/v1/jobs/${jobId}`;
   const query = new URLSearchParams(url.search);
   if (query.has("afterId")) {
     query.set("after_id", query.get("afterId") || "0");
@@ -124,15 +138,54 @@ function upstreamPath(request) {
   return { path: target, query: query.toString() ? `?${query.toString()}` : "" };
 }
 
+// --- access control -------------------------------------------------------------------------------------
+// The Worker holds the backend token, so it must never inject it for an anonymous caller.  Every route except
+// the health check requires `Authorization: Bearer <READORI_VALIDATOR_ACCESS_TOKEN>`.  With no secret configured
+// the Worker fails closed (503) instead of running open.
+
+async function digest(text) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+}
+
+// Constant-time comparison: hash both sides to a fixed length, then OR the byte differences together.
+async function tokensMatch(supplied, expected) {
+  const [a, b] = await Promise.all([digest(supplied), digest(expected)]);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < a.length && i < b.length; i += 1) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+function bearerToken(request) {
+  const header = request.headers.get("authorization") || "";
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match ? match[1].trim() : "";
+}
+
+// Returns a Response when the caller must be refused, otherwise null.
+async function requireAccess(request, env) {
+  const expected = String(env.READORI_VALIDATOR_ACCESS_TOKEN || "").trim();
+  if (!expected) {
+    return textError(request, env, 503, "未配置访问令牌：请先执行 wrangler secret put READORI_VALIDATOR_ACCESS_TOKEN");
+  }
+  const supplied = bearerToken(request);
+  if (!supplied || !(await tokensMatch(supplied, expected))) {
+    return json(request, env, { error: "访问令牌无效或缺失" }, 401, { "www-authenticate": 'Bearer realm="readori-validator"' });
+  }
+  return null;
+}
+
 async function proxy(request, env, target) {
   const config = serverConfig(env);
   if (config.error) return textError(request, env, 503, config.error);
-  if (!config.token) return textError(request, env, 503, "VALIDATOR_SERVER_TOKEN is not configured");
+  // The health check is the only anonymous route and never carries the backend token.
+  if (!target.public && !config.token) return textError(request, env, 503, "VALIDATOR_SERVER_TOKEN is not configured");
 
   const headers = new Headers(request.headers);
   headers.delete("host");
   headers.delete("cookie");
-  headers.set("x-api-key", config.token);
+  headers.delete("authorization"); // the caller's access token stops here
+  headers.delete("x-api-key");
+  if (!target.public) headers.set("x-api-key", config.token);
   headers.set("accept", "application/json");
 
   let body = request.body;
@@ -144,6 +197,11 @@ async function proxy(request, env, target) {
       if (target.path === "/v1/jobs" && payload && typeof payload === "object" && payload.inputName && !payload.input_name) {
         payload.input_name = payload.inputName;
         delete payload.inputName;
+      }
+      if (target.path === "/v1/jobs" && payload && typeof payload === "object") {
+        // The console never reads server-side files; do not let a caller reach the backend's input_path feature.
+        delete payload.input_path;
+        delete payload.inputPath;
       }
       body = JSON.stringify(payload);
       headers.set("content-type", "application/json");
@@ -174,7 +232,13 @@ async function proxy(request, env, target) {
 
 async function routeAPI(request, env) {
   const target = upstreamPath(request);
-  return target ? proxy(request, env, target) : textError(request, env, 404, "route not found");
+  if (!target) return textError(request, env, 404, "route not found");
+  if (target.methodNotAllowed) return textError(request, env, 405, "method not allowed");
+  if (!target.public) {
+    const refusal = await requireAccess(request, env);
+    if (refusal) return refusal;
+  }
+  return proxy(request, env, target);
 }
 
 export default {

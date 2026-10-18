@@ -12,7 +12,7 @@ $env:READORI_VALIDATOR_DB = "D:\Readzen\readori-shuyuan\server\data\validator.sq
 .\.venv\Scripts\python.exe -m server.source_validator_server --host 0.0.0.0 --port 8787
 ```
 
-未设置 API key 时仅适合本机开发；部署到局域网或公网前必须设置 `READORI_VALIDATOR_API_KEY`，并在反向代理启用 TLS。可用 `READORI_VALIDATOR_INPUT_ROOT` 限制 `input_path` 只能读取指定目录。
+未设置 API key 时仅适合本机开发；部署到局域网或公网前必须设置 `READORI_VALIDATOR_API_KEY`，并在反向代理启用 TLS。`input_path` 始终被限定在一个根目录内：`READORI_VALIDATOR_INPUT_ROOT`，未设置时默认为服务数据目录（`READORI_VALIDATOR_DB` 所在目录）下的 `inputs/` 子目录。相对路径按该根目录解析，路径会先 `resolve`（折叠 `..`、跟随符号链接 / junction）再判断是否仍在根目录内，越界返回 403；只接受文件，不接受目录。
 
 ### AMD Micro 一键安装
 
@@ -77,3 +77,18 @@ sudo --preserve-env=READORI_VALIDATOR_API_KEY,READORI_VALIDATOR_HOST,READORI_VAL
 ## 配置建议
 
 1000+ 书源建议 `workers=8–16`、`domain_concurrency=2`、`quick_timeout=8`、`source_timeout=30`、`rounds=2`。服务器验证通过后仍应在 iOS 真机抽样搜索 → 详情 → 目录 → 正文复测；必须登录、验证码或付费的书源会标为不可自动认证，而不是进入 App 默认可用列表。
+
+## 安全（R145a）
+
+| 项目 | 行为 |
+| --- | --- |
+| 访问鉴权 | 设置了 `READORI_VALIDATOR_API_KEY` 后，除 `/healthz` 外都要求 `x-api-key` 或 `Authorization: Bearer`，常量时间比较。公网只应经 Cloudflare Worker（它另有访问令牌）访问本服务。 |
+| SSRF（来源地址） | 每个书源的 `bookSourceUrl` / `searchUrl` / `exploreUrl` 中的主机，解析 DNS 后只要有一个地址是私网、回环、链路本地（含 169.254.169.254 云元数据）、CGNAT、多播、保留地址，或 IPv4 嵌在 IPv6（`::ffff:`、NAT64、6to4）里的上述地址，该源在 quick-scan 前直接失败，原因 `blocked: non-public address (...)`，不会发出任何请求。结果缓存 5 分钟。无法解析的主机交给引擎，按连通性失败处理。 |
+| 本地开发开关 | `READORI_VALIDATOR_ALLOW_PRIVATE_NETWORK=1`（也接受 `true/yes/on`）关闭上述过滤，只用于本机夹具测试，**不要**写进生产环境文件。 |
+| 引擎内部请求 | `fetch_text`、JS `ajax`、重定向跳转目前不经过 `validator/net_guard.py`；服务器只检查书源声明的首跳主机。书源规则仍可能让引擎请求其他地址，需要后续在引擎里接入 `check_url_allowed` 并对每次重定向复查。 |
+| 上传大小 | `READORI_VALIDATOR_MAX_UPLOAD_BYTES`（默认 64 MiB）。ASGI 层先看 `Content-Length`，再对分块 / 说谎的请求体逐块计数，超过上限 + 1 MiB 的 multipart 开销立即 413，不等整份读完；文件本身再按分块读取，超过上限即刻 413。 |
+| 取消排队任务 | 取消 `queued` 任务立即变为 `cancelled`，worker 取到它时直接跳过；之前 worker 启动时会清掉取消标志，取消请求会丢失。取消后仍可用 `/resume` 重新排队。运行中的任务仍用轮询取消标志。 |
+| 每域名并发 | 信号量按域名保存容量，只在请求的上限改变时重建；之前用“剩余许可数大于上限”判断，繁忙时降低上限不生效。 |
+| 日志脱敏 | 事件 / 明细里含 `cookie`、`token`、`password`、`secret`、`api key`、`authorization`、`auth`、`credential`、`session` 的键会被替换为 `[redacted]`；`author` / `authors` / `authority` 不再被误伤。 |
+| 设备门槛 | `detail_is_device_compatible`（搜索 / 详情 / 目录 / 正文四段、章节数、正文预览长度、交互验证、WebView 延迟内容、搜索页落地检查）只在服务器 `device` profile 下生效；命令行与 GUI 没有，三条路径结果可能不同。 |
+| 书源 JS | Node `vm` 不是安全沙箱，书源脚本可能逃逸。服务器必须用低权限用户、`ProtectSystem=strict`、限制出口网络运行，并且只对受信任的提交者开放（见 Cloudflare 访问令牌）。 |
