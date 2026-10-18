@@ -1024,6 +1024,45 @@ def _detail_book_identity(record: dict[str, Any], detail: dict[str, Any] | None)
     return title, author, sample
 
 
+_QUALITY_STAGES = ("search", "detail", "toc", "content")
+
+
+def candidate_quality_key(record: dict[str, Any], detail: dict[str, Any] | None) -> tuple[int, int, int]:
+    """R147 (F13): how completely a validated variant really worked, higher is better.
+
+    ``(stages passed, content size class, unique chapters)`` from what the validation measured (the
+    ``__readoriValidation`` metadata the passing record carries, falling back to the ``detail`` of the pipeline). The
+    content size class is ``bit_length`` of the first-chapter text length (a 1200 vs 1300 character difference is
+    noise, 0 vs 800 is not), so a variant whose rules return the whole chapter beats one that returns a stub, and a
+    variant that walks every TOC page beats one that stops at the first. Records without measurements score ``(0,0,0)``.
+    """
+    metadata = record.get("__readoriValidation") if isinstance(record.get("__readoriValidation"), dict) else {}
+    detail = detail if isinstance(detail, dict) else {}
+    # The metadata travels with the passing record; ``detail`` may belong to a later (failed) stability round.
+    stages = detail.get("stages") if isinstance(detail.get("stages"), dict) else None
+    if "stagesPassed" in metadata:
+        passed = _int_or_zero(metadata.get("stagesPassed"))
+    elif stages is not None:
+        passed = sum(1 for name in _QUALITY_STAGES if stages.get(name))
+    else:
+        passed = 0
+
+    def measured(metadata_key: str, detail_key: str) -> int:
+        value = _int_or_zero(metadata.get(metadata_key))
+        return value if value > 0 else _int_or_zero(detail.get(detail_key))
+
+    content_chars = measured("contentChars", "contentPreviewChars")
+    chapters = measured("tocChapters", "tocUniqueChapterCount")
+    return passed, max(0, content_chars).bit_length(), max(0, chapters)
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def aggregate_validated_sources(
     entries: Iterable[tuple[str, dict[str, Any], dict[str, Any] | None]],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -1052,7 +1091,9 @@ def aggregate_validated_sources(
     for candidates in groups.values():
         if len(candidates) > 1:
             duplicate_groups += 1
-        candidates.sort(key=lambda item: (-score_candidate(item[1]), int(item[1].get("respondTime") or 0), str(item[1].get("bookSourceName") or "").casefold(), str(item[1].get("bookSourceUrl") or "")))
+        # R147 (F13): measured quality first (all stages really passed, fuller chapter text, more chapters); the
+        # customTag based score_candidate cannot tell rule quality apart (every passing record carries the same tag).
+        candidates.sort(key=lambda item: (tuple(-part for part in candidate_quality_key(item[1], item[2])), -score_candidate(item[1]), int(item[1].get("respondTime") or 0), str(item[1].get("bookSourceName") or "").casefold(), str(item[1].get("bookSourceUrl") or "")))
         selected.append(candidates[0])
     selected.sort(key=lambda item: (canonical_source_site_key(item[1]), str(item[1].get("bookSourceName") or "").casefold()))
     return [record for _, record, _ in selected], {"input": input_count, "output": len(selected), "removed": max(0, input_count - len(selected)), "duplicateGroups": duplicate_groups}
@@ -2376,7 +2417,7 @@ def _build_java_api_js(runtime: RuleRuntime) -> str:
     """构建 java.* 对象的 JS 代码，对齐 Legado AnalyzeRule/java 桥接 API"""
     import base64
     import hashlib
-    return r"""
+    java_api_js = r"""
 function __readoriBufferFromUtf8(value) {
     if (typeof Buffer !== 'undefined') return Buffer.from(String(value || ''), 'utf8');
     return String(value || '');
@@ -5835,6 +5876,37 @@ org.jsoup.Jsoup.parse = function(html) {
 if (typeof __readoriBookIsNull !== 'undefined' && __readoriBookIsNull) { book = null; }
 if (typeof chapterActive !== 'undefined' && !chapterActive) { chapter = null; }
 """
+    if _dbg.active():
+        # R147 (H9): java.log(msg) also lands in the debug trace (kind="log"); batch validation keeps the plain stub.
+        java_api_js = java_api_js.replace(
+            "log: function(msg) { return msg; },",
+            "log: function(msg) { __readoriDebugLogPush(msg); return msg; },",
+            1,
+        ) + _DEBUG_LOG_JS
+    return java_api_js
+
+
+DEBUG_LOG_LIMIT = 500
+DEBUG_LOG_TEXT_LIMIT = 2000
+# Appended to the java prelude while a debug trace is open (Node vm and QuickJS both run the prelude as plain JS).
+_DEBUG_LOG_JS = r"""
+var __readoriDebugLog = [];
+function __readoriDebugLogPush(msg) {
+    if (__readoriDebugLog.length >= %d) return;
+    var text;
+    try { text = String(msg); } catch (error) { text = '[unprintable]'; }
+    __readoriDebugLog.push(text.length > %d ? text.slice(0, %d) : text);
+}
+""" % (DEBUG_LOG_LIMIT, DEBUG_LOG_TEXT_LIMIT, DEBUG_LOG_TEXT_LIMIT)
+
+
+def emit_debug_log_messages(messages: Any) -> None:
+    """Forward the messages a script passed to java.log to the active debug trace (no-op without one)."""
+    if not _dbg.active() or not isinstance(messages, list):
+        return
+    for message in messages[:DEBUG_LOG_LIMIT]:
+        if _dbg.active():
+            _dbg.emit("log", value=str(message)[:DEBUG_LOG_TEXT_LIMIT])
 
 
 NODE_JS_RUNNER = r"""
@@ -6572,7 +6644,8 @@ function __readoriAppNatives() {
       scriptError: scriptError,
       variables: context.variables || {},
       requests: Array.isArray(context.__readoriRequestLog) ? context.__readoriRequestLog : [],
-      interactions: suppressedInteractions
+      interactions: suppressedInteractions,
+      logs: Array.isArray(context.__readoriDebugLog) ? context.__readoriDebugLog : []
     }));
   } catch (error) {
     __hostStdout.write(JSON.stringify({ value: '', variables: {} }));
@@ -6612,8 +6685,25 @@ def install_quickjs_app_globals(ctx: Any, runtime: RuleRuntime) -> None:
         pass
 
 
+def read_quickjs_debug_log(ctx: Any) -> list[str]:
+    """The java.log messages collected on the JS side (empty unless the prelude was built under a debug trace)."""
+    try:
+        raw = ctx.eval("JSON.stringify(typeof __readoriDebugLog === 'undefined' ? [] : __readoriDebugLog)")
+        messages = json.loads(str(raw or "[]"))
+    except Exception as _swallowed:
+        note_debug_error("quickjs debug log", _swallowed)
+        return []
+    return [str(message) for message in messages] if isinstance(messages, list) else []
+
+
 def drain_quickjs_interactions(ctx: Any, runtime: RuleRuntime) -> None:
     """Move the interaction kinds the JS side logged (java.startBrowser* etc.) into runtime.interaction_state."""
+    if _dbg.active():
+        emit_debug_log_messages(read_quickjs_debug_log(ctx))
+        try:
+            ctx.eval("if (typeof __readoriDebugLog !== 'undefined') __readoriDebugLog.length = 0;")
+        except Exception:
+            pass
     try:
         raw = ctx.eval(
             "JSON.stringify(typeof __readoriSuppressedInteractionLog === 'undefined' ? [] : __readoriSuppressedInteractionLog)"
@@ -6848,7 +6938,8 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
                 timeout=node_timeout,
                 env=env,
             )
-        except Exception:
+        except Exception as _swallowed:
+            note_debug_error("node js subprocess", _swallowed)
             return None
         if proc.returncode != 0:
             if os.environ.get("READORI_DEBUG_NODE_JS"):
@@ -6896,6 +6987,8 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
 
     if not isinstance(node_result, dict) or "value" not in node_result:
         return ""
+    # R147 (H9): the replay loop above re-runs the script; only the final run's java.log output is reported.
+    emit_debug_log_messages(node_result.get("logs"))
     if node_result.get("scriptError"):
         record_script_error(runtime, str(node_result.get("scriptError")), script)
     variables = node_result.get("variables")
@@ -7661,6 +7754,13 @@ class _QuickJSNativeBridge:
             return []
         return [lambda kind=kind: record_suppressed_interaction(runtime, _js_text(kind)) for kind in kinds]
 
+    def debug_log_effects(self) -> list[Callable[[], None]]:
+        """R147 (H9): java.log messages the script wrote (only collected while a debug trace was open at build time)."""
+        if not _dbg.active():
+            return []
+        messages = read_quickjs_debug_log(self._ctx)
+        return [lambda: emit_debug_log_messages(messages)] if messages else []
+
 
 def _evaluate_js_quickjs(
     code: str,
@@ -8113,6 +8213,7 @@ def _evaluate_js_quickjs_attempt(
         if js_ctx is not None:
             state["miss"] = js_ctx.first_native_miss()
             pending.extend(js_ctx.interaction_effects(runtime))
+            pending.extend(js_ctx.debug_log_effects())
 
 
 def apply_login_check_js(
@@ -8176,7 +8277,8 @@ if (__readoriCheckedResponse !== undefined && __readoriCheckedResponse !== null)
     encoded = evaluate_js(wrapper, body, check_runtime)
     try:
         document = json.loads(encoded)
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("loginCheckJs result", _swallowed)
         return False, body, final_url
     if not isinstance(document, dict) or document.get("valid") is not True:
         return False, body, final_url
@@ -9399,7 +9501,8 @@ def css_extract(html: str, selector: str, attr: str | None, index: int | None, b
     soup = BeautifulSoup(html, "html.parser")
     try:
         elems = soup.select(normalize_selector(selector))
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("css selector", _swallowed)
         return []
     if index is not None:
         if index <= -1000:
@@ -9525,7 +9628,8 @@ def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> lis
     """
     try:
         from lxml import etree, html as lxml_html
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("xpath lxml import", _swallowed)
         return []
 
     def extract_items(items: list) -> list[str]:
@@ -9594,6 +9698,7 @@ def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> lis
         if results_xml:
             return results_xml
     except Exception:
+        # Strategy 1 failing is expected (XHTML conversion); only a failure of strategy 2 below is reported.
         pass
 
     # 策略2：lxml.html 降级（与 Swift SwiftSoup CSS 降级方向一致）
@@ -9601,7 +9706,8 @@ def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> lis
         doc_html = lxml_html.fromstring(html)
         items_html = doc_html.xpath(xpath)
         return extract_items(items_html)
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("xpath strategy 2 (html)", _swallowed)
         return []
 
 
@@ -9611,7 +9717,8 @@ def jsonpath_extract(content: str, path: str, preserve_objects: bool = False) ->
         return []
     try:
         obj = json.loads(json_text)
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("jsonpath json parse", _swallowed)
         return []
     norm_path = path.strip()
     if norm_path and not norm_path.startswith("$") and not norm_path.startswith("["):
@@ -9620,7 +9727,8 @@ def jsonpath_extract(content: str, path: str, preserve_objects: bool = False) ->
     try:
         expr = parse_jsonpath_expression(norm_path)
         matches = [m.value for m in expr.find(obj)]
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("jsonpath expression", _swallowed)
         return []
     results: list[str] = []
     for item in matches:
@@ -10399,7 +10507,8 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
                         runtime.variables[key] = value
                         out.append(value)
                     return out
-                except Exception:
+                except Exception as _swallowed:
+                    note_debug_error("rule @put", _swallowed)
                     pass
             pairs = [part.strip() for part in body.split(",") if part.strip()]
             if len(pairs) > 1 and all(":" in part for part in pairs):
@@ -10923,7 +11032,8 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
                 normalized = normalize_selector(selector_value)
                 for node in current:
                     selected.extend(node.select(normalized))
-        except Exception:
+        except Exception as _swallowed:
+            note_debug_error("css chain selector", _swallowed)
             return []
         selected = _apply_css_index_selection(selected, step_selection)
         if not selected:
@@ -11107,7 +11217,8 @@ def evaluate_json_rule(rule: str, content: str, runtime: RuleRuntime) -> list[st
         return []
     try:
         obj = json.loads(json_text)
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("json rule parse", _swallowed)
         return []
     path = text
     if path and not path.startswith(("$", "[")):
@@ -11131,7 +11242,8 @@ def evaluate_json_rule(rule: str, content: str, runtime: RuleRuntime) -> list[st
     try:
         expr = parse_jsonpath_expression(path)
         matches = [m.value for m in expr.find(obj)]
-    except Exception:
+    except Exception as _swallowed:
+        note_debug_error("json rule path", _swallowed)
         matches = []
     if object_mode:
         return legado_get_string_json_values(matches, indefinite=jsonpath_is_indefinite(path))
@@ -11787,6 +11899,8 @@ def candidate_validation_keywords(primary: str) -> list[str]:
     # one-character, long or whitespace-bearing value can invalidate signed or
     # language-specific search requests. Additional candidates are recovery
     # probes only and never replace the source-authored primary value.
+    # R147: NOT used by batch validation any more (the App searches one keyword, see app_validation_keywords);
+    # kept for offline recovery probes and the scripts/tests contract.
     base = primary if primary and primary.strip() else "夜无疆"
     out = [base]
     for kw in FALLBACK_KEYWORDS:
@@ -11799,6 +11913,20 @@ def candidate_validation_keywords(primary: str) -> list[str]:
 
 def normalized_validation_keyword(raw: str | None) -> str:
     return candidate_validation_keywords(raw or "")[0]
+
+
+# R147 (task 1): the App's batch validation searches exactly ONE keyword per source
+# (BookSourceValidator.validationSearchKeyword, BookSourceValidator.swift:2682-2691): ruleSearch.checkKeyWord verbatim
+# when it is not blank, otherwise "我的". It never rotates through other keywords while validating; the other keywords
+# (`repairCheckKeywords`) are only tried by the user-triggered one-click repair after a failed validation.
+APP_DEFAULT_CHECK_KEYWORD = "我的"
+
+
+def app_validation_keywords(raw: Any) -> list[str]:
+    """The keyword list the App's batch validation uses: one entry, `checkKeyWord` verbatim or the App default."""
+    if isinstance(raw, str) and raw.strip():
+        return [raw]
+    return [APP_DEFAULT_CHECK_KEYWORD]
 
 
 def _candidate_retry_urls(url: str) -> list[str]:
@@ -11956,6 +12084,46 @@ def classify_network_error(exc: BaseException | str) -> tuple[str, str]:
 def begin_network_stage() -> None:
     """Forget the transport errors of the previous stage (per thread)."""
     _thread_local.network_events = []
+
+
+# ---- R147 (L7): swallowed exceptions on the verdict path --------------------------------------------------------------
+# Many `except Exception:` blocks turn a failure into an empty result on purpose (that is the App's behaviour too).
+# They used to leave no trace. `note_debug_error` records the most important of them per source in
+# `detail["debugErrors"]` (at most DEBUG_ERROR_LIMIT entries, each truncated) for diagnosis. It never raises and never
+# changes a verdict.
+DEBUG_ERROR_LIMIT = 20
+DEBUG_ERROR_TEXT_LIMIT = 240
+
+
+def begin_debug_errors() -> None:
+    """Forget the swallowed exceptions of the previous source (per thread)."""
+    _thread_local.debug_errors = []
+
+
+def note_debug_error(where: str, exc: BaseException | str) -> None:
+    try:
+        if isinstance(exc, SourceValidationDeadlineExceeded):
+            return
+        events = getattr(_thread_local, "debug_errors", None)
+        if events is None:
+            events = []
+            _thread_local.debug_errors = events
+        if len(events) >= DEBUG_ERROR_LIMIT:
+            return
+        reason = f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc)
+        entry = f"{where}: {' '.join(reason.split())}"[:DEBUG_ERROR_TEXT_LIMIT]
+        if events and events[-1] == entry:
+            return
+        events.append(entry)
+    except Exception:  # noqa: BLE001 - diagnostics must never affect validation
+        return
+
+
+def attach_debug_errors(detail: dict[str, Any]) -> None:
+    """Copy the swallowed exceptions of the source that just ran into ``detail["debugErrors"]``."""
+    events = getattr(_thread_local, "debug_errors", None)
+    if events and isinstance(detail, dict):
+        detail["debugErrors"] = list(events[:DEBUG_ERROR_LIMIT])
 
 
 def record_network_event(url: str, exc: BaseException | str, status: int = 0) -> dict[str, Any]:
@@ -12156,7 +12324,8 @@ def fetch_text(
                                 for key, value in verify_resp.cookies.get_dict().items()
                             }
                         return verify_text, str(verify_resp.url), int(verify_resp.status_code)
-                except Exception:
+                except Exception as _swallowed:
+                    note_debug_error("fetch_text verify redirect", _swallowed)
                     pass
             return text, str(resp.url), int(resp.status_code)
         except SourceValidationDeadlineExceeded:
@@ -13785,11 +13954,15 @@ def fetch_book_candidates(
         explore_rule = search_rule
     has_search = bool(str(src.get("searchUrl") or "").strip()) and isinstance(search_rule, dict) and bool(str(search_rule.get("bookList") or "").strip())
     has_explore = bool(str(src.get("exploreUrl") or "").strip()) and isinstance(explore_rule, dict) and bool(str(explore_rule.get("bookList") or "").strip())
-    check_keyword = normalized_validation_keyword(search_rule.get("checkKeyWord") if isinstance(search_rule, dict) else None)
+    # R147 (task 1): exactly the App's single validation keyword (checkKeyWord verbatim, else "我的"), no rotation.
     custom_keywords = [str(item) for item in (keywords or []) if str(item) != ""]
-    keywords = custom_keywords or candidate_validation_keywords(check_keyword)
+    keywords = custom_keywords or app_validation_keywords(search_rule.get("checkKeyWord") if isinstance(search_rule, dict) else None)
     if explore_url and isinstance(explore_rule, dict) and str(explore_rule.get("bookList") or "").strip():
         has_explore = True
+
+    # R147 (task 2): App doCheckSource records `发现规则为空` (an info label, NOT a failure) when the exploreUrl yields no
+    # category link; only a link that returns no book is `发现失效`.
+    explore_link_empty = [False]
 
     def try_mode(mode: str) -> tuple[list[str], str]:
         if mode not in modes:
@@ -13803,6 +13976,7 @@ def fetch_book_candidates(
         if mode == "explore":
             template = explore_url or build_first_explore_url(str(src.get("exploreUrl") or ""), runtime)
             if not template:
+                explore_link_empty[0] = True
                 return [], ""
             url = template
             if url.lower().startswith("@js:") or (url.lower().startswith("<js>") and url.lower().endswith("</js>")):
@@ -13810,6 +13984,7 @@ def fetch_book_candidates(
                 if rendered:
                     url = rendered
             if not url:
+                explore_link_empty[0] = True
                 return [], ""
             base_url = urljoin(runtime.base_url, url)
             response_meta: dict[str, Any] = {}
@@ -13968,6 +14143,27 @@ def fetch_book_candidates(
 
     search_urls, search_base = try_mode("search")
     if search_urls:
+        # R147 (task 2): the App also runs discovery after a passing search (BookSourceValidator.doCheckSource
+        # 2342-2392: "Discovery must still run after a successful search when the user selected both stages") and
+        # an exploreUrl whose first category returns no book is `发现失效` (2373), which fails the whole source; a
+        # category list without any link is only the info label `发现规则为空` (2391).
+        if has_explore and "search" in modes and "explore" in modes and explore_url is None:
+            # `has_explore` (exploreUrl set + a list rule; a section without its own bookList uses ruleSearch's, like the
+            # App's effectiveExploreRule()). The explore candidate must not replace the search candidate's variables.
+            saved_variables = dict(runtime.variables or {})
+            saved_author = runtime.validation_book_author
+            try:
+                explore_ok_urls, _explore_ok_base = try_mode("explore")
+            finally:
+                runtime.variables = saved_variables
+                runtime.validation_book_author = saved_author
+            if not explore_ok_urls and not explore_link_empty[0]:
+                note_app_validation_failure(runtime)
+                runtime.variables = dict(runtime.variables or {})
+                runtime.variables["__exploreFailed"] = "1"
+                if _dbg.active():
+                    _dbg.set_stage("explore")
+                    _dbg.emit("warn", code="explore_failed", value="发现失效：搜索通过，但发现页没有可用的书（App 判整个书源失效）")
         return search_urls, search_base
     if has_search and "search" in modes:
         # R144a (F4): the App's batch validation runs search and discovery as independent checks
@@ -15879,7 +16075,9 @@ def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] 
     if _dbg.active():
         _dbg.set_stage("quick-scan")
         _dbg.emit("begin")
+    begin_debug_errors()
     passed, seed, detail = _quick_scan_single_source(src, holder)
+    attach_debug_errors(detail)
     if _dbg.active():
         _dbg.set_stage("quick-scan")
         _dbg.emit("end", ok=bool(passed), value=str(detail.get("failureReason") or ""),
@@ -15994,6 +16192,10 @@ def _quick_scan_single_source(
             detail["failedStage"] = "search"
             detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
             return False, None, detail
+        if book_urls and (runtime.variables or {}).get("__exploreFailed") == "1":
+            _mark_explore_failed(detail)
+            detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
+            return False, None, detail
         if not book_urls:
             if (runtime.variables or {}).get("__searchChallenge") == "1":
                 detail["failureReason"] = "webView/paid content"
@@ -16032,6 +16234,13 @@ def _quick_scan_single_source(
         return False, None, detail
 
 
+def _mark_explore_failed(detail: dict[str, Any]) -> None:
+    """R147 (task 2): search passed but the discovery entry returned no book - the App's `发现失效` (a failure group)."""
+    detail["failureReason"] = "explore failed"
+    detail["failureGroup"] = "发现失效"
+    detail["error"] = "search passed but the discovery entry returned no book (App marks 发现失效 and the source fails)"
+
+
 def quick_scan_group(url: str, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     last_detail: dict[str, Any] | None = None
     for src in candidates:
@@ -16057,7 +16266,9 @@ def validate_single_source(
     if _dbg.active():
         _dbg.set_stage("full-validation")
         _dbg.emit("begin")
+    begin_debug_errors()
     outcome, merged, detail = _validate_single_source(src, quick_seed, holder)
+    attach_debug_errors(detail)
     if _dbg.active():
         _dbg.set_stage("full-validation")
         _dbg.emit("end", ok=bool(outcome.passed), value=str(detail.get("failureReason") or ""),
@@ -16119,7 +16330,8 @@ def _validate_single_source(
         if isinstance(cookies, dict):
             try:
                 session.cookies.update(requests.utils.cookiejar_from_dict({str(k): str(v) for k, v in cookies.items()}))
-            except Exception:
+            except Exception as _swallowed:
+                note_debug_error("seed cookies", _swallowed)
                 pass
         runtime.validation_book_author = str(quick_seed.get("searchBookAuthor") or "")
     start = time.perf_counter()
@@ -16150,7 +16362,8 @@ def _validate_single_source(
                     timeout=(min(REQUEST_CONNECT_TIMEOUT, initial_timeout), initial_timeout),
                     allow_redirects=True,
                 )
-            except Exception:
+            except Exception as _swallowed:
+                note_debug_error("base url probe", _swallowed)
                 pass
             # Legado ScriptException in searchUrl/exploreUrl/bookList/item rules fails the stage.
             if _dbg.active():
@@ -16161,6 +16374,10 @@ def _validate_single_source(
             finish_script_error_stage(runtime, stage_sink, detail, "search")
             if _dbg.active():
                 _dbg.emit("end", ok=bool(book_urls), count=len(book_urls))
+        if book_urls and (runtime.variables or {}).get("__exploreFailed") == "1":
+            _mark_explore_failed(detail)
+            detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
+            return ValidationOutcome(False, reason="explore failed", response_time_ms=detail["responseTimeMs"]), None, detail
         if not book_urls:
             if (runtime.variables or {}).get("__searchChallenge") == "1":
                 detail["failureReason"] = "webView/paid content"
@@ -16289,6 +16506,10 @@ def _validate_single_source(
             "sampleBookUrl": first_book_url,
             "sourceSiteKey": canonical_source_site_key(original),
             "ruleFingerprint": source_rule_fingerprint(original),
+            # R147 (F13): measured quality for the same-book aggregation (see candidate_quality_key).
+            "stagesPassed": sum(1 for stage_name in _QUALITY_STAGES if detail["stages"].get(stage_name)),
+            "contentChars": detail["contentPreviewChars"],
+            "tocChapters": toc_unique_chapters,
         }
         if content_preview and not merged.get("bookSourceComment"):
             merged["bookSourceComment"] = f"tocPages={toc_pages};tocFirstPageItems={toc_first_page};tocUniqueChapters={toc_unique_chapters};contentPages={content_pages}"
@@ -16320,16 +16541,22 @@ def validate_group(
     last_detail: dict[str, Any] | None = None
     ordered_candidates = list(candidates)
     preferred_source = quick_seed.get("source") if isinstance(quick_seed, dict) else None
+    preferred_key: str | None = None
+    # R147 (L10): every candidate is serialized at most once (the fingerprint is cached by object id); the sort key
+    # and the per-candidate seed check used to serialize each candidate and the preferred source again each time.
+    fingerprints: dict[int, str] = {}
     if isinstance(preferred_source, dict):
         preferred_key = json.dumps(preferred_source, ensure_ascii=False, sort_keys=True)
-        ordered_candidates.sort(
-            key=lambda candidate: 0 if json.dumps(candidate, ensure_ascii=False, sort_keys=True) == preferred_key else 1
-        )
+        for candidate in ordered_candidates:
+            if candidate is preferred_source:
+                fingerprints[id(candidate)] = preferred_key
+            else:
+                fingerprints[id(candidate)] = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+        ordered_candidates.sort(key=lambda candidate: 0 if fingerprints[id(candidate)] == preferred_key else 1)
     for src in ordered_candidates:
         ensure_source_validation_time_remaining()
         seed_for_candidate = quick_seed if src is preferred_source or (
-            isinstance(preferred_source, dict)
-            and json.dumps(src, ensure_ascii=False, sort_keys=True) == json.dumps(preferred_source, ensure_ascii=False, sort_keys=True)
+            preferred_key is not None and fingerprints.get(id(src)) == preferred_key
         ) else None
         outcome, record, detail = validate_single_source(src, quick_seed=seed_for_candidate)
         last_detail = detail
@@ -16366,6 +16593,69 @@ def source_timeout_detail(url: str, candidates: list[dict[str, Any]], source_tim
     return detail
 
 
+# ---- R147 (L2): abandoned worker threads ---------------------------------------------------------------------------
+# After an idle timeout a worker that is still inside a validation cannot be killed (the source deadline is
+# cooperative, and killing a thread mid-request is not safe). It keeps using network / CPU while the next stage
+# starts, so the real concurrency would exceed `--workers`. The stage that gives up on such a thread registers it
+# here; every later stage subtracts the still-running ones from its worker budget (waiting a bounded time first) and
+# the report summary records how many workers were abandoned (`abandonedWorkers`).
+ABANDONED_WORKER_WAIT_SECONDS = 15.0
+_abandoned_lock = threading.Lock()
+_abandoned_threads: list[threading.Thread] = []
+_abandoned_total = 0
+
+
+def reset_abandoned_worker_count() -> None:
+    """Start counting abandoned workers for a new pipeline run (threads still running stay in the budget)."""
+    global _abandoned_total
+    with _abandoned_lock:
+        _abandoned_total = 0
+
+
+def note_abandoned_workers(threads: Iterable[threading.Thread]) -> int:
+    """Register worker threads a stage gave up on while they were still validating. Returns how many."""
+    global _abandoned_total
+    alive = [thread for thread in threads if thread.is_alive()]
+    with _abandoned_lock:
+        for thread in alive:
+            if thread not in _abandoned_threads:
+                _abandoned_threads.append(thread)
+                _abandoned_total += 1
+    return len(alive)
+
+
+def abandoned_workers_alive() -> int:
+    """Abandoned workers that are still running (finished ones are forgotten)."""
+    with _abandoned_lock:
+        _abandoned_threads[:] = [thread for thread in _abandoned_threads if thread.is_alive()]
+        return len(_abandoned_threads)
+
+
+def abandoned_workers_total() -> int:
+    with _abandoned_lock:
+        return _abandoned_total
+
+
+def stage_worker_budget(max_workers: int, total: int, wait_seconds: float | None = None) -> int:
+    """Workers a new stage may start: ``max_workers`` minus abandoned workers that are still running.
+
+    Waits up to ``wait_seconds`` (default ``ABANDONED_WORKER_WAIT_SECONDS``) for abandoned workers to finish when
+    they would use the whole budget; a stage always gets at least one worker so the pipeline keeps moving (that one
+    worker may briefly exceed the limit by one).
+    """
+    limit = max(1, int(max_workers))
+    wait = ABANDONED_WORKER_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline = time.monotonic() + max(0.0, wait)
+    alive = abandoned_workers_alive()
+    while alive >= limit and time.monotonic() < deadline:
+        time.sleep(0.2)
+        alive = abandoned_workers_alive()
+    granted = max(1, min(limit - alive, max(1, total)))
+    if alive:
+        print(f"Abandoned workers still running: {alive}; new stage uses {granted} of {limit} workers", flush=True)
+    return granted
+
+
 def run_round_with_idle_timeout(
     round_url_list: list[str],
     groups: dict[str, list[dict[str, Any]]],
@@ -16383,6 +16673,8 @@ def run_round_with_idle_timeout(
     round_records: dict[str, dict[str, Any]] = {}
     round_details: dict[str, dict[str, Any]] = {}
     timed_out = 0
+    busy: set[int] = set()
+    threads: list[threading.Thread] = []
 
     for url in round_url_list:
         work_q.put(url)
@@ -16393,6 +16685,7 @@ def run_round_with_idle_timeout(
                 url = work_q.get_nowait()
             except queue.Empty:
                 return
+            busy.add(threading.get_ident())
             try:
                 begin_source_validation_deadline(source_timeout)
                 # Preserve the scheduled group key. The validator may return a
@@ -16411,15 +16704,18 @@ def run_round_with_idle_timeout(
                 result_q.put((url, None, detail))
             finally:
                 clear_source_validation_deadline()
+                busy.discard(threading.get_ident())
                 try:
                     work_q.task_done()
                 except Exception:
                     pass
 
-    worker_count = max(1, min(max_workers, total_r))
+    worker_count = stage_worker_budget(max_workers, total_r)
     for _ in range(worker_count):
         # Threads do not inherit contextvars: bind the App profile once per thread (R143).
-        threading.Thread(target=app_profiles.bind_current_profile(worker), daemon=True).start()
+        thread = threading.Thread(target=app_profiles.bind_current_profile(worker), daemon=True)
+        threads.append(thread)
+        thread.start()
 
     done_r = 0
     last_result_at = time.monotonic()
@@ -16429,6 +16725,7 @@ def run_round_with_idle_timeout(
         except queue.Empty:
             if idle_timeout > 0 and (time.monotonic() - last_result_at) >= idle_timeout:
                 stop_event.set()
+                note_abandoned_workers([thread for thread in threads if thread.ident in busy])
                 timed_out = len(remaining)
                 for url in sorted(remaining):
                     round_details[url] = timeout_detail(url, groups.get(url, []), round_num, idle_timeout)
@@ -16493,6 +16790,8 @@ def run_parallel_stage(
     records: dict[str, dict[str, Any]] = {}
     details: dict[str, dict[str, Any]] = {}
     timed_out = 0
+    busy: set[int] = set()
+    threads: list[threading.Thread] = []
     for url in url_list:
         work_q.put(url)
 
@@ -16502,6 +16801,7 @@ def run_parallel_stage(
                 url = work_q.get_nowait()
             except queue.Empty:
                 return
+            busy.add(threading.get_ident())
             try:
                 begin_source_validation_deadline(source_timeout)
                 _, record, detail = handler(url)
@@ -16523,19 +16823,22 @@ def run_parallel_stage(
                 result_q.put((url, None, detail))
             finally:
                 clear_source_validation_deadline()
+                busy.discard(threading.get_ident())
                 try:
                     work_q.task_done()
                 except Exception:
                     pass
 
-    worker_count = max(1, min(max_workers, total))
+    worker_count = stage_worker_budget(max_workers, total)
     for _ in range(worker_count):
         # Threads do not inherit contextvars: bind the App profile once per thread (R143).
-        threading.Thread(
+        thread = threading.Thread(
             target=app_profiles.bind_current_profile(worker),
             daemon=True,
             name=f"source-validator-{stage}",
-        ).start()
+        )
+        threads.append(thread)
+        thread.start()
 
     done = 0
     last_result_at = time.monotonic()
@@ -16545,6 +16848,7 @@ def run_parallel_stage(
         except queue.Empty:
             if idle_timeout > 0 and time.monotonic() - last_result_at >= idle_timeout:
                 stop_event.set()
+                note_abandoned_workers([thread for thread in threads if thread.ident in busy])
                 timed_out = len(remaining)
                 for pending_url in sorted(remaining):
                     details[pending_url] = pipeline_timeout_detail(pending_url, groups.get(pending_url, []), stage, idle_timeout)
@@ -16667,6 +16971,11 @@ def _run_staged_stages(
     for url, detail in all_details.items():
         detail["stabilityPassCount"] = pass_counts.get(url, 0)
     if min_pass_rounds < rounds:
+        # R147 (L1): only sources that passed the previous round are retested (`candidate_urls = round_passed`), so a
+        # source that fails round K is never tried again. `count >= min_pass_rounds` therefore means "passed the
+        # first min_pass_rounds rounds in a row"; failures in the rounds after that are tolerated. A source that fails
+        # mid-way and "recovers" later is NOT counted (retesting every source every round would multiply the
+        # requests, and a flaky source is not what the App should be shipped).
         final_urls = {url for url, count in pass_counts.items() if count >= min_pass_rounds}
     else:
         final_urls = candidate_urls
@@ -16745,6 +17054,10 @@ def _finalize_staged(
         "failed": len(urls) - len(final_urls),
         "deduplicatedAfterValidation": book_aggregation["removed"],
         "workers": max_workers,
+        # R147 (L2): workers a stage gave up on after the idle timeout (not killed); `...StillRunning` is how many
+        # of them were still busy when the report was written.
+        "abandonedWorkers": abandoned_workers_total(),
+        "abandonedWorkersStillRunning": abandoned_workers_alive(),
         "quickScanTimeoutSeconds": max(0, quick_timeout),
         "sourceTimeoutSeconds": max(0, source_timeout),
         "stabilityRounds": outcome.rounds,
@@ -16770,6 +17083,7 @@ def run_staged_pipeline(
     idle_timeout: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Execute dedupe → quick scan → full chain → stability re-test under the current App profile."""
+    reset_abandoned_worker_count()
     outcome = _run_staged_stages(
         urls, groups, max_workers, quick_timeout, source_timeout, rounds, min_pass_rounds, idle_timeout
     )
@@ -16849,6 +17163,7 @@ def run_staged_pipeline_both(
     ``passedSourcesByAppVersion``).
     """
     stage_args = (max_workers, quick_timeout, source_timeout, rounds, min_pass_rounds, idle_timeout)
+    reset_abandoned_worker_count()
     with app_profiles.app_profile_scope("1.1.1"):
         print(f"=== App 1.1.1: validating {len(urls)} source groups ===", flush=True)
         outcome_111 = _run_staged_stages(urls, groups, *stage_args)
@@ -16927,7 +17242,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pipeline", choices=("staged", "legacy"), default="staged", help="验证流水线；staged=去重→快速扫描→完整验证→稳定性复测（默认），legacy=旧版完整轮次")
     parser.add_argument("--quick-timeout", type=int, default=8, help="快速扫描单源硬截止秒数，建议 5-10 秒；0 表示不限制")
     parser.add_argument("--rounds", type=int, default=3, help="稳定性复测总轮次（含首次完整验证），默认 3 轮")
-    parser.add_argument("--min-pass-rounds", type=int, default=3, help="最终交付至少需通过几轮（默认 3，不超过 --rounds）")
+    parser.add_argument("--min-pass-rounds", type=int, default=3, help="最终交付至少需连续通过前几轮（默认 3，不超过 --rounds）。每轮只复测上一轮通过的书源；小于 --rounds 时，前 N 轮连续通过即可交付，之后的复测失败不再扣除，中途失败的书源不会再复测")
     parser.add_argument("--idle-timeout", type=int, default=180, help="单轮无任何书源完成的最长等待秒数；超时后剩余源判失败，避免坏源拖死整批")
     parser.add_argument("--source-timeout", type=int, default=60, help="单个书源完整搜索/详情/目录/正文链路的硬截止秒数；0 表示不限制")
     parser.add_argument("--app-version", choices=("1.1.1", "1.1.2", "both"), default=DEFAULT_APP_VERSION, help="模拟的 App 版本：1.1.1=当前公开版（默认）；1.1.2=下一版；both=两版对比（只重跑受版本影响的书源，额外输出 *.app-1.1.2.json）")
@@ -17049,6 +17364,7 @@ def _run_main(args: argparse.Namespace, app_version: str) -> int:
     # ─── 多轮验证：只有连续通过的书源才视为生产可用 ───────────────────────────
     num_rounds = max(1, args.rounds)
     min_pass   = max(1, min(args.min_pass_rounds, num_rounds))
+    reset_abandoned_worker_count()
 
     round_pass_counts: dict[str, int]           = {}  # url → 累计通过轮次
     round_best_record: dict[str, dict[str, Any]] = {}  # url → 最新通过时的完整记录
@@ -17085,7 +17401,8 @@ def _run_main(args: argparse.Namespace, app_version: str) -> int:
 
     # 最终交付：通过轮次 >= min_pass 的书源
     if min_pass < num_rounds:
-        # 宽松模式：通过 min_pass 轮即可（即便中途某轮失败又恢复）
+        # R147（L1）：每轮只复测上一轮通过的书源，中途失败的不会再测，所以这里的含义是“连续通过前 min_pass 轮”，
+        # 之后的复测失败不扣除；中途失败后“恢复”的书源不会计入。
         final_url_set: set[str] = {url for url, cnt in round_pass_counts.items() if cnt >= min_pass}
     else:
         # 严格模式（默认 min_pass == num_rounds）：必须通过所有轮次
@@ -17115,6 +17432,8 @@ def _run_main(args: argparse.Namespace, app_version: str) -> int:
         "passed": pass_count,
         "failed": len(urls) - pass_count,
         "workers": max_workers,
+        "abandonedWorkers": abandoned_workers_total(),
+        "abandonedWorkersStillRunning": abandoned_workers_alive(),
         "sourceTimeoutSeconds": max(0, args.source_timeout),
         "checks": ["search_or_explore", "book_detail_name_or_tocUrl", "toc_first_chapter", "chapter_content_non_empty"],
     }

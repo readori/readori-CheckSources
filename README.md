@@ -140,7 +140,11 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 ## 参数建议
 
 - 最快首轮筛选：`--quick-timeout 8 --rounds 1 --min-pass-rounds 1 --source-timeout 30`。
-- 稳定复测：只对快速扫描和首次完整验证均通过的源运行 `--rounds 3 --min-pass-rounds 2`；后续复测会重新执行搜索、详情、目录、正文。
+- 稳定复测：只对快速扫描和首次完整验证均通过的源运行 `--rounds 3 --min-pass-rounds 2`；后续复测会重新执行搜索、详情、目录、正文。每轮只复测上一轮通过的源，所以 `--min-pass-rounds` 小于 `--rounds` 时的含义是“连续通过前 N 轮即可交付，之后的复测失败不再扣除”；中途失败的源不会再复测，也不会因为之后“恢复”而被计入。
+- 搜索关键词与 App 一致（R147）：只搜一个词，`ruleSearch.checkKeyWord` 非空白时原样使用，否则用 App 默认词“我的”；不会再轮换其他关键词。搜索通过后，只要 `exploreUrl` 有分类链接，发现页也会按 App 的 `发现失效` 规则检查（发现页没有书，整个书源判失败，失败原因 `explore failed`）；没有搜索、只有发现的源由发现页单独判定；分类列表里没有任何链接只是 App 的信息标签 `发现规则为空`，不算失败。
+- 同站同书的多个通过变体聚合时，优先保留各阶段都真实通过、首章正文更完整、目录章节更多的变体（再按原有评分与响应时间）。
+- 无进度超时（idle timeout）后仍在运行的线程不会被强杀；它们计入后续阶段的并发预算（下一阶段会先等待一小段时间，再按剩余名额启动 worker），报告 `summary.abandonedWorkers` / `abandonedWorkersStillRunning` 记录被放弃的 worker 数。
+- 判定路径上被吞掉的异常（请求重试、规则求值、loginCheckJs 结果、CSS / XPath / JSONPath 解析等）会写入明细 `debugErrors`（最多 20 条，每条截断），只用于诊断，不改变判定。
 - `--pipeline legacy` 可临时回退到旧版完整轮次调度，便于结果对比（只能配合单个 App 版本，不能配合 `both`）。
 - `--app-version` 默认 1.1.1（当前公开版）；准备发布 1.1.2 前用 `both` 看哪些源两版表现不同。
 - `--workers` 不宜盲目增大；建议先使用 8–20，并观察目标站点是否限流。

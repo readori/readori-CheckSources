@@ -56,6 +56,7 @@ STAGE_ZH = {"search": "搜索页", "explore": "发现页", "info": "详情页", 
 
 _FAILURE_GROUPS: list[tuple[str, str]] = [
     ("no search/explore result", "搜索失效"),
+    ("explore failed", "发现失效"),
     ("detail failed", "网站失效"),
     ("toc failed", "目录失效"),
     ("content failed", "正文失效"),
@@ -716,6 +717,23 @@ def _worker_exception_detail(url: str, candidates: list[dict[str, Any]], stage: 
     return detail
 
 
+def _raise_if_cancelled(controller: DebugController | None) -> None:
+    """R147 cancel point: ``DebugController.cancel()`` ends a validate_one / compare_sources run at the next check."""
+    if controller is not None and controller.cancelled:
+        raise DebugCancelled()
+
+
+def _cancel_sink(controller: DebugController, inner: Callable[[dict], None] | None = None) -> Callable[[dict], None]:
+    """A trace sink that checks the cancel flag on every event (every request emits some), then forwards it."""
+
+    def sink(event: dict[str, Any]) -> None:
+        _raise_if_cancelled(controller)
+        if inner is not None:
+            inner(event)
+
+    return sink
+
+
 def _run_stage(stage: str, seconds: int, url: str, candidates: list[dict[str, Any]],
                handler: Callable[[], tuple[str, dict[str, Any] | None, dict[str, Any]]]
                ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -733,7 +751,7 @@ def _run_stage(stage: str, seconds: int, url: str, candidates: list[dict[str, An
 
 
 def _validate_one_core(src: dict[str, Any], *, app_version: str, quick_timeout: int, source_timeout: int,
-                       rounds: int, emit_verdict: bool) -> dict[str, Any]:
+                       rounds: int, emit_verdict: bool, controller: DebugController | None = None) -> dict[str, Any]:
     url = vsp.normalize_book_source_url(str(src.get("bookSourceUrl") or ""))
     candidates = [src]
     rounds = max(1, int(rounds or 1))
@@ -741,8 +759,10 @@ def _validate_one_core(src: dict[str, Any], *, app_version: str, quick_timeout: 
     record: dict[str, Any] | None = None
     pass_count = 0
     with app_profiles.app_profile_scope(app_version):
+        _raise_if_cancelled(controller)
         vsp.reset_thread_session(src)
         seed, detail = _run_stage("quick-scan", quick_timeout, url, candidates, lambda: vsp.quick_scan_group(url, candidates))
+        _raise_if_cancelled(controller)
         if seed is not None:
             record, detail = _run_stage(
                 "full-validation", source_timeout, url, candidates,
@@ -752,6 +772,7 @@ def _validate_one_core(src: dict[str, Any], *, app_version: str, quick_timeout: 
             pass_count = 1 if passed else 0
             round_num = 2
             while passed and round_num <= rounds:
+                _raise_if_cancelled(controller)
                 # Stability rounds do a fresh search and do not use the quick seed (same as _run_staged_stages).
                 vsp.reset_thread_session(src)
                 round_record, detail = _run_stage(
@@ -795,20 +816,30 @@ def _validate_one_core(src: dict[str, Any], *, app_version: str, quick_timeout: 
 
 
 def validate_one(src: dict[str, Any], *, app_version: str = DEFAULT_APP_VERSION, quick_timeout: int = 8,
-                 source_timeout: int = 60, rounds: int = 1, trace: DebugSession | None = None) -> dict[str, Any]:
+                 source_timeout: int = 60, rounds: int = 1, trace: DebugSession | None = None,
+                 controller: DebugController | None = None) -> dict[str, Any]:
     """The batch pipeline for exactly one source: quick scan -> full chain (seeded) -> optional stability rounds.
 
     Same stage order, per-stage hard timeouts and ``app_verdict`` as ``_run_staged_stages``.  With ``trace`` the run
-    is recorded in that ``DebugSession`` and ends with a ``verdict`` event."""
+    is recorded in that ``DebugSession`` and ends with a ``verdict`` event.
+
+    R147: ``controller.cancel()`` (or the cancel of ``trace.controller``) raises ``DebugCancelled`` between the stages
+    and, through a trace sink that checks the flag on every event, between requests."""
+    ctl = controller if controller is not None else (trace.controller if trace is not None else None)
     if trace is None:
-        return _validate_one_core(src, app_version=app_version, quick_timeout=quick_timeout,
-                                  source_timeout=source_timeout, rounds=rounds, emit_verdict=False)
+        if ctl is None:
+            return _validate_one_core(src, app_version=app_version, quick_timeout=quick_timeout,
+                                      source_timeout=source_timeout, rounds=rounds, emit_verdict=False)
+        with debug_trace.tracing(_cancel_sink(ctl)):
+            return _validate_one_core(src, app_version=app_version, quick_timeout=quick_timeout,
+                                      source_timeout=source_timeout, rounds=rounds, emit_verdict=False, controller=ctl)
     trace.app_version = app_version
-    with debug_trace.tracing(trace.sink):
+    sink = _cancel_sink(controller, trace.sink) if controller is not None else trace.sink
+    with debug_trace.tracing(sink):
         if not any(e.get("kind") == "info" and (e.get("data") or {}).get("code") == "header" for e in trace.events):
             _emit_header(trace, src, app_version, trace.key or DebugKey("auto", ""))
         return _validate_one_core(src, app_version=app_version, quick_timeout=quick_timeout,
-                                  source_timeout=source_timeout, rounds=rounds, emit_verdict=True)
+                                  source_timeout=source_timeout, rounds=rounds, emit_verdict=True, controller=ctl)
 
 
 _COMPARE_ROWS = (("quick-scan", "快速扫描"), ("search", "搜索"), ("detail", "详情"), ("toc", "目录"),
@@ -830,9 +861,19 @@ def _stage_flags(result: dict[str, Any]) -> dict[str, bool]:
 
 
 def compare_sources(original: dict[str, Any], working: dict[str, Any], **validate_kwargs: Any) -> dict[str, Any]:
-    """Validate ``original`` then ``working`` (one after the other: no parallel hits on the same site)."""
+    """Validate ``original`` then ``working`` (one after the other: no parallel hits on the same site).
+
+    R147: ``controller`` / ``trace`` are forwarded to ``validate_one`` and the cancel flag is also checked between the
+    two runs (``DebugCancelled`` is raised, nothing is returned)."""
+    controller = validate_kwargs.get("controller")
+    trace = validate_kwargs.get("trace")
+    if controller is None and trace is not None:
+        controller = trace.controller
+    _raise_if_cancelled(controller)
     before = validate_one(original, **validate_kwargs)
+    _raise_if_cancelled(controller)
     after = validate_one(working, **validate_kwargs)
+    _raise_if_cancelled(controller)
     flags_before, flags_after = _stage_flags(before), _stage_flags(after)
     rows = []
     for stage, zh in _COMPARE_ROWS:
@@ -1171,7 +1212,8 @@ def debug_source(
                         return finish("fail", False, f"App 导入会拒绝这条书源：{decode_error}")
                     if parsed.kind == "auto":
                         outcome = _validate_one_core(src, app_version=app_version, quick_timeout=min(8, max(1, timeout)),
-                                                     source_timeout=timeout, rounds=1, emit_verdict=True)
+                                                     source_timeout=timeout, rounds=1, emit_verdict=True,
+                                                     controller=session.controller)
                         session.closing = True
                         result.verdict = outcome
                         result.ok = bool(outcome["passed"])
