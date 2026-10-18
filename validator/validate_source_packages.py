@@ -177,7 +177,6 @@ FALLBACK_KEYWORDS = [
     "我真不想修行啊",
 ]
 
-CONNECT_TIMEOUT = 12
 REQUEST_TIMEOUT = 20
 REQUEST_CONNECT_TIMEOUT = 6
 DEFAULT_BROWSER_HEADERS = {
@@ -1924,7 +1923,10 @@ def _resolve_js_template_expressions(
             pass
         return match.group(0)
 
-    return re.sub(r"\{\{([^}]+)\}\}", replace_expr, text)
+    # R150 (B11): RuleType.evalPattern `\{\{[\w\W]*?\}\}` (RuleType.swift:413-416, RuleParser.templateParts): the inner text
+    # runs to the FIRST `}}` and may itself contain single `}` / newlines (`{"headers": {...} }` inside a template
+    # literal, `if (x) { ... }`). The old `[^}]+` stopped at the first `}` and left such templates unevaluated.
+    return _LEGADO_RULE_TEMPLATE_PATTERN.sub(replace_expr, text)
 
 
 def resolve_template(
@@ -1934,12 +1936,15 @@ def resolve_template(
     page: int = 1,
     raw_keyword: str | None = None,
     rule_template: bool = False,
+    input_text: str = "",
 ) -> str:
     """Substitute URL/rule placeholders.
 
     ``rule_template`` is Legado makeUpRule for rules: only double-brace
     ``{{name}}`` placeholders expand; a single-brace ``{name}`` is literal rule
     text (``{$.…}`` inner JSONPath rules are handled by the rule engine).
+    ``input_text`` is what ``result`` is inside a ``{{js}}`` expression (RuleEvaluator.swift:716-720 evaluates the
+    expression with the rule's input as ``result``); rule evaluation passes the content being analysed.
     """
     out = template
     replacements = {
@@ -1991,7 +1996,7 @@ def resolve_template(
         out = out.replace(f"{{{{{key}}}}}", replacement)
     # Resolve remaining JS expression templates like {{Math.round(...)}}
     if "{{" in out:
-        out = _resolve_js_template_expressions(out, runtime, keyword=keyword, page=page)
+        out = _resolve_js_template_expressions(out, runtime, keyword=keyword, page=page, input_text=input_text)
     return out
 
 
@@ -10210,7 +10215,21 @@ def is_literal_rule_template(text: str) -> bool:
     raw, _bodies = _extract_legado_put_rules(text or "")
     split = _split_top_level_replace(raw)
     base = split[0] if split is not None else raw
-    return _LEGADO_RULE_TEMPLATE_INNER.search(base) is not None
+    return _LEGADO_RULE_TEMPLATE_INNER.search(base) is not None or has_legado_expression_template(base)
+
+
+def has_legado_expression_template(text: str) -> bool:
+    """R150 (B11): a SourceRule holding any `{{expr}}` is a makeUpRule TEMPLATE in the App (RuleType.swift:533-536
+    templateParts -> `.template`, evaluated by RuleEvaluator.swift:665-722 expandTemplate): literal text plus the value of
+    each `{{…}}`, and that whole string is the rule's result — it is never fed to the CSS / XPath / JSONPath engines
+    afterwards. `{{$.x}}` / `{{$[…]}}` placeholders keep their dedicated JSON-template handling
+    (`is_literal_json_template_rule`), `{{@…}}` / `{{//…}}` are covered by `_LEGADO_RULE_TEMPLATE_INNER`."""
+    if "{{" not in (text or ""):
+        return False
+    for match in _LEGADO_RULE_TEMPLATE_PATTERN.finditer(text):
+        if not match.group(1).strip().startswith(("$.", "$[")):
+            return True
+    return False
 
 
 def substitute_rule_templates(rule: str, content: str, runtime: RuleRuntime, content_type: str = "html") -> str:
@@ -10394,7 +10413,7 @@ def _evaluate_legado_source_rule(
         if not base:
             base_values = [content]
         elif literal_template:
-            base_values = [base]
+            base_values = [_literal_template_with_result(base, content)]
         else:
             base_values = evaluate_rule(base, content, runtime, content_type, string_mode=string_mode)
         if not chain:
@@ -10404,8 +10423,19 @@ def _evaluate_legado_source_rule(
         return [legado_replace_regex(value, chain) for value in base_values]
 
     if literal_template:
+        t = _literal_template_with_result(t, content)
         return [t] if t else []
     return _evaluate_rule_sequence(t, content, runtime, content_type)
+
+
+def _literal_template_with_result(text: str, content: str) -> str:
+    """RuleEvaluator.swift:689-692 evaluateTemplateExpression: `{{result}}` is the template's input (the previous
+    segment's output / the item), the one placeholder the whole-rule pre-pass cannot know."""
+    if "{{" not in text:
+        return text
+    return _LEGADO_RULE_TEMPLATE_PATTERN.sub(
+        lambda match: content if match.group(1).strip() == "result" else match.group(0), text
+    )
 
 
 def legado_absolute_url(relative_path: str, base_url: str) -> str:
@@ -10495,7 +10525,7 @@ def evaluate_rule(
     # invalid JS expressions and collapse to an empty rule.
     rule = substitute_json_placeholders(raw_rule, content)
     rule = substitute_rule_templates(rule, content, runtime, content_type)
-    rule = resolve_template(rule, runtime, rule_template=True)
+    rule = resolve_template(rule, runtime, rule_template=True, input_text=content)
     rule = substitute_makeup_rule_templates(rule, content, runtime, content_type)
     if literal_json_template:
         rule = substitute_variable_references(rule, runtime)
@@ -12675,20 +12705,35 @@ def loading_verify_redirect_url(html: str, final_url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, "/userverify" + fragment, "", "", ""))
 
 
-def build_first_explore_url(explore_text: str, runtime: RuleRuntime, *, resolve_categories: bool = False) -> str | None:
+def build_first_explore_url(
+    explore_text: str,
+    runtime: RuleRuntime,
+    *,
+    resolve_categories: bool = False,
+    raw_template: bool = False,
+) -> str | None:
     """First requestable discovery category. `resolve_categories=True` (the validation / debug request paths) follows the
     App's resolveExploreCategories + BookSourceValidator.swift:2357-2360: an `@js:` / `<js>` exploreUrl is run to get its
     category list and a title-only segment (no `::`) is a header, never a URL. The default keeps the lenient reading
-    that static checks (`source_has_absolute_entry_point`, `fallback_base_url_from_entry_point`) rely on."""
+    that static checks (`source_has_absolute_entry_point`, `fallback_base_url_from_entry_point`) rely on.
+    `raw_template=True` (R150) returns the category's URL TEMPLATE untouched (`url,{options}`, `{{page}}`, `{{js}}` all
+    unresolved) for `build_url_with_options`, which is what the App's explore() does with it
+    (BookSourceEngine+Flagship.swift:149-150 buildUrlWithOptionsThrowing)."""
     previous_binding = getattr(runtime, "book_binding", "automatic")
     runtime.book_binding = "unbound"
     try:
-        return _build_first_explore_url(explore_text, runtime, resolve_categories=resolve_categories)
+        return _build_first_explore_url(explore_text, runtime, resolve_categories=resolve_categories, raw_template=raw_template)
     finally:
         runtime.book_binding = previous_binding
 
 
-def _build_first_explore_url(explore_text: str, runtime: RuleRuntime, *, resolve_categories: bool = False) -> str | None:
+def _build_first_explore_url(
+    explore_text: str,
+    runtime: RuleRuntime,
+    *,
+    resolve_categories: bool = False,
+    raw_template: bool = False,
+) -> str | None:
     entries = parse_explore_urls(explore_text, runtime.source_url)
     if resolve_categories:
         if is_script_explore_text(explore_text):
@@ -12711,6 +12756,8 @@ def _build_first_explore_url(explore_text: str, runtime: RuleRuntime, *, resolve
             continue  # `{{js}}` button, never a category (BookSourceValidator.swift:2357-2360)
         if url.lower().startswith("@js:") or (url.lower().startswith("<js>") and url.lower().endswith("</js>")):
             return url
+        if raw_template:
+            return url.strip()
         # Resolve templates like {{page}} in explore URL
         resolved = resolve_template(url, runtime, page=1)
         resolved = apply_page_expression_templates(resolved, 1)
@@ -12776,11 +12823,26 @@ def make_runtime(src: dict[str, Any]) -> RuleRuntime:
     )
 
 
-def request_search_or_explore(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, keyword: str, page: int = 1, mode: str = "search") -> tuple[str, str, dict[str, Any]] | None:
-    if mode == "search":
+def request_search_or_explore(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    keyword: str,
+    page: int = 1,
+    mode: str = "search",
+    template: str | None = None,
+) -> tuple[str, str, dict[str, Any]] | None:
+    """The request of a search (`searchUrl`) or discovery (first `exploreUrl` category, or `template`) page: the template goes
+    through `build_url_with_options` (page / key templates, `{{js}}`, `url,{method/body/headers/charset}` options) exactly
+    like AnalyzeUrl, for BOTH modes (explore: BookSourceEngine+Flagship.swift:149-150, keyword "" and the given page)."""
+    if template is not None:
+        pass
+    elif mode == "search":
         template = app_profiles.app_search_url_template(src)
     else:
-        template = build_first_explore_url(str(src.get("exploreUrl") or ""), runtime, resolve_categories=True) or ""
+        template = build_first_explore_url(
+            str(src.get("exploreUrl") or ""), runtime, resolve_categories=True, raw_template=True
+        ) or ""
     if not template:
         return None
     url, opts = build_url_with_options(template, keyword=keyword, page=page, runtime=runtime, session=session)
@@ -13692,55 +13754,93 @@ def recover_deferred_chapter_api_content(
 
 
 def is_empty_json_payload(value: Any) -> bool:
+    """BookSourceEngine.swift:1588-1596 isEmptyJSONPayload: null, a blank string (trimmed), an empty array / object."""
     if value is None:
         return True
-    if isinstance(value, (list, tuple, dict, str)):
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict)):
         return len(value) == 0
     return False
 
 
+def _app_json_fallback_string(obj: dict[str, Any], keys: list[str]) -> str:
+    """BookSourceEngine.swift:1560-1586 jsonSearchFallbackString: the first key whose value is a non-blank string, a
+    number / bool (NSNumber.stringValue: true -> "1") or an array whose FIRST element is a string / number. Objects and
+    other arrays are skipped (unlike json_first_text, which digs into objects and joins arrays)."""
+    for key in keys:
+        value = json_nested_value(obj, key)
+        if value is None:
+            continue
+        token: str | None = None
+        if isinstance(value, str):
+            token = value
+        elif isinstance(value, (bool, int, float)):
+            token = _app_ns_number_string(value)
+        elif isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, str):
+                token = first
+            elif isinstance(first, (bool, int, float)):
+                token = _app_ns_number_string(first)
+        if token is None:
+            continue
+        trimmed = token.strip()
+        if trimmed:
+            return trimmed
+    return ""
+
+
+def _app_ns_number_string(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+_APP_DETAIL_ERROR_MESSAGE_MARKERS = (
+    "认证失败", "未授权", "未登录", "请先登录", "token失效", "token过期",
+    "unauthorized", "forbidden", "not logged in", "login required",
+    "参数错误", "请求失败", "请求参数错误",
+)
+
+
 def is_likely_detail_error_json(obj: Any) -> bool:
+    """BookSourceEngine.swift:1598-1636 isLikelyDetailErrorJSON (R150: the old port was stricter than the App).
+
+    1. any of data / result / book / novel / info / item non-empty -> not an error;
+    2. an explicit ``success: false`` -> error;
+    3. otherwise ONLY the combination "explicit failure message AND an error-looking code" is an error. A code that is
+       merely not 0 / 1 / 200 with no (or an unrelated) message is NOT an error (the App dropped that guess because
+       aggregators return 10000 / "OK" and the like for success), and neither is a bare message such as "error" /
+       "login" / "token" (marker substrings the old port matched inside ordinary text).
+    """
     if not isinstance(obj, dict):
         return False
     payload_keys = ["data", "result", "book", "novel", "info", "item"]
-    has_non_empty_payload = any(key in obj and not is_empty_json_payload(obj.get(key)) for key in payload_keys)
-    if has_non_empty_payload:
+    if any(key in obj and not is_empty_json_payload(obj.get(key)) for key in payload_keys):
         return False
     success = obj.get("success")
-    if success is False:
+    # Swift `as? Bool` on a JSON number bridges 0 / 1, so `success: 0` is false as well.
+    if success is False or (isinstance(success, (int, float)) and not isinstance(success, bool) and success == 0):
         return True
-    code = obj.get("code") or obj.get("status") or obj.get("errCode") or obj.get("errorCode")
-    if isinstance(code, (int, float)) and int(code) not in {0, 1, 200}:
-        return True
+    message = _app_json_fallback_string(obj, ["msg", "message", "error", "errorMsg", "reason"]).lower()
+    if not any(marker in message for marker in _APP_DETAIL_ERROR_MESSAGE_MARKERS):
+        return False
+    # `json["code"] ?? json["status"] ?? json["errCode"] ?? json["errorCode"]`: the first key that is present (even a
+    # JSON null, which is neither a number nor a string and so ends in "not an error").
+    code: Any = None
+    for key in ("code", "status", "errCode", "errorCode"):
+        if key in obj:
+            code = obj[key]
+            break
+    if isinstance(code, (bool, int, float)):
+        return int(code) not in {0, 1, 200}
     if isinstance(code, str):
         normalized = code.strip().lower()
-        if normalized and normalized not in {"0", "1", "200", "ok", "success"}:
-            return True
-    message = json_first_text(obj, ["msg", "message", "error", "errorMsg", "reason"]).lower()
-    error_markers = [
-        "认证失败", "未授权", "未登录", "登录", "token", "authorization",
-        "unauthorized", "forbidden", "auth", "error", "failed",
-    ]
-    return any(marker in message for marker in error_markers)
-
-
-def is_likely_detail_login_page(html: str) -> bool:
-    if not html or is_json_content(html):
-        return False
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    except Exception:
-        title = ""
-    compact_title = re.sub(r"\s+", "", title or "").lower()
-    if not compact_title:
-        return False
-    markers = [
-        "\u767b\u5f55", "\u767b\u9304", "\u767b\u9646", "\u767b\u9678",
-        "\u6ce8\u518c", "\u8a3b\u518a", "\u7528\u6237\u767b\u5f55", "\u7528\u6236\u767b\u9304",
-        "login", "signin", "sign-in", "register",
-    ]
-    return any(marker in compact_title for marker in markers)
+        return bool(normalized) and normalized not in {"0", "1", "200", "ok", "success"}
+    return False
 
 
 def is_likely_empty_search_json(content: str) -> bool:
@@ -14250,24 +14350,28 @@ def fetch_book_candidates(
         if _dbg.active():
             _dbg.set_stage(mode)
         if mode == "explore":
-            template = explore_url or build_first_explore_url(str(src.get("exploreUrl") or ""), runtime, resolve_categories=True)
+            template = explore_url or build_first_explore_url(
+                str(src.get("exploreUrl") or ""), runtime, resolve_categories=True, raw_template=True
+            )
             if not template:
                 explore_link_empty[0] = True
                 return [], ""
-            url = template
-            if url.lower().startswith("@js:") or (url.lower().startswith("<js>") and url.lower().endswith("</js>")):
-                rendered = execute_js_block_if_needed(url, runtime)
-                if rendered:
-                    url = rendered
-            if not url:
+            # R150: the category URL is a full AnalyzeUrl template (App explore(): buildUrlWithOptionsThrowing with keyword ""
+            # and page 1), so `url,{method, body, headers, charset}` options and `{{js}}` / `{{page}}` apply to the discovery
+            # request just as they do to search. It used to be fetched with a bare GET of the unresolved string.
+            req = request_search_or_explore(session, src, runtime, "", page=1, mode="explore", template=template)
+            if not req:
                 explore_link_empty[0] = True
                 return [], ""
-            base_url = urljoin(runtime.base_url, url)
+            base_url, explore_method, explore_params = req
             response_meta: dict[str, Any] = {}
             html, final_url, status = fetch_text(
                 session,
                 base_url,
-                headers=runtime.headers,
+                method=explore_method,
+                headers=explore_params["headers"],
+                body=explore_params["body"],
+                charset=explore_params["charset"],
                 response_meta=response_meta,
             )
             if status == 0 and not html:
@@ -14278,7 +14382,9 @@ def fetch_book_candidates(
                 return [], final_url
             login_ok, html, final_url = apply_login_check_js(
                 src, runtime, html, final_url, base_url, status,
-                request_headers=runtime.headers,
+                request_method=explore_method,
+                request_body=str(explore_params["body"] or ""),
+                request_headers=explore_params["headers"],
                 response_headers=response_meta.get("headers", {}),
                 response_cookies=response_meta.get("cookies", {}),
             )
@@ -14695,8 +14801,12 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
         name = ""
         rejected_recovered_name = True
 
-    if not name.strip() and not toc_url.strip() and is_likely_detail_error_json(json_obj):
-        return False, "", "", json_first_text(json_obj, ["msg", "message", "error", "errorMsg", "reason"])
+    # R150: BookSourceEngine.swift:8895-8898 throws parseError(message or "detail api error") for ANY JSON detail response that
+    # isLikelyDetailErrorJSON, before and regardless of what the rules extract (the old gate "name and tocUrl both empty"
+    # let an error body pass whenever a rule happened to pull a value from it). HTML pages with embedded JSON are not JSON
+    # responses, so the check is limited to a body that is JSON itself.
+    if isinstance(json_obj, dict) and not html.lstrip().startswith("<") and is_likely_detail_error_json(json_obj):
+        return False, "", "", _app_json_fallback_string(json_obj, ["msg", "message", "error", "errorMsg", "reason"]) or "detail api error"
 
     should_recover_toc_from_html = toc_heuristics_allowed and (not toc_url.strip() or is_likely_search_or_explore_landing_url(toc_url, runtime2))
     html_for_toc_recovery = original_html if original_html.strip() and not is_json_content(original_html) else html
@@ -15810,9 +15920,12 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             for raw in next_values:
                 if not raw or not raw.strip():
                     continue
-                next_url, _ = resolve_url_with_options(raw, final_url)
+                next_url, next_options = resolve_url_with_options(raw, final_url)
                 if not next_url:
                     continue
+                # R150: a nextTocUrl page keeps its `url,{options}` (the App resolves each queued page with resolveRequest,
+                # BookSourceEngine.swift:2743-2752); the loop above splits them again when the page is requested.
+                next_url = compose_url_with_options(next_url, next_options)
                 if next_url in visited or next_url in queue:
                     continue
                 queue.append(next_url)
@@ -16101,14 +16214,16 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         for raw in next_values:
             if not raw or not raw.strip():
                 continue
-            next_url, _ = resolve_url_with_options(raw, final_url)
+            next_url, next_options = resolve_url_with_options(raw, final_url)
             if not next_url:
                 continue
-            if next_url in visited or next_url in pending_url_values or next_url in next_candidates:
+            # R150: the page keeps its `url,{options}` (the fetch loop splits them again).
+            next_entry = compose_url_with_options(next_url, next_options)
+            if next_url in visited or next_entry in pending_url_values or next_entry in next_candidates:
                 continue
             if not is_same_chapter_content_page(next_url, abs_url, first_abs_url):
                 continue
-            next_candidates.append(next_url)
+            next_candidates.append(next_entry)
 
         if next_rule and not next_candidates:
             for raw in derive_paged_chapter_urls(abs_url, page_html, page_content):

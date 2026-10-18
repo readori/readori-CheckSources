@@ -93,6 +93,10 @@ GUI 里的“App 版本”下拉框对应这三种模式（1.1.1（当前公开�
   - 详情阶段：不再因书名与目录链接都解析不出而失败（App 目录链接回退书籍链接，`BookSourceEngine.swift:9123-9150`，书名未解析只是信息项）；请求 / 脚本异常、空响应、HTTP 错误页仍失败。已删除 App 没有的「登录页标题」详情判失败。
   - 发现：`exploreUrl` 先按换行、再按 `&&` 拆分；不含 `::` 的段是仅标题的分组头，不当作 URL；`{{...}}` 动作不当分类；`@js:` / `<js>` 分类脚本先执行，再取其输出里第一个有链接的分类（脚本报错 = `发现规则为空` 信息项，不判失败）；发现分支不再有 App 没有的「落地页」守卫（搜索分支保留）。
   - 去掉首页探测：快速扫描与完整验证都不再单独请求站点首页（App 没有这一步）；它曾占用 8 秒快速扫描配额，也可能让搜索入口正常的源被判 `connectivity failed`。站点是否可达由搜索 / 发现请求本身判定。
+- R150 对齐（括号内为 App 依据）：
+  - 规则里的 `{{js}}` 模板：含 `{{…}}` 的规则是「模板」，结果就是字面量与各 `{{…}}` 求值后的整串，不再交给 CSS / XPath / JSONPath 引擎（`RuleType.swift:533-536`、`RuleEvaluator.swift:665-722`）。`{{…}}` 按第一个 `}}` 结束（正则 `\{\{[\w\W]*?\}\}`，`RuleType.swift:413-416`，不是括号配对），内部可含换行、单个 `}`（模板字面量里的 `{"headers": {...} }`）、`java.put(...);"url"` 多语句（取最后一个值）；`{{…}}` 内 JS 的 `result` 是规则输入。`tocUrl` / `bookUrl` / `nextTocUrl` / `nextContentUrl` / `chapterUrl` 求值后的 `url,{method, body, headers}` 选项会带到各自的请求里（`nextTocUrl` / `nextContentUrl` 的后续页此前丢弃选项）。
+  - 发现请求：分类 URL 与搜索一样走完整 AnalyzeUrl 模板（`BookSourceEngine+Flagship.swift:149-150`，关键词为空、页码 1），`url,{method, body, headers, charset}` 选项、`{{js}}` / `{{page}}` 都会应用；此前只对未解析的字符串发 GET。
+  - 详情错误 JSON：按 App `isLikelyDetailErrorJSON`（`BookSourceEngine.swift:1598-1636`）判定——`data` / `result` / `book` / `novel` / `info` / `item` 任一非空即不是错误；`success: false` 是错误；否则必须「明确失败文案（认证失败 / 未授权 / 未登录 / 请先登录 / token失效 / token过期 / unauthorized / forbidden / not logged in / login required / 参数错误 / 请求失败 / 请求参数错误）」与「不在 0 / 1 / 200 / ok / success 内的错误码」同时出现才算。只有错误码、或只有 `error` / `login` / `token` 之类字样不再判错。JSON 详情响应只要命中就失败（App 在规则执行前抛错），不再要求书名与目录链接同时为空；带内嵌 JSON 的 HTML 页面不算 JSON 响应。已删除无人调用的 `is_likely_detail_login_page` 与 `CONNECT_TIMEOUT`。
 
 ## 生成独立 EXE
 
