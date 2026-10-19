@@ -215,6 +215,50 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 
 工作台自己不加载校验器：它启动一个常驻子进程 `ReadoriSourceValidatorCLI.exe rpc`（开发时是 `python -u source_validator_cli.py rpc`），UI 线程只写请求，后台线程读响应并经 `after()` 回到 UI 线程。「停止」先发取消请求，3 秒内没有结束就强制结束并重启子进程（已编辑的书源会自动恢复）。`python workbench_gui.py --self-test` 可在没有窗口的情况下检查控件树。
 
+## Legado 实时对照（R153）
+
+目标：量化「相对 Legado 的书源可用率」。对同一份书源包，在同一时段联网运行 **真正的 Legado 引擎** 与本目录的 Python 验证器（App 语义，`--app-version 1.1.1`），输出对照报告：
+
+```text
+relativeRate = |Legado 通过 且 Readori 通过| / |Legado 通过|        （目标 >= 95%）
+```
+
+目录 `legado_reference/`（随本目录一并镜像到 `readori-CheckSources`）：
+
+| 文件 | 作用 |
+|---|---|
+| `kotlin/io/legado/app/readori/LegadoLiveSourceCheckTest.kt` | Robolectric JVM 测试：逐行移植 Legado `CheckSourceService.checkSource / doCheckSource / checkBook`（搜索 → 发现 → 详情 → 目录 → 正文，全部开关打开，关键字 `source.getCheckKeyword(CheckSource.keyword)`，默认超时 `CheckSource.timeout` = 180 s）；引擎调用（`WebBook.*Await`、书源分组辅助方法、`exploreKinds`）全部是未修改的 Legado 代码。成功判据与 Legado 相同：没有异常，且没有任何「xx失效 / 校验超时」分组 |
+| `legado-live.init.gradle` | Gradle init 脚本：把 Robolectric 和上面的 Kotlin 目录加进 Legado `:app` 的单元测试源集，传系统属性，测试 JVM 堆 4g，关闭测试缓存，输出 stdout；**不修改 Legado 检出目录** |
+| `run_legado_live_reference.py` | 包装脚本（Linux / Windows）：只在 `local.properties` 不存在时用 `ANDROID_HOME` / `ANDROID_SDK_ROOT` 写 `sdk.dir`（已存在则不读不改），运行 `gradlew --no-daemon -I legado-live.init.gradle :app:testAppReleaseUnitTest --tests io.legado.app.readori.LegadoLiveSourceCheckTest`，校验报告 JSON；`--dry-run` 只打印命令 |
+| `prepare_sources.py` | 规范化书源包（数组 / `sources`、`bookSources`、`list`、`data` 包装 / 单对象；去 BOM；按 `bookSourceUrl` 去重；`--offset` / `--limit` 只在这里切一次），保证两个引擎看到完全相同的书源 |
+| `compare_parity.py` | 读 Legado 报告和验证器报告，输出 `parity.json` / `parity.md` |
+| `samples/smoke.json` | 8 个书源的冒烟样本（取自 2026-10-18 重验的通过集合，不含需登录 / 成人站点） |
+
+### 本机运行（需要 Android SDK + JDK 17）
+
+```bash
+python legado_reference/prepare_sources.py --input sources.json --output work/sources.json
+python legado_reference/run_legado_live_reference.py --legado-root /path/to/legado \
+    --sources work/sources.json --output work/legado_report.json --concurrency 8
+python validator/validate_source_packages.py --input work/sources.json --app-version 1.1.1 \
+    --pipeline staged --report-path work/report.json --report-only --no-mirror
+python legado_reference/compare_parity.py --legado work/legado_report.json \
+    --readori work/report.json --output-dir work
+```
+
+要点：Legado 检出需是 `readori/legado`（`io.legado.app` 包，AGP 8.13 / Kotlin 2.3 / JDK 17）；Gradle 首次要下载依赖和 Robolectric 的 android-all jar；`--timeout N` 改每源超时秒数，`--build-root DIR` 把构建输出放到检出目录之外，`--variant AppDebug` 改测试变体（默认 `AppRelease`，避免 debug 日志把整页响应写进 Robolectric 的内存日志），`--no-android-resources` 是应用启动异常时的备用开关。包装脚本退出码：0 报告已生成；1 Gradle 失败（可能留有部分报告）；2 用法 / 环境错误；3 报告缺失。Legado 报告每 25 个源增量写一次（`partial: true`），整个任务超时也会保留已完成部分。
+
+### GitHub Actions
+
+工作流 `Readori Legado Reference`（文件 `docs/公开仓专用ci/readori-legado-reference.yml`，放进公开仓 `readori/test-env-setup` 的 `.github/workflows/`），仅手动触发，不需要任何 secret：检出 `readori/legado`（`legado_ref`）与 `readori/readori-CheckSources`（`main`），JDK 17（Temurin），ubuntu-latest 预装的 Android SDK，`prepare_sources.py` 规范化（`sources_url` 为 https 下载，否则用镜像仓内的 `sources_path`，默认冒烟样本），Legado 实时运行与验证器并行，`compare_parity.py` 出报告并追加到 `$GITHUB_STEP_SUMMARY`；`legado_report.json`、`report.json`、`parity.json`、`parity.md`、日志与 Gradle 测试报告作为 artifact 上传（`if: always()` 语义，14 天）。输入只经 `env:` 传入 shell 并先校验。
+
+### 如何读 `parity.md`
+
+- 顶部 **Relative rate**：目标 >= 95%。`Relative rate excluding Readori timeout / network / missing` 排除站点抖动后的值；`excluding vacuous Legado passes` 排除「Legado 什么都没检查就算通过」的情况（没有搜索地址且没有发现地址时，Legado 的 `doCheckSource` 不会失败）。
+- **Legado pass, Readori fail** 是工作清单：`rule` / `needsInteraction` 是引擎差距，优先处理；`network` / `timeout` / `missing` 多半是站点抖动，先重跑确认。`Legado stages` 形如 `S:ok E:- I:ok T:ok C:ok`（搜索 / 发现 / 详情 / 目录 / 正文；`-` = 未运行，`x` = 失败）。
+- **Readori pass, Legado fail**：Legado 一侧的 `failureGroup`（`js失效` / `网站失效` / `校验超时`）和 `harnessSuspect`（`webview`、`android-resource`、`jvm-linkage`、`robolectric`）说明失败是书源本身还是 JVM 测试环境限制；声明了 WebView 的源在 Robolectric 里无法真正加载页面，会按超时算 Legado 失败。
+- 报告里的书源名 / 错误文本来自不可信数据，已转义和截断，仅供阅读。
+
 ## 与 iOS 验证器的关系
 
 本目录中的 Python 核心是服务器/Windows 侧验证实现；iOS 的 Swift 验证器仍负责 App 内的运行时语义和 UI。两者应通过固定 JSON/响应夹具做差异回归，不应直接复制 Swift 文件到 Windows。

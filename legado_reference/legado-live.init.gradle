@@ -1,0 +1,86 @@
+import org.gradle.api.tasks.testing.Test
+
+// Gradle init script for the Readori Legado live reference run.
+//
+// It attaches LegadoLiveSourceCheckTest (kotlin/io/legado/app/readori) and Robolectric to the unit-test source set of
+// the checked-out Legado ':app' module WITHOUT modifying that checkout, forwards the run configuration as JVM system
+// properties and makes the test task suitable for a long, network-bound run.
+//
+// Required project properties (passed by run_legado_live_reference.py):
+//   -PreadoriLiveAdapter=<dir with the Kotlin sources>
+//   -PreadoriLiveSources=<book source JSON array>
+//   -PreadoriLiveOutput=<report JSON path>
+// Optional: readoriLiveConcurrency, readoriLiveTimeoutSeconds, readoriLiveLimit, readoriLiveOffset,
+//   readoriLiveFlushEvery, readoriLiveHardGraceSeconds, readoriLiveLegadoRevision, readoriLiveBuildRoot,
+//   readoriLiveIncludeResources (default true), readoriLiveTestHeap (default 4g).
+
+def liveProperties = gradle.startParameter.projectProperties
+def adapterSource = liveProperties['readoriLiveAdapter']
+def sourcesPath = liveProperties['readoriLiveSources']
+def outputPath = liveProperties['readoriLiveOutput']
+def buildRoot = liveProperties['readoriLiveBuildRoot']
+def includeResources = (liveProperties['readoriLiveIncludeResources'] ?: 'true') != 'false'
+def testHeap = liveProperties['readoriLiveTestHeap'] ?: '4g'
+
+if (!adapterSource || !sourcesPath || !outputPath) {
+    throw new GradleException(
+        'Missing -PreadoriLiveAdapter, -PreadoriLiveSources or -PreadoriLiveOutput'
+    )
+}
+
+// Optional: keep every Gradle build output outside the Legado checkout.
+if (buildRoot) {
+    gradle.beforeProject { project ->
+        def projectDirectoryName = project.path == ':'
+            ? 'root'
+            : project.path.substring(1).replace(':', File.separator)
+        project.layout.buildDirectory.set(new File(buildRoot, projectDirectoryName))
+    }
+}
+
+gradle.beforeProject { project ->
+    if (project.path != ':app') {
+        return
+    }
+    project.pluginManager.withPlugin('com.android.application') {
+        project.dependencies.add(
+            'testImplementation',
+            'org.robolectric:robolectric:4.14.1'
+        )
+        // Kotlin files in an Android "java" source dir are compiled by the Kotlin plugin.
+        project.android.sourceSets.test.java.srcDir(new File(adapterSource))
+        project.android.testOptions.unitTests.returnDefaultValues = true
+        // Robolectric needs the merged app resources so R.string lookups used by the engine's error paths
+        // (for example R.string.chapter_list_empty in BookChapterList) resolve like on a device.
+        project.android.testOptions.unitTests.includeAndroidResources = includeResources
+
+        project.tasks.withType(Test).configureEach { testTask ->
+            // The run is network-bound and must never be served from the build cache.
+            testTask.outputs.upToDateWhen { false }
+            testTask.maxHeapSize = testHeap
+            testTask.defaultCharacterEncoding = 'UTF-8'
+            testTask.jvmArgs('-XX:+UseParallelGC', '-Dfile.encoding=UTF-8', '-Dstdout.encoding=UTF-8')
+            testTask.testLogging {
+                showStandardStreams = true
+                events 'started', 'passed', 'failed', 'skipped'
+                exceptionFormat 'full'
+            }
+            testTask.systemProperty('readori.live.sources', sourcesPath)
+            testTask.systemProperty('readori.live.output', outputPath)
+            [
+                'readori.live.concurrency'      : 'readoriLiveConcurrency',
+                'readori.live.timeoutSeconds'   : 'readoriLiveTimeoutSeconds',
+                'readori.live.limit'            : 'readoriLiveLimit',
+                'readori.live.offset'           : 'readoriLiveOffset',
+                'readori.live.flushEvery'       : 'readoriLiveFlushEvery',
+                'readori.live.hardGraceSeconds' : 'readoriLiveHardGraceSeconds',
+                'readori.live.legadoRevision'   : 'readoriLiveLegadoRevision',
+            ].each { systemName, projectName ->
+                def value = liveProperties[projectName]
+                if (value != null && value != '') {
+                    testTask.systemProperty(systemName, value)
+                }
+            }
+        }
+    }
+}
