@@ -131,9 +131,12 @@ def test_compare_counts_and_rates() -> None:
     assert counts["legadoOnlyFlaky"] == 3  # timeout, network, missing
     assert counts["readoriFailureClassesOfLegadoPass"] == {"missing": 1, "network": 1, "rule": 1, "timeout": 1}
     assert counts["legadoFailureClasses"] == {"js": 1, "rule": 1}
-    assert rates["relativeRate"] == pytest.approx(3 / 7, abs=1e-6)
-    assert rates["relativeRateExcludingFlaky"] == pytest.approx(3 / 4, abs=1e-6)
-    assert rates["relativeRateNonVacuous"] == pytest.approx(2 / 6, abs=1e-6)
+    assert rates["relativeRate"] == pytest.approx(2 / 6, abs=1e-6)  # headline: vacuous Legado passes excluded
+    assert rates["relativeRateInclVacuous"] == pytest.approx(3 / 7, abs=1e-6)
+    assert rates["relativeRateExcludingFlaky"] == pytest.approx(2 / 3, abs=1e-6)
+    assert rates["relativeRateExcludingFlakyInclVacuous"] == pytest.approx(3 / 4, abs=1e-6)
+    assert rates["relativeRateNonVacuous"] == rates["relativeRate"]
+    assert counts["bothNonVacuous"] == 2 and counts["legadoPassNonVacuous"] == 6
     assert rates["legadoPassRate"] == pytest.approx(7 / 9, abs=1e-6)
     assert rates["readoriPassRate"] == pytest.approx(4 / 9, abs=1e-6)
     assert rates["meetsTarget"] is False
@@ -247,6 +250,202 @@ def test_empty_legado_pass_set_has_no_rate() -> None:
     assert "n/a" in cp.render_markdown(parity)
 
 
+# ----------------------------------------------- R155b: groups and vacuous passes
+
+
+def prepared_source(url: str, **extra: Any) -> dict[str, Any]:
+    source: dict[str, Any] = {
+        "bookSourceName": f"src {url}",
+        "bookSourceUrl": url,
+        "searchUrl": "/s?q={{key}}",
+        "ruleSearch": {"bookList": "$.list", "name": "$.n"},
+    }
+    source.update(extra)
+    return source
+
+
+def fake_index(groups: dict[str, list[str]]) -> Any:
+    return cp.GroupIndex(
+        {member: key for key, members in groups.items() for member in members},
+        {key: list(members) for key, members in groups.items()},
+    )
+
+
+def test_validator_grouping_is_imported_not_reimplemented() -> None:
+    grouper, reason = cp.load_grouper()
+    assert grouper is not None, reason
+    from validator import validate_source_packages as validator
+
+    assert grouper is validator.group_sources
+    source = (Path(cp.__file__)).read_text(encoding="utf-8")
+    assert "source_rule_fingerprint" not in source and "canonical_source_site_key" not in source
+
+
+def test_group_members_inherit_the_representative_verdict_with_real_validator_grouping() -> None:
+    grouper, reason = cp.load_grouper()
+    assert grouper is not None, reason
+    sources = [
+        prepared_source("http://same.test"),
+        prepared_source("http://same.test#🎃"),  # export cosmetic: same group as the line above
+        prepared_source("http://same.test/"),
+        prepared_source("http://other.test"),
+    ]
+    normalize = cp.load_normalizer()
+    index = cp.build_group_index(sources, normalize, grouper)
+    assert len(index) == 2
+    legado = {"results": [legado_entry(source["bookSourceUrl"], True) for source in sources]}
+    # the validator reports ONE representative per group (a URL spelling Legado may not even have used)
+    representative = next(key for key, members in index.members.items() if "http://same.test" in members)
+    readori = {
+        "summary": {"uniqueSourceUrls": 2},
+        "results": [readori_entry(representative, True), readori_entry("http://other.test", False)],
+    }
+    parity = cp.compare(legado, readori, normalize=normalize, group_index=index)
+    counts = parity["counts"]
+    assert counts["both"] == 3 and counts["legadoOnly"] == 1
+    assert counts["readoriMissing"] == 0 and counts["readoriSkipped"] == 0
+    assert counts["readoriMapping"]["exact"] + counts["readoriMapping"]["group"] == 4
+    assert counts["readoriReportOnly"] == 0
+    assert parity["grouping"] == {"status": "grouped", "groups": 2}
+
+
+def test_member_maps_to_report_entry_of_another_member_of_its_group() -> None:
+    # the report names the group by a member URL that is not the group key (best candidate changed)
+    index = fake_index({"http://g.test": ["http://g.test", "http://g.test#a", "http://g.test#b"]})
+    legado = {"results": [legado_entry("http://g.test#a", True), legado_entry("http://g.test", True)]}
+    readori = {"results": [readori_entry("http://g.test#b", False, failureReason="toc empty")]}
+    parity = cp.compare(legado, readori, normalize=lambda url: url.strip(), group_index=index)
+    assert parity["counts"]["readoriMissing"] == 0
+    assert parity["counts"]["readoriMapping"] == {"exact": 0, "group": 2, "relaxed": 0, "skipped": 0, "missing": 0}
+    assert {item["readoriFailureClass"] for item in parity["legadoOnly"]} == {"rule"}
+    assert {item["readoriRepresentative"] for item in parity["legadoOnly"]} == {"http://g.test#b"}
+    assert parity["counts"]["readoriReportOnly"] == 0
+
+
+def test_group_prefers_a_passing_entry_when_several_members_were_reported() -> None:
+    index = fake_index({"http://g.test": ["http://g.test", "http://g.test#a", "http://g.test#c"]})
+    legado = {"results": [legado_entry("http://g.test#c", True)]}  # no entry of its own: inherits the group's
+    readori = {"results": [readori_entry("http://g.test", False), readori_entry("http://g.test#a", True)]}
+    parity = cp.compare(legado, readori, normalize=lambda url: url.strip(), group_index=index)
+    assert parity["counts"]["both"] == 1
+
+
+def test_group_without_report_entry_is_skipped_not_missing() -> None:
+    index = fake_index({"http://a.test": ["http://a.test"], "http://skipped.test": ["http://skipped.test", "http://skipped.test#x"]})
+    legado = {"results": [legado_entry(u, True) for u in ("http://a.test", "http://skipped.test", "http://skipped.test#x")]}
+    readori = {"summary": {"uniqueSourceUrls": 2}, "results": [readori_entry("http://a.test", True)]}
+    parity = cp.compare(legado, readori, normalize=lambda url: url.strip(), group_index=index)
+    counts = parity["counts"]
+    assert counts["readoriMissing"] == 0
+    assert counts["readoriSkipped"] == 2
+    assert counts["readoriSkippedReasons"] == {"not-validated": 2}
+    assert counts["readoriFailureClassesOfLegadoPass"] == {"skipped:not-validated": 2}
+    assert counts["legadoOnlyFlaky"] == 0  # a skipped group is not site flakiness
+    assert {item["readoriFailureClass"] for item in parity["legadoOnly"]} == {"skipped:not-validated"}
+    assert all(item["readoriMatch"] == "skipped" for item in parity["legadoOnly"])
+    # the validator ran with --limit: fewer groups reported than the package has
+    limited = cp.compare(
+        legado,
+        {"summary": {"uniqueSourceUrls": 1}, "results": [readori_entry("http://a.test", True)]},
+        normalize=lambda url: url.strip(),
+        group_index=index,
+    )
+    assert limited["counts"]["readoriSkippedReasons"] == {"validator-limit": 2}
+    assert "skipped:validator-limit" in cp.render_markdown(limited)
+
+
+def test_without_groups_the_old_matching_is_used_and_the_report_says_so() -> None:
+    legado, readori = synthetic_documents()
+    parity = cp.compare(legado, readori, normalize=lambda url: (url or "").strip())
+    assert parity["grouping"]["status"].startswith("unavailable")
+    assert parity["counts"]["readoriMapping"]["missing"] == 1
+    assert "WARNING: validator groups were not reconstructed" in cp.render_markdown(parity)
+
+
+def test_vacuous_legado_passes_are_not_in_the_headline_rate() -> None:
+    legado = {
+        "results": [
+            legado_entry("http://real-both.test", True),
+            legado_entry("http://real-gap.test", True),
+            legado_entry("http://vac-both.test", True, vacuous=True),
+            legado_entry("http://vac-gap-1.test", True, vacuous=True),
+            legado_entry("http://vac-gap-2.test", True, vacuous=True),
+            legado_entry("http://vac-fail.test", False, vacuous=True),  # a failing source is never vacuous-counted
+        ]
+    }
+    readori = {
+        "results": [
+            readori_entry("http://real-both.test", True),
+            readori_entry("http://real-gap.test", False),
+            readori_entry("http://vac-both.test", True),
+            readori_entry("http://vac-gap-1.test", False),
+            readori_entry("http://vac-gap-2.test", False),
+            readori_entry("http://vac-fail.test", False),
+        ]
+    }
+    parity = cp.compare(legado, readori, normalize=lambda url: url.strip())
+    counts, rates = parity["counts"], parity["rates"]
+    assert counts["legadoPass"] == 5 and counts["both"] == 2
+    assert counts["legadoPassNonVacuous"] == 2 and counts["bothNonVacuous"] == 1
+    assert counts["legadoVacuousPass"] == 3
+    assert rates["relativeRate"] == pytest.approx(1 / 2, abs=1e-6)  # headline = non-vacuous
+    assert rates["relativeRateInclVacuous"] == pytest.approx(2 / 5, abs=1e-6)
+    assert rates["relativeRateNonVacuous"] == rates["relativeRate"]
+    markdown = cp.render_markdown(parity)
+    header = next(line for line in markdown.splitlines() if line.startswith("**Relative rate"))
+    assert "non-vacuous" in header and "50.00%" in header and "1 / 2" in header
+    assert "| Relative rate including vacuous Legado passes | 40.00% |" in markdown
+    vacuous_rows = [item for item in parity["legadoOnly"] if item["vacuous"]]
+    assert len(vacuous_rows) == 2  # still listed in the work list, flagged
+    only_vacuous = {"results": [legado_entry("http://v.test", True, vacuous=True)]}
+    none_real = cp.compare(only_vacuous, {"results": [readori_entry("http://v.test", True)]}, normalize=lambda url: url.strip())
+    assert none_real["rates"]["relativeRate"] is None and none_real["rates"]["meetsTarget"] is False
+    assert none_real["rates"]["relativeRateInclVacuous"] == 1.0
+
+
+def test_cli_uses_sources_next_to_the_legado_report_and_the_explicit_flag(tmp_path: Path) -> None:
+    sources = [prepared_source("http://same.test"), prepared_source("http://same.test#🎃"), prepared_source("http://other.test")]
+    legado = {"results": [legado_entry(s["bookSourceUrl"], True) for s in sources]}
+    normalize = cp.load_normalizer()
+    grouper, reason = cp.load_grouper()
+    assert grouper is not None, reason
+    index = cp.build_group_index(sources, normalize, grouper)
+    representative = next(key for key, members in index.members.items() if "http://same.test" in members)
+    readori = {
+        "summary": {"uniqueSourceUrls": 2},
+        "results": [readori_entry(representative, True), readori_entry("http://other.test", True)],
+    }
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "legado_report.json").write_text(json.dumps(legado, ensure_ascii=False), encoding="utf-8")
+    (work / "report.json").write_text(json.dumps(readori, ensure_ascii=False), encoding="utf-8")
+    (work / "sources.json").write_text(json.dumps(sources, ensure_ascii=False), encoding="utf-8")
+    auto = tmp_path / "auto"
+    assert cp.main(["--legado", str(work / "legado_report.json"), "--readori", str(work / "report.json"), "--output-dir", str(auto)]) == 0
+    parity = json.loads((auto / "parity.json").read_text(encoding="utf-8"))
+    assert parity["grouping"]["status"] == "grouped"
+    assert parity["counts"]["both"] == 3 and parity["counts"]["readoriMissing"] == 0
+    # explicit --sources wins; a package without a sources.json next to it falls back with a warning
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for name in ("legado_report.json", "report.json"):
+        (elsewhere / name).write_text((work / name).read_text(encoding="utf-8"), encoding="utf-8")
+    plain = tmp_path / "plain"
+    assert cp.main(["--legado", str(elsewhere / "legado_report.json"), "--readori", str(elsewhere / "report.json"), "--output-dir", str(plain)]) == 0
+    assert json.loads((plain / "parity.json").read_text(encoding="utf-8"))["grouping"]["status"].startswith("unavailable")
+    explicit = tmp_path / "explicit"
+    code = cp.main(
+        [
+            "--legado", str(elsewhere / "legado_report.json"),
+            "--readori", str(elsewhere / "report.json"),
+            "--sources", str(work / "sources.json"),
+            "--output-dir", str(explicit),
+        ]
+    )
+    assert code == 0
+    assert json.loads((explicit / "parity.json").read_text(encoding="utf-8"))["counts"]["both"] == 3
+
+
 def test_cli_writes_json_and_markdown(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     legado, readori = synthetic_documents()
     legado_path = tmp_path / "legado_report.json"
@@ -260,7 +459,7 @@ def test_cli_writes_json_and_markdown(tmp_path: Path, capsys: pytest.CaptureFixt
     assert parity["schemaVersion"] == 1
     assert parity["counts"]["both"] == 3
     assert (out / "parity.md").read_text(encoding="utf-8").startswith("## Readori vs Legado live reference")
-    assert "relativeRate=42.86%" in capsys.readouterr().out
+    assert "relativeRate=33.33%" in capsys.readouterr().out
     assert cp.main(["--legado", str(legado_path), "--readori", str(readori_path), "--output-dir", str(out), "--fail-under"]) == 1
 
 

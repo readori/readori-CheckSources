@@ -1161,6 +1161,26 @@ def normalized_book_candidate_url_for_comparison(url: str) -> str:
     return text.rstrip("/").lower()
 
 
+def response_url_differs_from_request(request_url: str, final_url: str) -> bool:
+    """True when the response URL is a real redirect target (Swift `finalUrl != searchUrl`).
+
+    `requests` re-quotes the request URL (`resp.url`), so a plain string compare would call every URL with raw
+    non-ASCII characters a redirect; the request URL is re-quoted the same way before comparing. `url,{options}`
+    carriers compare by their URL part."""
+    request_part = parse_url_options(request_url or "")[0].strip()
+    final_part = str(final_url or "").strip()
+    if final_part == request_part:
+        return False
+    try:
+        from requests.utils import requote_uri
+
+        if final_part == requote_uri(request_part):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def is_likely_search_or_explore_landing_url(url: str, runtime: RuleRuntime, *, reject_search_endpoint: bool = False) -> bool:
     candidate = normalized_book_candidate_url_for_comparison(url)
     if not candidate:
@@ -4413,12 +4433,15 @@ var java = {
     setContent: function(content) { result = content; __readoriContent = content; },
     getElement: function(selector, html) {
         var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
-        var rows = _readoriJsoupRows(sourceHtml, String(selector || ''));
+        var rows = _readoriJsoupRowsByLegadoRule(sourceHtml, String(selector || ''));
+        if (rows === null) rows = _readoriJsoupRows(sourceHtml, String(selector || ''));
         return rows.length ? _readoriJsoupElement(rows[0], null) : _readoriJsoupElement({}, null);
     },
     getElements: function(selector, html) {
         var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
-        return _readoriJsoupElements(_readoriJsoupRowsForRule(sourceHtml, String(selector || '')), null);
+        var rows = _readoriJsoupRowsByLegadoRule(sourceHtml, String(selector || ''));
+        if (rows === null) rows = _readoriJsoupRowsForRule(sourceHtml, String(selector || ''));
+        return _readoriJsoupElements(rows, null);
     },
     selectElementsJSON: function(selector, html) {
         try {
@@ -5789,6 +5812,16 @@ function _readoriJsoupRows(html, selector) {
         rows = [];
     }
     return rows;
+}
+function _readoriJsoupRowsByLegadoRule(html, selector) {
+    // null = not a Legado element rule (plain CSS: the caller keeps its CSS selection)
+    try {
+        if (typeof __readoriSelectElementsByRuleJSON === 'function') {
+            var rows = JSON.parse(__readoriSelectElementsByRuleJSON(String(selector || ''), String(html || '')) || 'null');
+            if (Array.isArray(rows)) return rows;
+        }
+    } catch (error) {}
+    return null;
 }
 function _readoriSelectorToken(token) {
     var text = String(token || '').trim();
@@ -7969,10 +8002,11 @@ def _evaluate_js_quickjs_attempt(
                     ctx.set(key, value)
             except Exception:
                 pass
-        ctx.eval("var headers = {};")
-        ctx.eval(f"headers = {json.dumps(runtime.headers, ensure_ascii=False)};")
-        ctx.eval("var variables = {};")
-        ctx.eval(f"variables = {json.dumps(runtime.variables or {}, ensure_ascii=False)};")
+        # R155 (G): configurable globalThis properties instead of `var` (non-configurable): Rhino lets a source script
+        # declare its own `let headers = {...}`; a QuickJS top-level `var headers` made that a redeclaration SyntaxError
+        # (JSEngine.swift:2348 installs them with setObject, also configurable).
+        ctx.eval(f"globalThis.headers = {json.dumps(runtime.headers, ensure_ascii=False)};")
+        ctx.eval(f"globalThis.variables = {json.dumps(runtime.variables or {}, ensure_ascii=False)};")
         try:
             ctx.eval(
                 """
@@ -7991,6 +8025,14 @@ def _evaluate_js_quickjs_attempt(
             ctx.add_callable(
                 "__readoriSelectElementsJSON",
                 lambda selector, html: select_elements_json(str(selector or ""), str(html or ""), runtime.base_url),
+            )
+        except Exception:
+            pass
+        try:
+            # R155 (L): java.getElements / java.getElement take Legado rules (AnalyzeRule.getElements), not only CSS.
+            ctx.add_callable(
+                "__readoriSelectElementsByRuleJSON",
+                lambda rule, html: select_elements_by_rule_json(str(rule or ""), str(html or ""), runtime),
             )
         except Exception:
             pass
@@ -9665,8 +9707,42 @@ def parse_css_rule(inner: str) -> tuple[str, str | None, int | None]:
     return selector, final_attr, final_index
 
 
+_JSOUP_INDEX_PSEUDO_RE = re.compile(r":(lt|gt|eq)\(\s*(\d+)\s*\)")
+
+
+def _jsoup_index_pseudo_to_nth_child(match: re.Match[str]) -> str:
+    """Jsoup `:lt(n)` / `:gt(n)` / `:eq(n)` compare the ELEMENT SIBLING INDEX (0-based, any tag among the parent's
+    element children) with n - exactly `:nth-child` (1-based): lt -> positions 1..n, gt -> n+2.., eq -> n+1."""
+    kind = match.group(1)
+    number = int(match.group(2))
+    if kind == "lt":
+        return ":nth-child(-n+%d)" % number if number > 0 else ":not(*)"
+    if kind == "gt":
+        return ":nth-child(n+%d)" % (number + 2)
+    return ":nth-child(%d)" % (number + 1)
+
+
+_JSOUP_UNQUOTED_ATTR_VALUE_RE = re.compile(r"\[\s*([A-Za-z_][-\w:.]*)\s*(\^=|\$=|\*=|\|=|!=|=)\s*([^\]\"']*?)\s*\]")
+
+
+def _quote_jsoup_attribute_value(match: re.Match[str]) -> str:
+    value = match.group(3)
+    if not value or re.fullmatch(r"-?[A-Za-z_][-\w]*", value):
+        return match.group(0)
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return '[%s%s"%s"]' % (match.group(1), match.group(2), escaped)
+
+
 def normalize_selector(selector: str) -> str:
-    return selector.replace(":contains(", ":-soup-contains(")
+    selector = selector.replace(":contains(", ":-soup-contains(")
+    if "[" in selector:
+        # R155 (R): Jsoup's QueryParser takes everything up to `]` as the raw value of `[attr=value]` (`div[style=text-indent: 2em;]`,
+        # sfacg's content rule); soupsieve only accepts an identifier or a quoted string there.
+        selector = _JSOUP_UNQUOTED_ATTR_VALUE_RE.sub(_quote_jsoup_attribute_value, selector)
+    if ":lt(" in selector or ":gt(" in selector or ":eq(" in selector:
+        # R155 (M): soupsieve has no Jsoup index pseudo selectors.
+        selector = _JSOUP_INDEX_PSEUDO_RE.sub(_jsoup_index_pseudo_to_nth_child, selector)
+    return selector
 
 
 def css_extract(html: str, selector: str, attr: str | None, index: int | None, base_url: str) -> list[str]:
@@ -9690,11 +9766,11 @@ def css_extract(html: str, selector: str, attr: str | None, index: int | None, b
     results: list[str] = []
     for el in elems:
         if attr is None or attr == "outerhtml":
-            results.append(str(el))
+            results.append(_serialize_html(el))
         elif attr == "all":
-            results.append(str(el))
+            results.append(_serialize_html(el))
         elif attr == "html" or attr == "innerhtml":
-            results.append("".join(str(c) for c in el.contents))
+            results.append("".join(_serialize_html(c) for c in el.contents))
         elif attr == "text":
             results.append(el.get_text(strip=True))
         elif attr == "owntext":
@@ -9738,32 +9814,79 @@ def select_elements_json(selector: str, html: str, base_url: str) -> str:
     if not elems and (selector or "").strip().lower() == "body":
         elems = [soup]
 
+    return json.dumps([_element_row(el, base_url) for el in elems], ensure_ascii=False)
+
+
+def _element_row(el: Any, base_url: str) -> dict[str, str]:
+    outer = _serialize_html(el)
+    inner = "".join(_serialize_html(c) for c in getattr(el, "contents", [])).strip()
+    text = el.get_text(" ", strip=True) if hasattr(el, "get_text") else str(el)
+    own_text = ""
+    if hasattr(el, "find_all"):
+        own_text = " ".join(s.strip() for s in el.find_all(string=True, recursive=False) if s.strip())
+    row: dict[str, str] = {
+        "outerHtml": outer,
+        "html": inner,
+        "text": text,
+        "ownText": own_text,
+    }
+    attrs = getattr(el, "attrs", {}) or {}
+    for key, value in attrs.items():
+        attr_key = str(key).lower()
+        if isinstance(value, list):
+            attr_value = " ".join(str(v) for v in value)
+        else:
+            attr_value = str(value)
+        # Jsoup Element.attr(name) is the raw value (Legado / iOS semantics); only an explicit "abs:" resolves.
+        row[attr_key] = attr_value
+        if attr_key in URL_ATTRS:
+            row["abs:" + attr_key] = urljoin(base_url, attr_value)
+    return row
+
+
+_LEGADO_ELEMENT_RULE_PREFIX_RE = re.compile(r"^(?:class|tag|id|text)\.|^children(?:$|[.!\[])|^@@|^@(?:css|xpath|json):|^/", re.I)
+_LEGADO_ELEMENT_RULE_INDEX_RE = re.compile(r"(?:[.!]\s*-?\d+(?:\s*:\s*-?\d+)*|\[\s*!?[\d\s,:\-]+\])\s*$")
+
+
+def is_legado_element_rule(selector: str) -> bool:
+    """Whether `java.getElements/getElement` input is a Legado rule (AnalyzeRule.getElements) rather than a plain CSS
+    selector: `tag.`/`id.`/`class.`/`text.`/`children` steps, `@@`, `@css:`/`@xpath:`/`@json:`, an `@` chain, a `||`/`&&`/`%%`
+    combination, or an ElementsSingle index suffix (`.N`, `!N`, `[..]`). Script rules are not element rules."""
+    text = (selector or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if "@js:" in low or "<js>" in low:
+        return False
+    if _LEGADO_ELEMENT_RULE_PREFIX_RE.search(text):
+        return True
+    if "@" in text or "||" in text or "&&" in text or "%%" in text:
+        return True
+    return bool(_LEGADO_ELEMENT_RULE_INDEX_RE.search(text))
+
+
+def select_elements_by_rule_json(rule: str, html: str, runtime: RuleRuntime) -> str:
+    """`java.getElements(rule, html)` / `java.getElement`: the validator's own Legado rule evaluator (the same one that
+    evaluates a list rule, i.e. AnalyzeRule.getElements) and every hit re-parsed into a bridge row.
+
+    Returns the JSON text `null` when `rule` is not a Legado element rule (or the content is JSON): the JS side then keeps
+    its CSS selection."""
+    text = (rule or "").strip()
+    if not is_legado_element_rule(text) or is_json_content(html or ""):
+        return "null"
+    if text.startswith("@@"):
+        text = text[2:].strip()
+    try:
+        items = evaluate_book_list(text, html or "", runtime)
+    except Exception as _swallowed:
+        note_debug_error("java.getElements rule", _swallowed)
+        return "[]"
     rows: list[dict[str, str]] = []
-    for el in elems:
-        outer = str(el)
-        inner = "".join(str(c) for c in getattr(el, "contents", [])).strip()
-        text = el.get_text(" ", strip=True) if hasattr(el, "get_text") else str(el)
-        own_text = ""
-        if hasattr(el, "find_all"):
-            own_text = " ".join(s.strip() for s in el.find_all(string=True, recursive=False) if s.strip())
-        row: dict[str, str] = {
-            "outerHtml": outer,
-            "html": inner,
-            "text": text,
-            "ownText": own_text,
-        }
-        attrs = getattr(el, "attrs", {}) or {}
-        for key, value in attrs.items():
-            attr_key = str(key).lower()
-            if isinstance(value, list):
-                attr_value = " ".join(str(v) for v in value)
-            else:
-                attr_value = str(value)
-            # Jsoup Element.attr(name) is the raw value (Legado / iOS semantics); only an explicit "abs:" resolves.
-            row[attr_key] = attr_value
-            if attr_key in URL_ATTRS:
-                row["abs:" + attr_key] = urljoin(base_url, attr_value)
-        rows.append(row)
+    for item in items:
+        element = BeautifulSoup(item or "", "html.parser").find(True)
+        if element is None:
+            continue
+        rows.append(_element_row(element, runtime.base_url))
     return json.dumps(rows, ensure_ascii=False)
 
 
@@ -10280,14 +10403,25 @@ def _legado_all_in_one_patterns(rule: str) -> list[str] | None:
     return patterns or None
 
 
+def _legado_src_binding(src_content: str | None, js_input: str) -> dict[str, Any] | None:
+    """R155: Legado binds `src` to the rule's CONTENT (AnalyzeRule.evalJS `bindings["src"] = content`), not to the
+    previous segment's result (`result`). evaluate_js defaults `src` to its input, which is only right for the first segment."""
+    if src_content is None or src_content == js_input:
+        return None
+    return {"src": src_content}
+
+
 def _evaluate_legado_js_segment(
     code: str,
     is_at_js: bool,
     js_input: str,
     runtime: RuleRuntime,
     is_last: bool,
+    src_content: str | None = None,
 ) -> list[str]:
-    js_code = code.strip()
+    # R155 (B): Legado SourceRule.makeUpRule (AnalyzeRule.kt:659-705) expands `@get:{key}` in EVERY rule mode, JS
+    # included (`'...&bookId=@get:{book}&...'` inside an `@js:` tail is the stored value before the script runs).
+    js_code = substitute_variable_references(code.strip(), runtime)
     json_tail = ""
     if is_at_js:
         # Readori compatibility: @js:…@json:… (Legado's @js: swallows the tail).
@@ -10299,7 +10433,7 @@ def _evaluate_legado_js_segment(
     if js_result is None and is_at_js:
         js_result = try_evaluate_fast_toc_item_js(js_code, js_input, runtime)
     if js_result is None:
-        js_result = evaluate_js(js_code, js_input, runtime)
+        js_result = evaluate_js(js_code, js_input, runtime, extra_vars=_legado_src_binding(src_content, js_input))
     if json_tail:
         return evaluate_rule(json_tail, js_result, runtime, "json")
     if not js_result:
@@ -10334,7 +10468,7 @@ def _evaluate_legado_js_pipeline(
             previous_mode = set_legado_object_string_mode(object_mode and is_last)
             try:
                 if is_js:
-                    values = _evaluate_legado_js_segment(text, is_at_js, text_value, runtime, is_last)
+                    values = _evaluate_legado_js_segment(text, is_at_js, text_value, runtime, is_last, content)
                 else:
                     if offset == 0:
                         item_type = content_type
@@ -10357,7 +10491,7 @@ def _evaluate_legado_js_pipeline(
         try:
             if is_js:
                 js_input = content if offset == 0 else "\n".join(current)
-                current = _evaluate_legado_js_segment(text, is_at_js, js_input, runtime, is_last)
+                current = _evaluate_legado_js_segment(text, is_at_js, js_input, runtime, is_last, content)
             else:
                 next_values: list[str] = []
                 for item in current:
@@ -10629,7 +10763,7 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
                 for item in base_results:
                     js_result = try_evaluate_fast_java_aes(js_code, item)
                     if js_result is None:
-                        js_result = evaluate_js(js_code, item, runtime)
+                        js_result = evaluate_js(js_code, item, runtime, extra_vars=_legado_src_binding(content, item))
                     if js_result:
                         if after_js:
                             out.extend(evaluate_rule(after_js, js_result, runtime, content_type))
@@ -10673,7 +10807,7 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
         for item in intermediate:
             js_result = try_evaluate_fast_java_aes(js_tail, item)
             if js_result is None:
-                js_result = evaluate_js(js_tail, item, runtime)
+                js_result = evaluate_js(js_tail, item, runtime, extra_vars=_legado_src_binding(content, item))
             out.extend(js_result_to_list(js_result))
         return out
 
@@ -11138,10 +11272,20 @@ def _is_current_element_url_rule(rule: str) -> bool:
 
 
 class _SourceOrderHTMLFormatter(HTMLFormatter):
-    """Keep source attribute order like JSoup's Element.outerHtml()."""
+    """JSoup's Element.outerHtml() attribute serialisation: source attribute order, every value in DOUBLE quotes with
+    `&` -> `&amp;`, `"` -> `&quot;` and U+00A0 -> `&nbsp;` (Jsoup Entities.escape, attribute mode: `<` / `>` stay raw).
+
+    R155 (F): BeautifulSoup's default picks single quotes for a value that contains `"` (`class='"g"'`), so a rule that
+    matches the element text with `/class="\\&quot;g\\&quot;"/` (52PO) never matched."""
 
     def attributes(self, tag: Any) -> Iterable[tuple[str, Any]]:
         return [] if tag.attrs is None else tag.attrs.items()
+
+    def attribute_value(self, value: str) -> str:
+        return str(value).replace("&", "&amp;").replace('"', "&quot;").replace(" ", "&nbsp;")
+
+    def quoted_attribute_value(self, value: str) -> str:
+        return '"' + str(value) + '"'
 
 
 _SOURCE_ORDER_HTML_FORMATTER = _SourceOrderHTMLFormatter()
@@ -12127,6 +12271,55 @@ def _java_regex_replacement(match: re.Match[str], replacement: str) -> str:
     return "".join(out)
 
 
+_JAVA_NON_LINE_TERMINATOR_CLASS = "[^\\n\\r\\u0085\\u2028\\u2029]"
+_JAVA_DOTALL_FLAG_RE = re.compile(r"\(\?[a-zA-Z]*s[a-zA-Z-]*[:)]")
+
+
+def java_regex_dot_to_python(pattern: str) -> str:
+    """R155 (E): Java / ICU `.` (no DOTALL) excludes every line terminator - `\\n \\r \\u0085 \\u2028 \\u2029` - while Python's
+    only excludes `\\n`, so a page that breaks lines with a lone `\\r` made `##第(.*)页` swallow the whole text. Every
+    unescaped `.` outside a character class becomes `[^\\n\\r\\u0085\\u2028\\u2029]`. Escapes (`\\.`, `\\\\`), character
+    classes (including nested `[a[b]]` and a leading literal `]`), and patterns carrying an inline DOTALL flag are left alone."""
+    if "." not in pattern or _JAVA_DOTALL_FLAG_RE.search(pattern):
+        return pattern
+    out: list[str] = []
+    index = 0
+    length = len(pattern)
+    class_depth = 0
+    while index < length:
+        char = pattern[index]
+        if char == "\\":
+            out.append(pattern[index:index + 2])
+            index += 2
+            continue
+        if class_depth:
+            if char == "[":
+                class_depth += 1
+            elif char == "]":
+                class_depth -= 1
+            out.append(char)
+            index += 1
+            continue
+        if char == "[":
+            class_depth = 1
+            out.append(char)
+            index += 1
+            # `[^]...]` / `[]...]`: a `]` right after the opening is a literal member
+            if index < length and pattern[index] == "^":
+                out.append("^")
+                index += 1
+            if index < length and pattern[index] == "]":
+                out.append("]")
+                index += 1
+            continue
+        if char == ".":
+            out.append(_JAVA_NON_LINE_TERMINATOR_CLASS)
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def legado_replace_regex(value: str, chain: str) -> str:
     """AnalyzeRule.replaceRegex for a SourceRule ``##`` suffix.
 
@@ -12148,7 +12341,10 @@ def legado_replace_regex(value: str, chain: str) -> str:
         if (repl.startswith(("http://", "https://")) or "{{" in replacement) and current.startswith(("http://", "https://")):
             return value
     try:
-        regex = re.compile(pattern)
+        try:
+            regex = re.compile(java_regex_dot_to_python(pattern))
+        except re.error:
+            regex = re.compile(pattern)
     except re.error:
         return replacement if replace_first else value.replace(pattern, replacement)
     if replace_first:
@@ -12863,6 +13059,33 @@ def request_search_or_explore(
     return abs_url, method, {"headers": headers, "body": body, "charset": charset}
 
 
+def trailing_put_split(rule: str) -> tuple[str, list[str]] | None:
+    """`base@put:{…}[@put:{…}]` with every put at the END of a non-script rule -> (base, put bodies); otherwise None."""
+    text = (rule or "").strip()
+    if "@put:" not in text.lower() or "<js>" in text.lower() or "@js:" in text.lower():
+        return None
+    match = re.fullmatch(r"([\s\S]*?)((?:\s*@put:\{[^}]+?\})+)\s*", text, re.I)
+    if match is None or not match.group(1).strip():
+        return None
+    bodies = [found.group(1)[1:-1] for found in _LEGADO_PUT_PATTERN.finditer(match.group(2))]
+    return match.group(1).strip(), bodies
+
+
+def is_bare_css_exclusion_rule(rule: str) -> bool:
+    """True for a single-step bare selector rule (no `@` chain, no JSON/XPath/JS marker) whose tail is an ElementsSingle
+    exclusion index: `sel!N[:M...]` or `sel[!N, A:B]`."""
+    text = (rule or "").strip()
+    if not text or "@" in text or "##" in text or "<js>" in text.lower():
+        return False
+    if text.startswith(("$", "/", "[", "{", "<", "+", "-")):
+        return False
+    parsed = _parse_css_index_selection(text)
+    if parsed is None:
+        return False
+    selector_text, excludes, _terms = parsed
+    return bool(excludes and selector_text.strip())
+
+
 def evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
     # Legado list rules run on RuleData: JS `book` is null unless a book is bound.
     runtime.book_list_depth = getattr(runtime, "book_list_depth", 0) + 1
@@ -12887,6 +13110,16 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
     all_in_one = _legado_all_in_one_patterns(text)
     if all_in_one is not None:
         return _legado_all_in_one_values(all_in_one, html)
+
+    # R155 (C), App profile 1.1.2 only: `data.chapters@put:{total_page:data.total_page}` - Legado AnalyzeRule.getElements
+    # (:365-395) calls putRule(sourceRule.putMap) on the WHOLE content for each source rule and then evaluates the rule
+    # without its put as a list. 1.1.1 hands the whole text to the engines and ends up with a single bogus item.
+    if app_profiles.current_app_profile().list_put_on_whole_content and trailing_put_split(text) is not None:
+        put_base, put_bodies = trailing_put_split(text)  # type: ignore[misc]
+        put_content_type = "json" if is_json_content(html) else "html"
+        for put_body in put_bodies:
+            evaluate_single_rule("@put:{" + put_body + "}", html, runtime, put_content_type)
+        return evaluate_book_list(put_base, html, runtime)
 
     sequence = _first_rule_sequence(text)
     if sequence is not None:
@@ -12972,6 +13205,13 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
         results = css_extract(html, text, "outerhtml", None, runtime.base_url)
         if results:
             return results
+    # R155 (D): a bare Jsoup selector with a trailing exclusion index (`tr!0`, `.mySearch ul!-1`, `li!0:3`) is
+    # AnalyzeByJSoup.ElementsSingle (:303-322): `select(beforeRule)` then the listed indexes (negatives count from the
+    # end) are REMOVED. parse_css_rule only knows the `@`-chained `!N`, so the whole rule used to be one bogus selector.
+    if not is_json_content(html) and is_bare_css_exclusion_rule(text):
+        excluded_items = evaluate_css_chain_rule(text, html, runtime, attr_override="outerhtml")
+        if excluded_items:
+            return excluded_items
     if text.startswith(("$.", "$[")) or text.startswith("$..") or looks_like_bare_jsonpath(text):
         if not text.startswith("$") and not is_json_content(html):
             # R149 (B2): RuleEvaluator.swift:1534-1539 (.contentDependent in a list rule): JSON content -> JSONPath,
@@ -13070,7 +13310,12 @@ def evaluate_json_object_list(path: str, content: str) -> list[str]:
         if isinstance(obj, list):
             return [x for x in (json_container_to_string(item) for item in obj) if x]
     if path_text.startswith("."):
-        path_text = "$" + path_text
+        if app_profiles.current_app_profile().json_leading_dot_deep_scan and not path_text.startswith(("..", ".[")) and path_text not in {".", ".*"}:
+            # R155 (N), App profile 1.1.2: Jayway compiles a path that does not start with `$` / `@` as `"$." + path`, so
+            # `.bookList[*]` is `$..bookList[*]` (deep scan; AnalyzeByJSonPath hands the rule to JsonPath.read as is).
+            path_text = "$." + path_text
+        else:
+            path_text = "$" + path_text
     elif not path_text.startswith(("$", "[")):
         path_text = "$." + path_text
     if path_text.startswith("$.["):
@@ -14573,7 +14818,10 @@ def fetch_book_candidates(
                 if _dbg.active():
                     _dbg.emit("field", field="init", rule=search_init_rule,
                               value=transformed_html[:2000] if transformed_html else "")
-            if is_likely_search_or_explore_landing_url(final_url, runtime):
+            # R155 (I): BookSourceEngine.swift:246-262 consults the landing guard only after a real redirect
+            # (finalUrl != searchUrl); Legado has no such guard. A search URL that merely looks like a landing page
+            # (e.g. `wap/index.php?keyword=...` answering with results directly) must not be dropped.
+            if response_url_differs_from_request(url, final_url) and is_likely_search_or_explore_landing_url(final_url, runtime):
                 if _dbg.active():
                     _dbg.emit("warn", code="landing", url=final_url)
                 continue
@@ -14849,6 +15097,23 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
         runtime2.book_kind = kind
         runtime2.variables = runtime2.variables or {}
         runtime2.variables.update({"book.kind": kind, "bookKind": kind, "kind": kind})
+    # R155 (Q): Legado BookInfo.kt:68-140 evaluates EVERY info field in order (name, author, kind, wordCount, lastChapter,
+    # intro, coverUrl, then tocUrl) and the App does the same (BookSourceEngine.swift:9059 ...), so the `@put:{k:rule}` /
+    # `java.put` of a field the validator otherwise ignores still runs before the TOC / content stages ask for it
+    # (漫客栈 `wordCount: "@put:{p:$.comic_id}"` feeds `comic_id=@get:{p}` of chapterUrl). Only fields whose rule can
+    # have such a side effect are evaluated; their errors never fail the detail stage (Legado catches them).
+    for side_effect_field in ("author", "wordCount", "lastChapter", "intro", "coverUrl"):
+        side_effect_rule = str(info_rule.get(side_effect_field) or "").strip()
+        side_effect_low = side_effect_rule.lower()
+        if "@put:" not in side_effect_low and "java.put(" not in side_effect_low:
+            continue
+        saved_script_error = runtime2.script_error
+        try:
+            evaluate_get_string(side_effect_rule, html, runtime2, "json" if is_json_content(html) else "html")
+        except Exception as _swallowed:
+            note_debug_error("detail field side effects", _swallowed)
+        finally:
+            runtime2.script_error = saved_script_error
     if str(info_rule.get("tocUrl") or "").strip():
         toc_rule_text = str(info_rule.get("tocUrl"))
         content_type = "json" if is_json_content(html) else "html"
@@ -14864,7 +15129,11 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
                 book_url=book_url,
             )
             candidate_toc_url = resolve_plausible_url_preserving_options(toc_raw, final_url)
-            if candidate_toc_url and not is_unusable_toc_url_candidate(candidate_toc_url, book_url) and not is_likely_single_chapter_toc_fallback(candidate_toc_url, book_url):
+            # R155 (H): with a tocUrl rule only the pagination-plausibility check applies (BookSourceEngine.swift
+            # :9120-9150); the category / list / single-chapter heuristics (is_unusable_toc_url_candidate,
+            # is_likely_single_chapter_toc_fallback) are for a source with neither a tocUrl nor a chapterList rule and run
+            # on the heuristic paths below. A static asset (`.css`, `.js`, images) stays rejected: it can never be a TOC.
+            if candidate_toc_url and not (is_static_asset_url(candidate_toc_url) and not is_likely_toc_data_asset_url(candidate_toc_url)):
                 toc_url = candidate_toc_url
                 break
         if _dbg.active():
@@ -15725,6 +15994,10 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
     first_chapter_url = ""
     first_chapter_title = ""
     seen_chapter_urls: set[str] = set()
+    # R155 (A): Legado BookChapterList:77-104 / :160-175 - a first page whose nextTocUrl yields several URLs fetches them
+    # as a one-shot batch and those pages never evaluate nextTocUrl again; a single URL is followed serially (only the
+    # first URL of each page). BookSourceEngine.swift:3326-3350 `nextTocRuleBatchUrls` is the App mirror.
+    next_toc_batch_urls: set[str] = set()
     while queue and pages < 80:
         current_url = queue.pop(0)
         abs_url, request_options = resolve_url_with_options(current_url, runtime_seed.base_url)
@@ -15920,6 +16193,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                     raw_chapter_url = "\n".join(raw_urls)
                 else:
                     raw_chapter_url = raw_urls[0] if raw_urls and raw_urls[0].strip() else ""
+                # R155 (B): a JS-produced chapter URL may still carry `@get:{key}` (BookSourceEngine.swift:3102 expands it).
+                raw_chapter_url = substitute_variable_references(raw_chapter_url, item_runtime)
                 if contains_json_placeholder(raw_chapter_url):
                     raw_chapter_url = substitute_json_placeholders(raw_chapter_url, item)
                 if "{{" in raw_chapter_url and "@css:" in raw_chapter_url:
@@ -16034,22 +16309,34 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                         runtime.chapter_active = True
 
         next_rule = str(toc_rule.get("nextTocUrl") or "").strip()
-        if next_rule:
+        if next_rule and current_url not in next_toc_batch_urls:
             next_values = legado_string_list_values(evaluate_rule(next_rule, html, runtime2, content_type))
             if _dbg.active():
                 _dbg.emit("field", field="nextTocUrl", rule=next_rule, value="\n".join(next_values))
+            resolved_next_urls: list[str] = []
             for raw in next_values:
                 if not raw or not raw.strip():
                     continue
                 next_url, next_options = resolve_url_with_options(raw, final_url)
-                if not next_url:
+                # Legado `if (item != redirectUrl)`: a next page equal to the page just fetched is dropped.
+                if not next_url or next_url == final_url:
                     continue
                 # R150: a nextTocUrl page keeps its `url,{options}` (the App resolves each queued page with resolveRequest,
                 # BookSourceEngine.swift:2743-2752); the loop above splits them again when the page is requested.
                 next_url = compose_url_with_options(next_url, next_options)
-                if next_url in visited or next_url in queue:
-                    continue
-                queue.append(next_url)
+                resolved_next_urls.append(next_url)
+            if pages == 1 and len(resolved_next_urls) > 1:
+                batch_urls: list[str] = []
+                for next_url in resolved_next_urls:
+                    if next_url in visited or next_url in queue or next_url in batch_urls:
+                        continue
+                    batch_urls.append(next_url)
+                next_toc_batch_urls.update(batch_urls)
+                queue.extend(batch_urls)
+            elif resolved_next_urls:
+                first_next_url = resolved_next_urls[0]
+                if first_next_url not in visited and first_next_url not in queue:
+                    queue.append(first_next_url)
 
         if not next_rule and len(items) >= 15:
             for range_url in guess_toc_range_option_urls_from_html(html, final_url):
@@ -16074,6 +16361,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
 
 def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, chapter_url: str, chapter_title: str, book_name: str) -> tuple[bool, str, int]:
     begin_network_stage()
+    # R155 (B): the content request URL expands any leftover `@get:{key}` (BookSourceEngine.swift:5397 / :8149).
+    chapter_url = substitute_variable_references(chapter_url or "", runtime)
     if _dbg.active():
         _dbg.set_stage("content")
     content_rule = src.get("ruleContent")

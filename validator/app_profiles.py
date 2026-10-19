@@ -6,7 +6,11 @@
 * A1 `@js:` searchUrl 的字面量捷径（1.1.1 会请求第一个 http(s) 字面量并丢弃脚本）；
 * A2 String 字段为 JSON 数组 / 对象（1.1.1 整个字段丢弃，1.1.2 存成紧凑 JSON 文本）；
 * A3 CryptoJS（1.1.1 无条件安装一个会遮挡书源自带库的假对象，1.1.2 按需安装 crypto-js 4.1 兼容实现）；
-* A4 批量验证里被拦下的登录 / 验证交互（1.1.1 记失效，1.1.2 记「需要登录/验证」）。
+* A4 批量验证里被拦下的登录 / 验证交互（1.1.1 记失效，1.1.2 记「需要登录/验证」）；
+* A5 列表规则尾部 `@put:{…}`（R155 C：1.1.1 把整条规则当一条普通规则，得到一个条目；1.1.2 先对整份内容执行 put，
+  再把去掉 put 的基础规则当列表求值，对应 Legado AnalyzeRule.getElements 的 putRule）；
+* A6 以单个 `.` 开头、不以 `$` / `@` 开头的 JSON 路径（R155 N：1.1.1 去掉前导点在根上求值；1.1.2 与 Jayway 一致，
+  补成 `$..`，即深度扫描）。
 
 本模块只有纯函数和常量，不联网、不读文件；`cryptography` 只在原生桥里按需导入。
 两段 CryptoJS 脚本由 R143 的提取脚本从 App 源码原样生成，不能手改：
@@ -54,11 +58,16 @@ class AppProfile:
     string_container_mode: str  # A2: "drop" | "gson-text"
     cryptojs_mode: str  # A3: "legacy-global" | "on-demand-builtin"
     interaction_verdict: str  # A4: "invalid" | "needsInteraction"
+    list_put_on_whole_content: bool = False  # A5 (R155 C): list rule `base@put:{…}` runs the put on the whole content
+    json_leading_dot_deep_scan: bool = False  # A6 (R155 N): `.key[*]` is `$..key[*]` (Jayway), not a root-level key
 
 
 APP_PROFILES: dict[str, AppProfile] = {
     "1.1.1": AppProfile("1.1.1", True, "drop", "legacy-global", "invalid"),
-    "1.1.2": AppProfile("1.1.2", False, "gson-text", "on-demand-builtin", "needsInteraction"),
+    "1.1.2": AppProfile(
+        "1.1.2", False, "gson-text", "on-demand-builtin", "needsInteraction",
+        list_put_on_whole_content=True, json_leading_dot_deep_scan=True,
+    ),
 }
 
 _ACTIVE_APP_VERSION: contextvars.ContextVar[str] = contextvars.ContextVar(

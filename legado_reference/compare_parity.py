@@ -9,9 +9,20 @@ Inputs
 Both engines must have been given the same source package. Sources are matched by the normalized
 ``bookSourceUrl`` (``normalize_book_source_url`` from the validator when it can be imported).
 
-Headline number (target >= 95 %)::
+The validator does not report one verdict per source: it groups the package by canonical site + rule
+fingerprint (``group_sources``) and reports one representative per group (possibly a *different* URL than the
+one Legado used for the same source). Pass the prepared package with ``--sources`` (``work/sources.json`` next
+to the Legado report is picked up automatically) and every source inherits the verdict of its group, so each
+prepared source maps to exactly one Readori verdict. A source whose group has no report entry is classed
+``skipped:<reason>`` instead of ``missing``. Without the package the old URL / relaxed-URL matching is used and
+the report says so.
 
-    relativeRate = |Legado pass AND Readori pass| / |Legado pass|
+Headline number (target >= 95 %), vacuous Legado passes excluded (Legado's CheckSource passes a source that has
+neither a search URL nor an explore URL without checking anything)::
+
+    relativeRate = |Legado pass AND Readori pass AND not vacuous| / |Legado pass AND not vacuous|
+
+The vacuous-inclusive rate is kept as ``relativeRateInclVacuous``.
 
 The report also lists the *work list*: sources Legado passes and Readori does not (``legadoOnly``) and the
 reverse (``readoriOnly``). Readori timeouts / network errors / missing entries are classified separately,
@@ -29,7 +40,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCHEMA_VERSION = 1
 DEFAULT_TARGET = 0.95
@@ -37,6 +48,9 @@ DEFAULT_MAX_ROWS = 300
 
 # Readori failure classes that are not rule/engine gaps.
 FLAKY_READORI_CLASSES = ("timeout", "network", "missing")
+SKIPPED_PREFIX = "skipped:"
+SKIP_REASON_LIMIT = "validator-limit"
+SKIP_REASON_NOT_VALIDATED = "not-validated"
 
 _TIMEOUT_PATTERN = re.compile(r"time(?:d)?\s*-?out|超时", re.IGNORECASE)
 
@@ -45,11 +59,11 @@ def _fallback_normalize(url: str) -> str:
     return (url or "").strip()
 
 
-def load_normalizer():
-    """Return the validator's ``normalize_book_source_url`` or a ``strip()`` fallback.
+def _import_validator():
+    """Return ``(module, error)``: the validator module or the reason it could not be imported.
 
     The validator is a large module; importing it is optional and any failure (missing optional
-    dependencies, different working directory) silently falls back to the identical ``strip()`` rule.
+    dependencies, different working directory) is reported to the caller instead of raised.
     """
     root = Path(__file__).resolve().parents[1]
     added = False
@@ -57,17 +71,35 @@ def load_normalizer():
         sys.path.insert(0, str(root))
         added = True
     try:
-        from validator.validate_source_packages import normalize_book_source_url  # type: ignore
+        from validator import validate_source_packages as module  # type: ignore
 
-        return normalize_book_source_url
-    except Exception:  # pragma: no cover - depends on the environment
-        return _fallback_normalize
+        return module, ""
+    except Exception as error:  # pragma: no cover - depends on the environment
+        return None, f"{type(error).__name__}: {error}"
     finally:
         if added:
             try:
                 sys.path.remove(str(root))
             except ValueError:
                 pass
+
+
+def load_normalizer():
+    """Return the validator's ``normalize_book_source_url`` or a ``strip()`` fallback."""
+    module, _ = _import_validator()
+    return getattr(module, "normalize_book_source_url", _fallback_normalize) if module else _fallback_normalize
+
+
+def load_grouper() -> tuple[Callable[[list[dict[str, Any]]], dict[str, list[dict[str, Any]]]] | None, str]:
+    """Return ``(group_sources, "")`` from the validator itself, or ``(None, reason)``.
+
+    The grouping is deliberately not re-implemented: it must stay identical to what the validator ran.
+    """
+    module, error = _import_validator()
+    grouper = getattr(module, "group_sources", None) if module else None
+    if grouper is None:
+        return None, error or "validator has no group_sources"
+    return grouper, ""
 
 
 def relaxed_key(normalized_url: str) -> str:
@@ -178,6 +210,51 @@ def _truncate(text: Any, limit: int) -> str:
     return value if len(value) <= limit else value[: max(0, limit - 1)] + "…"
 
 
+# ----------------------------------------------------------------- grouping
+
+
+class GroupIndex:
+    """Maps every prepared source URL to the validator group it was validated in.
+
+    Built with the validator's own ``group_sources`` so the membership is exactly what the validator saw.
+    """
+
+    def __init__(self, group_of: dict[str, str], members: dict[str, list[str]]) -> None:
+        self.group_of = group_of
+        self.members = members
+
+    def __len__(self) -> int:
+        return len(self.members)
+
+
+def build_group_index(
+    sources: list[dict[str, Any]],
+    normalize,
+    grouper: Callable[[list[dict[str, Any]]], dict[str, list[dict[str, Any]]]],
+) -> GroupIndex:
+    group_of: dict[str, str] = {}
+    members: dict[str, list[str]] = {}
+    for key, items in grouper(sources).items():
+        urls: list[str] = []
+        for item in items:
+            url = normalize(str(item.get("bookSourceUrl") or ""))
+            if url and url not in urls:
+                urls.append(url)
+        group_key = normalize(key)
+        members[group_key] = urls
+        for url in urls:
+            group_of.setdefault(url, group_key)
+    return GroupIndex(group_of, members)
+
+
+def skipped_class(reason: str) -> str:
+    return SKIPPED_PREFIX + reason
+
+
+def is_skipped_class(name: str) -> bool:
+    return name.startswith(SKIPPED_PREFIX)
+
+
 # --------------------------------------------------------------- comparison
 
 
@@ -187,13 +264,31 @@ def compare(
     *,
     normalize=None,
     target: float = DEFAULT_TARGET,
+    group_index: GroupIndex | None = None,
+    grouping_status: str | None = None,
 ) -> dict[str, Any]:
+    """Compare the two reports.
+
+    ``group_index`` (see :func:`build_group_index`) lets every Legado source inherit the verdict of the
+    validator group it belongs to. Without it the matching falls back to URL / relaxed-URL equality.
+    """
     normalize = normalize or load_normalizer()
     legado = _index_results(legado_doc["results"], normalize)
     readori = _index_results(readori_doc["results"], normalize)
     readori_by_relaxed: dict[str, list[str]] = {}
     for key in readori:
         readori_by_relaxed.setdefault(relaxed_key(key), []).append(key)
+    readori_summary = readori_doc.get("summary") if isinstance(readori_doc.get("summary"), dict) else {}
+    reported_groups = readori_summary.get("uniqueSourceUrls")
+    validator_limited = (
+        group_index is not None
+        and isinstance(reported_groups, int)
+        and not isinstance(reported_groups, bool)
+        and reported_groups < len(group_index)
+    )
+    skip_reason = SKIP_REASON_LIMIT if validator_limited else SKIP_REASON_NOT_VALIDATED
+    if grouping_status is None:
+        grouping_status = "grouped" if group_index is not None else "unavailable:no --sources"
 
     matched_readori: set[str] = set()
     relaxed_matches = 0
@@ -207,19 +302,43 @@ def compare(
     legado_failure_classes: dict[str, int] = {}
     readori_failure_classes_of_legado_pass: dict[str, int] = {}
     readori_missing = 0
+    mapping = {"exact": 0, "group": 0, "relaxed": 0, "skipped": 0, "missing": 0}
+    skipped_reasons: dict[str, int] = {}
 
     for key, legado_entry in legado.items():
-        readori_key = key if key in readori else None
-        if readori_key is None:
+        readori_key: str | None = None
+        match_kind = "missing"
+        representative = ""
+        readori_entry: dict[str, Any] | None = None
+        group_key = group_index.group_of.get(key) if group_index is not None else None
+        if key in readori:
+            readori_key, match_kind = key, "exact"
+        elif group_key is not None and group_index is not None:
+            # The validator reports one representative per group; the representative may be a member URL
+            # other than this source's (or other than ``group_key`` when the best candidate changed).
+            group_urls = [group_key] + [url for url in group_index.members.get(group_key, []) if url != group_key]
+            present = [url for url in group_urls if url in readori]
+            if present:
+                passing = [url for url in present if readori[url].get("ok")]
+                readori_key = (passing or present)[0]
+                match_kind = "group"
+                representative = readori_key
+            else:
+                match_kind = "skipped"
+        else:
             candidates = [k for k in readori_by_relaxed.get(relaxed_key(key), []) if k not in matched_readori]
             if len(candidates) == 1:
                 readori_key = candidates[0]
                 relaxed_matches += 1
-        readori_entry = readori.get(readori_key) if readori_key is not None else None
+                match_kind = "relaxed"
         if readori_key is not None:
+            readori_entry = readori.get(readori_key)
             matched_readori.add(readori_key)
-        else:
+        if match_kind == "missing":
             readori_missing += 1
+        elif match_kind == "skipped":
+            skipped_reasons[skip_reason] = skipped_reasons.get(skip_reason, 0) + 1
+        mapping[match_kind] += 1
 
         legado_pass = bool(legado_entry.get("ok"))
         readori_pass = bool(readori_entry and readori_entry.get("ok"))
@@ -236,7 +355,10 @@ def compare(
             if not vacuous:
                 both_non_vacuous += 1
         elif legado_pass and not readori_pass:
-            readori_class = classify_readori_failure(readori_entry)
+            if match_kind == "skipped":
+                readori_class = skipped_class(skip_reason)
+            else:
+                readori_class = classify_readori_failure(readori_entry)
             readori_failure_classes_of_legado_pass[readori_class] = (
                 readori_failure_classes_of_legado_pass.get(readori_class, 0) + 1
             )
@@ -252,7 +374,9 @@ def compare(
                     "legadoCounts": legado_counts(legado_entry),
                     "legadoElapsedMs": legado_entry.get("elapsedMs"),
                     "vacuous": vacuous,
-                    "relaxedMatch": readori_key is not None and readori_key != key,
+                    "relaxedMatch": match_kind == "relaxed",
+                    "readoriMatch": match_kind,
+                    "readoriRepresentative": representative if representative and representative != key else "",
                 }
             )
         elif readori_pass and not legado_pass:
@@ -275,19 +399,26 @@ def compare(
     legado_pass_count = both + len(legado_only)
     readori_pass_count = both + len(readori_only)
     flaky_legado_only = sum(1 for item in legado_only if item["readoriFailureClass"] in FLAKY_READORI_CLASSES)
+    flaky_non_vacuous = sum(
+        1 for item in legado_only if item["readoriFailureClass"] in FLAKY_READORI_CLASSES and not item["vacuous"]
+    )
 
     def ratio(numerator: int, denominator: int) -> float | None:
         return round(numerator / denominator, 6) if denominator else None
 
-    relative = ratio(both, legado_pass_count)
+    # Headline: vacuous Legado passes (nothing was checked) are not evidence of a working source.
+    relative = ratio(both_non_vacuous, legado_pass_non_vacuous)
+    relative_incl_vacuous = ratio(both, legado_pass_count)
     work_order = {"rule": 0, "needsInteraction": 1, "network": 2, "timeout": 3, "missing": 4}
     legado_only.sort(key=lambda item: (work_order.get(item["readoriFailureClass"], 9), item["bookSourceUrl"]))
     readori_only.sort(key=lambda item: (item["legadoFailureClass"], item["bookSourceUrl"]))
 
     rates = {
         "relativeRate": relative,
-        "relativeRateExcludingFlaky": ratio(both, legado_pass_count - flaky_legado_only),
-        "relativeRateNonVacuous": ratio(both_non_vacuous, legado_pass_non_vacuous),
+        "relativeRateInclVacuous": relative_incl_vacuous,
+        "relativeRateExcludingFlaky": ratio(both_non_vacuous, legado_pass_non_vacuous - flaky_non_vacuous),
+        "relativeRateExcludingFlakyInclVacuous": ratio(both, legado_pass_count - flaky_legado_only),
+        "relativeRateNonVacuous": relative,
         "legadoPassRate": ratio(legado_pass_count, total),
         "readoriPassRate": ratio(readori_pass_count, total),
         "target": target,
@@ -298,6 +429,7 @@ def compare(
         "legadoPass": legado_pass_count,
         "readoriPass": readori_pass_count,
         "both": both,
+        "bothNonVacuous": both_non_vacuous,
         "legadoOnly": len(legado_only),
         "readoriOnly": len(readori_only),
         "neither": neither,
@@ -305,8 +437,11 @@ def compare(
         "legadoVacuousPass": legado_vacuous_pass,
         "legadoPassNonVacuous": legado_pass_non_vacuous,
         "readoriMissing": readori_missing,
+        "readoriSkipped": mapping["skipped"],
         "readoriReportOnly": len(set(readori) - matched_readori),
         "relaxedUrlMatches": relaxed_matches,
+        "readoriMapping": mapping,
+        "readoriSkippedReasons": dict(sorted(skipped_reasons.items())),
         "legadoFailureClasses": dict(sorted(legado_failure_classes.items())),
         "readoriFailureClassesOfLegadoPass": dict(sorted(readori_failure_classes_of_legado_pass.items())),
     }
@@ -315,6 +450,10 @@ def compare(
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "counts": counts,
         "rates": rates,
+        "grouping": {
+            "status": grouping_status,
+            "groups": len(group_index) if group_index is not None else None,
+        },
         "legadoOnly": legado_only,
         "readoriOnly": readori_only,
         "inputs": {
@@ -376,10 +515,18 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
     if legado_meta.get("partial"):
         lines.append("> WARNING: the Legado report is PARTIAL (the run did not finish); numbers cover finished sources only.")
         lines.append("")
+    grouping = parity.get("grouping") or {}
+    if not str(grouping.get("status") or "").startswith("grouped"):
+        lines.append(
+            "> WARNING: validator groups were not reconstructed ("
+            + md_cell(grouping.get("status") or "unknown", 80)
+            + "); sources that the validator merged into another group's representative may show as missing."
+        )
+        lines.append("")
     lines.append(
-        f"**Relative rate: {_percent(rates['relativeRate'])}** "
-        f"(target {_percent(rates['target'])}, {verdict} target) = both pass / Legado pass = "
-        f"{counts['both']} / {counts['legadoPass']}"
+        f"**Relative rate (non-vacuous): {_percent(rates['relativeRate'])}** "
+        f"(target {_percent(rates['target'])}, {verdict} target) = both pass / Legado pass, "
+        f"vacuous Legado passes excluded = {counts['bothNonVacuous']} / {counts['legadoPassNonVacuous']}"
     )
     lines.append("")
     lines.append("| Metric | Value |")
@@ -394,10 +541,15 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
         ("Neither", counts["neither"]),
         ("Legado pass rate (absolute)", _percent(rates["legadoPassRate"])),
         ("Readori pass rate (absolute)", _percent(rates["readoriPassRate"])),
-        ("Relative rate", _percent(rates["relativeRate"])),
-        ("Relative rate excluding Readori timeout / network / missing", _percent(rates["relativeRateExcludingFlaky"])),
-        ("Relative rate excluding vacuous Legado passes", _percent(rates["relativeRateNonVacuous"])),
+        ("Relative rate (headline, non-vacuous)", _percent(rates["relativeRate"])),
+        (
+            "Relative rate excluding Readori timeout / network / missing (non-vacuous)",
+            _percent(rates["relativeRateExcludingFlaky"]),
+        ),
+        ("Relative rate including vacuous Legado passes", _percent(rates["relativeRateInclVacuous"])),
         ("Legado vacuous passes (no search / explore ran)", counts["legadoVacuousPass"]),
+        ("Readori verdict via the group representative", counts["readoriMapping"]["group"]),
+        ("Skipped by the validator", counts["readoriSkipped"]),
         ("Missing from Readori report", counts["readoriMissing"]),
     ]
     for label, value in rows:
@@ -499,6 +651,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="directory for parity.json / parity.md")
     parser.add_argument("--json-out", type=Path, default=None, help="override the parity.json path")
     parser.add_argument("--md-out", type=Path, default=None, help="override the parity.md path")
+    parser.add_argument(
+        "--sources",
+        type=Path,
+        default=None,
+        help="the prepared package both engines ran (default: sources.json next to --legado); used to rebuild "
+        "the validator's groups so every source inherits its group's verdict",
+    )
     parser.add_argument("--target", type=float, default=DEFAULT_TARGET, help="relative-rate target (default 0.95)")
     parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS, help="max table rows per list in parity.md")
     parser.add_argument(
@@ -509,6 +668,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def load_group_index(
+    sources_path: Path | None, legado_path: Path, normalize
+) -> tuple[GroupIndex | None, str]:
+    """Rebuild the validator's groups from the prepared package; ``(None, reason)`` when that is not possible."""
+    path = sources_path
+    if path is None:
+        candidate = Path(legado_path).parent / "sources.json"
+        if not candidate.is_file():
+            return None, "unavailable:no --sources and no sources.json next to the Legado report"
+        path = candidate
+    try:
+        from legado_reference.prepare_sources import extract_sources
+    except ImportError:  # run as a plain script: the package root is not on sys.path
+        from prepare_sources import extract_sources  # type: ignore
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as error:
+        return None, f"unavailable:cannot read sources ({type(error).__name__})"
+    sources = extract_sources(data)
+    if not sources:
+        return None, "unavailable:sources file has no book sources"
+    grouper, reason = load_grouper()
+    if grouper is None:
+        return None, f"unavailable:validator import failed ({reason})"
+    return build_group_index(sources, normalize, grouper), "grouped"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -517,7 +703,16 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"[PARITY] ERROR: {error}", file=sys.stderr)
         return 2
-    parity = compare(legado_doc, readori_doc, target=args.target)
+    normalize = load_normalizer()
+    group_index, grouping_status = load_group_index(args.sources, args.legado, normalize)
+    parity = compare(
+        legado_doc,
+        readori_doc,
+        normalize=normalize,
+        target=args.target,
+        group_index=group_index,
+        grouping_status=grouping_status,
+    )
     json_path = args.json_out or (args.output_dir / "parity.json")
     md_path = args.md_out or (args.output_dir / "parity.md")
     json_path.parent.mkdir(parents=True, exist_ok=True)

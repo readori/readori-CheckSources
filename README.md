@@ -97,6 +97,7 @@ GUI 里的“App 版本”下拉框对应这三种模式（1.1.1（当前公开�
   - 规则里的 `{{js}}` 模板：含 `{{…}}` 的规则是「模板」，结果就是字面量与各 `{{…}}` 求值后的整串，不再交给 CSS / XPath / JSONPath 引擎（`RuleType.swift:533-536`、`RuleEvaluator.swift:665-722`）。`{{…}}` 按第一个 `}}` 结束（正则 `\{\{[\w\W]*?\}\}`，`RuleType.swift:413-416`，不是括号配对），内部可含换行、单个 `}`（模板字面量里的 `{"headers": {...} }`）、`java.put(...);"url"` 多语句（取最后一个值）；`{{…}}` 内 JS 的 `result` 是规则输入。`tocUrl` / `bookUrl` / `nextTocUrl` / `nextContentUrl` / `chapterUrl` 求值后的 `url,{method, body, headers}` 选项会带到各自的请求里（`nextTocUrl` / `nextContentUrl` 的后续页此前丢弃选项）。
   - 发现请求：分类 URL 与搜索一样走完整 AnalyzeUrl 模板（`BookSourceEngine+Flagship.swift:149-150`，关键词为空、页码 1），`url,{method, body, headers, charset}` 选项、`{{js}}` / `{{page}}` 都会应用；此前只对未解析的字符串发 GET。
   - 详情错误 JSON：按 App `isLikelyDetailErrorJSON`（`BookSourceEngine.swift:1598-1636`）判定——`data` / `result` / `book` / `novel` / `info` / `item` 任一非空即不是错误；`success: false` 是错误；否则必须「明确失败文案（认证失败 / 未授权 / 未登录 / 请先登录 / token失效 / token过期 / unauthorized / forbidden / not logged in / login required / 参数错误 / 请求失败 / 请求参数错误）」与「不在 0 / 1 / 200 / ok / success 内的错误码」同时出现才算。只有错误码、或只有 `error` / `login` / `token` 之类字样不再判错。JSON 详情响应只要命中就失败（App 在规则执行前抛错），不再要求书名与目录链接同时为空；带内嵌 JSON 的 HTML 页面不算 JSON 响应。已删除无人调用的 `is_likely_detail_login_page` 与 `CONNECT_TIMEOUT`。
+- R155 对齐（Legado 实时对照里「Legado 通过、验证器失败」的规则类差距；括号内为 Legado / App 依据）：搜索落地页守卫只在响应地址不同于请求地址时才生效（`BookSourceEngine.swift:246-262`）；`nextTocUrl` 首页返回多条时按批次一次抓取、子页不再求值，只有一条时顺序追链且每页只取第一条（`BookChapterList.kt:77-104`）；`@get:{key}` 在 `@js:` / `<js>` 段、JS 产出的章节 / 正文地址里也展开（`AnalyzeRule.makeUpRule`）；裸选择器末尾 `!N[:M]` 走 `ElementsSingle` 排除语义；`java.getElements` / `getElement` 接受 Legado 规则（`tag.` / `id.` / `class.` / `text.` / `children` / `@@` / `.N`），`:lt(n)` / `:gt(n)` / `:eq(n)` 与 `[attr=原样值]` 按 Jsoup 解析；有 tocUrl 规则时目录地址不再过分类 / 单章启发式（`BookSourceEngine.swift:9120-9150`）；详情页里 name / kind / tocUrl 之外的字段（含 `@put`）也会求值；`let headers` / `let variables` 在书源脚本里合法；`##` 里的 `.` 不匹配 `\r \u0085 \u2028 \u2029`（Java / ICU）；`outerHtml` 属性一律双引号并转义 `&quot;` / `&amp;`；JS 段里的 `src` 是规则内容而不是上一段结果。仅 App 档案 1.1.2 生效：列表规则尾部 `@put:{…}` 先对整份内容执行再按基础规则取列表；单个前导 `.` 的 JSON 路径按 `$..` 深度扫描（1.1.1 保持原行为）。
 
 ## 生成独立 EXE
 
@@ -220,7 +221,7 @@ python -m server.source_validator_server --host 0.0.0.0 --port 8787
 目标：量化「相对 Legado 的书源可用率」。对同一份书源包，在同一时段联网运行 **真正的 Legado 引擎** 与本目录的 Python 验证器（App 语义，`--app-version 1.1.1`），输出对照报告：
 
 ```text
-relativeRate = |Legado 通过 且 Readori 通过| / |Legado 通过|        （目标 >= 95%）
+relativeRate = |Legado 通过（非空转）且 Readori 通过| / |Legado 通过（非空转）|        （目标 >= 95%）
 ```
 
 目录 `legado_reference/`（随本目录一并镜像到 `readori-CheckSources`）：
@@ -231,7 +232,7 @@ relativeRate = |Legado 通过 且 Readori 通过| / |Legado 通过|        （�
 | `legado-live.init.gradle` | Gradle init 脚本：把 Robolectric 和上面的 Kotlin 目录加进 Legado `:app` 的单元测试源集，传系统属性，测试 JVM 堆 4g，关闭测试缓存，输出 stdout；**不修改 Legado 检出目录** |
 | `run_legado_live_reference.py` | 包装脚本（Linux / Windows）：只在 `local.properties` 不存在时用 `ANDROID_HOME` / `ANDROID_SDK_ROOT` 写 `sdk.dir`（已存在则不读不改），运行 `gradlew --no-daemon -I legado-live.init.gradle :app:testAppReleaseUnitTest --tests io.legado.app.readori.LegadoLiveSourceCheckTest`，校验报告 JSON；`--dry-run` 只打印命令 |
 | `prepare_sources.py` | 规范化书源包（数组 / `sources`、`bookSources`、`list`、`data` 包装 / 单对象；去 BOM；按 `bookSourceUrl` 去重；`--offset` / `--limit` 只在这里切一次），保证两个引擎看到完全相同的书源 |
-| `compare_parity.py` | 读 Legado 报告和验证器报告，输出 `parity.json` / `parity.md` |
+| `compare_parity.py` | 读 Legado 报告和验证器报告，输出 `parity.json` / `parity.md`；`--sources`（缺省取 Legado 报告同目录的 `sources.json`）用验证器自己的 `group_sources` 还原分组，每个书源继承所在组代表的 Readori 结论 |
 | `samples/smoke.json` | 8 个书源的冒烟样本（取自 2026-10-18 重验的通过集合，不含需登录 / 成人站点） |
 
 ### 本机运行（需要 Android SDK + JDK 17）
@@ -254,7 +255,8 @@ python legado_reference/compare_parity.py --legado work/legado_report.json \
 
 ### 如何读 `parity.md`
 
-- 顶部 **Relative rate**：目标 >= 95%。`Relative rate excluding Readori timeout / network / missing` 排除站点抖动后的值；`excluding vacuous Legado passes` 排除「Legado 什么都没检查就算通过」的情况（没有搜索地址且没有发现地址时，Legado 的 `doCheckSource` 不会失败）。
+- 顶部 **Relative rate (non-vacuous)** 是头条数字，目标 >= 95%，分子分母都不含「空转通过」：没有搜索地址且没有发现地址时，Legado 的 `doCheckSource` 什么都不检查就算通过，这类源不能当作 Legado 可用的证据。含空转的旧口径保留在表格 `Relative rate including vacuous Legado passes` 一行（`parity.json` 的 `relativeRateInclVacuous`）；`Relative rate excluding Readori timeout / network / missing` 是在头条口径上再排除站点抖动。
+- 分组映射：验证器按「规范站点 + 规则指纹」去重，每组只报告一个代表（可能是和 Legado 所用不同的 URL 写法，例如 `#🎃` / `#♤yc` / 末尾 `/` / `http` 与 `https` 的差别）。`--sources` 给出准备好的书源包后，每个书源都映射到恰好一个 Readori 结论（`counts.readoriMapping`：`exact` / `group` / `relaxed` / `skipped` / `missing`）；验证器没有出报告项的组记为 `skipped:<原因>`（`validator-limit` = 验证器带了 `--limit`，`not-validated` = 报告里没有该组），不再计入 `missing`，也不算站点抖动。没有书源包时退回 URL / 宽松 URL 匹配，`parity.md` 顶部会有 WARNING。
 - **Legado pass, Readori fail** 是工作清单：`rule` / `needsInteraction` 是引擎差距，优先处理；`network` / `timeout` / `missing` 多半是站点抖动，先重跑确认。`Legado stages` 形如 `S:ok E:- I:ok T:ok C:ok`（搜索 / 发现 / 详情 / 目录 / 正文；`-` = 未运行，`x` = 失败）。
 - **Readori pass, Legado fail**：Legado 一侧的 `failureGroup`（`js失效` / `网站失效` / `校验超时`）和 `harnessSuspect`（`webview`、`android-resource`、`jvm-linkage`、`robolectric`）说明失败是书源本身还是 JVM 测试环境限制；声明了 WebView 的源在 Robolectric 里无法真正加载页面，会按超时算 Legado 失败。
 - 报告里的书源名 / 错误文本来自不可信数据，已转义和截断，仅供阅读。
