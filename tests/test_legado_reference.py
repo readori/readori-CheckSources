@@ -156,7 +156,7 @@ def test_r156_tls_and_disabled_are_own_classes_excluded_from_the_headline() -> N
     counts, rates = parity["counts"], parity["rates"]
     assert counts["legadoOnly"] == 5
     assert counts["legadoOnlyExcluded"] == 4
-    assert counts["legadoOnlyExcludedClasses"] == {"legadoInsecureTls": 2, "disabled": 2}
+    assert counts["legadoOnlyExcludedClasses"] == {"legadoInsecureTls": 2, "disabled": 2, "unsupportedSourceType": 0}
     # 1 of the 4 non-vacuous Legado passes outside the excluded classes (ok, gap) -> 1/2.
     assert counts["legadoPassNonVacuous"] == 5
     assert counts["legadoPassHeadlineDenominator"] == 2
@@ -170,6 +170,57 @@ def test_r156_tls_and_disabled_are_own_classes_excluded_from_the_headline() -> N
     assert "| disabled | 2 |" in markdown
     assert "Excluded: Readori TLS certificate failure" in markdown
     assert "Excluded: source disabled" in markdown
+
+
+def test_r157_unsupported_source_types_are_own_class_excluded_from_the_headline() -> None:
+    """R157 (user decision): `file`-type sources ("download-only source") and empty content rules ("content rule empty") are not
+    supported for now: own rows and metric, left out of the headline numerator and denominator like legadoInsecureTls."""
+    legado = {
+        "engine": "legado-live",
+        "results": [
+            legado_entry("http://ok.test", True),
+            legado_entry("http://gap.test", True),
+            legado_entry("http://kgbook.test", True),
+            legado_entry("http://lanzou.test", True),
+            legado_entry("http://typed.test", True),
+            legado_entry("http://tls.test", True),
+        ],
+    }
+    readori = {
+        "summary": {"appVersion": "1.1.2"},
+        "results": [
+            readori_entry("http://ok.test", True),
+            readori_entry("http://gap.test", False),
+            readori_entry("http://kgbook.test", False, failureReason="content rule empty", appVerdict="invalid"),
+            readori_entry("http://lanzou.test", False, failureReason="download-only source"),
+            readori_entry("http://typed.test", False, failureReason="detail failed", bookSourceType=3),
+            readori_entry("http://tls.test", False, failureReason="network error: tls"),
+        ],
+    }
+    parity = cp.compare(legado, readori, normalize=lambda url: (url or "").strip())
+    classes = {item["bookSourceUrl"]: item["readoriFailureClass"] for item in parity["legadoOnly"]}
+    assert classes == {
+        "http://gap.test": "rule",
+        "http://kgbook.test": "unsupportedSourceType",
+        "http://lanzou.test": "unsupportedSourceType",
+        "http://typed.test": "unsupportedSourceType",
+        "http://tls.test": "legadoInsecureTls",
+    }
+    assert "unsupportedSourceType" in cp.EXCLUDED_READORI_CLASSES
+    counts, rates = parity["counts"], parity["rates"]
+    assert counts["legadoOnlyExcluded"] == 4
+    assert counts["legadoOnlyExcludedClasses"] == {"legadoInsecureTls": 1, "disabled": 0, "unsupportedSourceType": 3}
+    assert counts["legadoPassHeadlineDenominator"] == 2
+    assert rates["relativeRate"] == 0.5
+    assert rates["relativeRateInclExcludedClasses"] == round(1 / 6, 6)
+    assert parity["legadoOnly"][0]["readoriFailureClass"] == "rule"
+    markdown = cp.render_markdown(parity)
+    assert "| unsupportedSourceType | 3 |" in markdown
+    assert "Excluded: unsupported source type" in markdown
+    # a failing entry with another reason and no source type stays an engine gap; a pass is never reclassified
+    assert cp.classify_readori_failure({"ok": False, "failureReason": "content failed"}) == "rule"
+    assert cp.classify_readori_failure({"ok": True, "failureReason": "content rule empty"}) == "pass"
+    assert cp.classify_readori_failure({"ok": False, "failureReason": " Content Rule Empty "}) == "unsupportedSourceType"
 
 
 def test_r156_other_network_errors_stay_network_class() -> None:

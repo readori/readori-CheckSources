@@ -193,6 +193,23 @@ DEFAULT_BROWSER_HEADERS = {
 QUICKJS_TIME_LIMIT_SECONDS = 2
 QUICKJS_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024
 NODE_DYNAMIC_REQUEST_REPLAY_LIMIT = 4
+def _response_needs_raw_bytes(content_type: str, raw: bytes) -> bool:
+    """Only a non-text Content-Type or a payload that is not valid UTF-8 needs its raw bytes next to the decoded text (an
+    AES-encrypted body read back through `bodyAsBytes`); ordinary UTF-8 text responses never carry `bodyBase64`."""
+    kind = content_type.split(";", 1)[0].strip().lower()
+    textual = kind.startswith("text/") or kind in {
+        "", "application/json", "application/xml", "application/xhtml+xml", "application/javascript", "application/x-javascript",
+    } or kind.endswith(("+json", "+xml"))
+    if not textual:
+        return True
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+RESPONSE_RAW_BYTES_LIMIT = 512 * 1024  # R157: raw response bytes kept per Node replay fixture (`bodyBase64`)
 NODE_DYNAMIC_REQUESTS_PER_REPLAY = 8
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
@@ -2236,6 +2253,10 @@ def substitute_css_placeholders(rule: str, content: str, runtime: RuleRuntime, c
     return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", replace, rule)
 
 
+def _has_double_brace_json_placeholder(text: str) -> bool:
+    return re.search(r"\{\{\s*\$(?:\.|\[)[^}]*\}\}", text or "") is not None
+
+
 def contains_json_placeholder(text: str) -> bool:
     return re.search(r"\{\{?\s*\$(?:\.|\[)", text or "") is not None
 
@@ -2317,6 +2338,14 @@ def _is_json_or_xml_request_body(body: str) -> bool:
     except Exception:
         pass
     return text.startswith("<") and text.endswith(">")
+
+
+def _request_body_looks_structured(body: Any) -> bool:
+    """App NetworkManager.swift `bodyLooksStructured`: trimmed body wrapped in `{}` / `[]` / `<>`."""
+    text = str(body or "").strip()
+    return (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")) or (
+        text.startswith("<") and text.endswith(">")
+    )
 
 
 def _is_already_legado_form_encoded(value: str) -> bool:
@@ -2685,7 +2714,8 @@ function __readoriLatin1Atob(input) {
 }
 function __readoriToByteArray(value) {
     if (!value) return [];
-    if (typeof value.toArray === 'function') value = value.toArray();
+    // (a string has `toArray` too - the App's String.prototype shim - but it is text to encode, not a Java list)
+    if (typeof value !== 'string' && typeof value.toArray === 'function') value = value.toArray();
     if (typeof value === 'string') {
         if (typeof Buffer !== 'undefined') return Array.from(Buffer.from(value, 'utf8'));
         var stringOut = [];
@@ -3410,12 +3440,20 @@ function __readoriCacheClear() {
         }
     }
 }
+function __readoriHide(obj, name, value) {
+    // R157 (js baidu, 1.1.2): Rhino's NativeJavaList enumerates only the indices (`for (i in list)`), so the helpers are not
+    // enumerable; 1.1.1 keeps them as plain (enumerable) properties.
+    if (typeof __readoriListNonEnumerable !== 'undefined' && __readoriListNonEnumerable) {
+        try { Object.defineProperty(obj, name, { value: value, writable: true, configurable: true, enumerable: false }); return; } catch (error) {}
+    }
+    obj[name] = value;
+}
 function __readoriListArray(values) {
     var arr = Array.isArray(values) ? values : [];
-    if (typeof arr.toArray !== 'function') arr.toArray = function() { return this; };
-    if (typeof arr.size !== 'function') arr.size = function() { return this.length; };
-    if (typeof arr.get !== 'function') arr.get = function(index) { return this[Number(index || 0)]; };
-    if (typeof arr.isEmpty !== 'function') arr.isEmpty = function() { return this.length === 0; };
+    if (typeof arr.toArray !== 'function') __readoriHide(arr, 'toArray', function() { return this; });
+    if (typeof arr.size !== 'function') __readoriHide(arr, 'size', function() { return this.length; });
+    if (typeof arr.get !== 'function') __readoriHide(arr, 'get', function(index) { return this[Number(index || 0)]; });
+    if (typeof arr.isEmpty !== 'function') __readoriHide(arr, 'isEmpty', function() { return this.length === 0; });
     return arr;
 }
 var __readoriT2SMap = {
@@ -4108,8 +4146,11 @@ function __readoriHeaderLookup(values, key) {
     }
     return '';
 }
-function __readoriResponseObject(body, finalUrl, status, responseHeaders, responseCookies) {
+function __readoriResponseObject(body, finalUrl, status, responseHeaders, responseCookies, bodyBase64) {
     var text = body === undefined || body === null ? '' : String(body);
+    // R157 (js baidu): `bodyBase64` carries the raw payload of a binary response (an AES-encrypted body decoded as text is
+    // corrupted); Jsoup Response.bodyAsBytes() / getByteArrayString are the bytes, not the text re-encoded.
+    var rawBase64 = bodyBase64 === undefined || bodyBase64 === null ? '' : String(bodyBase64);
     var url = finalUrl === undefined || finalUrl === null ? '' : String(finalUrl);
     var codeValue = Number(status || (text ? 200 : 0));
     var headerMap = __readoriNormalizeHeaderMap(responseHeaders || {});
@@ -4117,8 +4158,14 @@ function __readoriResponseObject(body, finalUrl, status, responseHeaders, respon
     var out = {
         body: function() { return text; },
         getStrResponse: function() { return text; },
-        bodyAsBytes: function() { return __readoriSignedBytes(__readoriToByteArray(text)); },
-        getByteArrayString: function() { return Base64.getEncoder().encodeToString(__readoriToByteArray(text)); },
+        bodyAsBytes: function() {
+            if (rawBase64) { try { return Base64.decode(rawBase64, 0); } catch (error) {} }
+            return __readoriSignedBytes(__readoriToByteArray(text));
+        },
+        getByteArrayString: function() {
+            if (rawBase64) return rawBase64;
+            return Base64.getEncoder().encodeToString(__readoriToByteArray(text));
+        },
         code: function() { return codeValue; },
         statusCode: function() { return codeValue; },
         statusMessage: function() {
@@ -4170,7 +4217,8 @@ function __readoriLookupResponseFixture(url) {
         url: fixture.url || resolved || target,
         status: Number(fixture.status || 200),
         headers: fixture.headers || {},
-        cookies: fixture.cookies || {}
+        cookies: fixture.cookies || {},
+        bodyBase64: fixture.bodyBase64 === undefined || fixture.bodyBase64 === null ? '' : String(fixture.bodyBase64)
     };
 }
 function __readoriFetchResponse(url, method, body, requestHeaders, followRedirects) {
@@ -4194,7 +4242,7 @@ function __readoriFetchResponse(url, method, body, requestHeaders, followRedirec
         });
     }
     var fixture = __readoriLookupResponseFixture(url) || __readoriLookupResponseFixture(target);
-    if (fixture) return __readoriResponseObject(fixture.body, fixture.url, fixture.status, fixture.headers, fixture.cookies);
+    if (fixture) return __readoriResponseObject(fixture.body, fixture.url, fixture.status, fixture.headers, fixture.cookies, fixture.bodyBase64);
     try {
         if (typeof __readoriHttpResponse === 'function') {
             var document = JSON.parse(__readoriHttpResponse(
@@ -4280,6 +4328,9 @@ var java = {
         return (variables && variables[key]) || '';
     },
     put: function(key, value) {
+        // R157 (searchExplore G4): AnalyzeRule.put(key: String, value: String) - Rhino converts the argument with ToString, so a
+        // list / array value is stored as the text `a,b` (an array object was kept and later turned into a Python list repr).
+        if (value !== null && value !== undefined && typeof value !== 'string') value = String(value);
         if (typeof chapter !== 'undefined' && chapter && chapter.__active
             && typeof chapter.putVariable === 'function') {
             return chapter.putVariable(key, value);
@@ -4492,6 +4543,22 @@ var java = {
     },
     getElements: function(selector, html) {
         var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
+        // R157 (js baidu, 1.1.2): in JSON mode Legado AnalyzeRule.getElements (AnalyzeByJSonPath.getList) returns the matched
+        // objects, not their JSON text, so `list[i].title` works.
+        // Mode as in SourceRule.init: `$.` / `$[` / `@json:` is JSON; so is any bare rule on JSON content; an explicit `@CSS:`, `@@`,
+        // `@XPath:` or `/`-prefixed rule never is.
+        var __ruleText = String(selector || '');
+        var __explicitNonJson = /^\s*(@css:|@@|@xpath:|\/)/i.test(__ruleText);
+        var __jsonMode = /^\s*(\$[.\[]|@json:)/i.test(__ruleText) || (!__explicitNonJson && /^\s*[\[{]/.test(sourceHtml));
+        if (typeof __readoriGetElementsJsonObjects !== 'undefined' && __readoriGetElementsJsonObjects
+            && __jsonMode && typeof __readoriEvaluateList === 'function') {
+            var jsonRows = [];
+            try { jsonRows = JSON.parse(__readoriEvaluateList(String(selector || ''), sourceHtml) || '[]') || []; } catch (error) { jsonRows = []; }
+            return __readoriListArray(jsonRows.map(function(value) {
+                if (typeof value === 'string' && /^\s*[\[{]/.test(value)) { try { return JSON.parse(value); } catch (error) {} }
+                return value;
+            }));
+        }
         var rows = _readoriJsoupRowsByLegadoRule(sourceHtml, String(selector || ''));
         if (rows === null) rows = _readoriJsoupRowsForRule(sourceHtml, String(selector || ''));
         return _readoriJsoupElements(rows, null);
@@ -4507,8 +4574,16 @@ var java = {
     getString: function(ruleStr, html) {
         try {
             if (typeof __readoriEvaluateString === 'function') {
-                var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
-                return __readoriEvaluateString(String(ruleStr || ''), sourceHtml) || '';
+                // R157 (searchExplore G2): `java.getString(rule, true|false)` is AnalyzeRule.getString(ruleStr, unescape: Boolean)
+                // (AnalyzeRule.kt:256); the boolean is NOT the content (it used to be stringified into "true" and evaluated as the page).
+                // 1.1.1 App (`get_string_unescape_flag` off): the boolean is not the content but is ignored, it always unescapes.
+                var unescapeFlag = true, hasContent = arguments.length > 1;
+                if (typeof html === 'boolean') {
+                    if (typeof __readoriGetStringUnescapeFlag !== 'undefined' && __readoriGetStringUnescapeFlag) unescapeFlag = html;
+                    hasContent = false;
+                }
+                var sourceHtml = hasContent ? String(html || '') : String(__readoriCurrentContent() || '');
+                return __readoriEvaluateString(String(ruleStr || ''), sourceHtml, unescapeFlag) || '';
             }
         } catch (error) {}
         return '';
@@ -4612,7 +4687,8 @@ var java = {
         var value = (typeof __readoriCrypto !== 'undefined' && __readoriCrypto.randomUUID)
             ? __readoriCrypto.randomUUID()
             : '00000000-0000-4000-8000-000000000000';
-        return { toString: function(){ return value; }, valueOf: function(){ return value; } };
+        // R157 (searchExplore G4): JsExtensions.randomUUID() returns a Java String, so `.replace(...)` / `.length` work on it.
+        return value;
     },
     androidId: function() { return '0000000000000000'; },
     deviceID: function() { return '0000000000000000'; },
@@ -5398,13 +5474,24 @@ function __readoriJsoupConnection(url) {
             };
         },
         execute: function() {
-            return __readoriFetchResponse(
+            var response = __readoriFetchResponse(
                 state.url,
                 state.method,
                 state.body,
                 state.headers,
                 state.followRedirects
             );
+            // R157 (js baidu): Jsoup Response.bodyAsBytes() is the raw payload (binary / encrypted bodies), not the decoded text
+            // re-encoded. A recorded fixture already carries its bytes (bodyBase64); otherwise a plain GET is re-read as bytes.
+            if (state.method === 'GET' && !state.body && typeof __readoriAjaxBytesBase64 === 'function'
+                && !(typeof __readoriLookupResponseFixture === 'function' && __readoriLookupResponseFixture(state.url))) {
+                var rawTarget = state.url;
+                response.bodyAsBytes = function() {
+                    try { return Base64.decode(__readoriAjaxBytesBase64(rawTarget), 0); } catch (error) {}
+                    return __readoriSignedBytes(__readoriToByteArray(response.body()));
+                };
+            }
+            return response;
         },
         get: function(){ state.method = 'GET'; return this.execute().body(); },
         post: function(){ state.method = 'POST'; return this.execute().body(); }
@@ -5914,10 +6001,37 @@ function _readoriRemoveHtmlFromParent(parent, htmls) {
         }
     }
 }
+function _readoriJsoupRootHtml(node) {
+    var root = node;
+    while (root && root._parent) root = root._parent;
+    if (!root) return '';
+    return String(root._sourceHtml || (typeof root.toString === 'function' ? root.toString() : '') || '');
+}
+function _readoriJsoupParents(element) {
+    // Jsoup Element.parents(): the ancestors, nearest first. The shim has no DOM tree, so the ancestors are the elements of the
+    // root markup whose outer HTML strictly contains this element's outer HTML (smallest = nearest).
+    var own = String(element.toString() || '');
+    var rootHtml = _readoriJsoupRootHtml(element);
+    var rows = own && rootHtml ? _readoriJsoupRows(rootHtml, '*') : [];
+    rows = rows.filter(function(row) {
+        var outer = String(row.outerHtml || '');
+        return outer.length > own.length && outer.indexOf(own) >= 0;
+    });
+    rows.sort(function(a, b) { return String(a.outerHtml || '').length - String(b.outerHtml || '').length; });
+    return _readoriJsoupElements(rows, null);
+}
+function _readoriJsoupHasClass(row, name) {
+    var wanted = String(name || '').trim().toLowerCase();
+    if (!wanted) return false;
+    return String(row['class'] || '').toLowerCase().split(/\s+/).indexOf(wanted) >= 0;
+}
+function _readoriJsoupExtrasEnabled() {
+    return typeof __readoriJsoupExtras !== 'undefined' && !!__readoriJsoupExtras;
+}
 function _readoriJsoupElement(row, parent) {
     row = row || {};
     var elementHtml = row.outerHtml || row.html || row.text || '';
-    return {
+    var element = {
         _html: elementHtml,
         _innerHtml: row.html || '',
         _parent: parent || null,
@@ -5945,43 +6059,76 @@ function _readoriJsoupElement(row, parent) {
         },
         toString: function(){ return this._html || row.outerHtml || row.html || row.text || ''; }
     };
+    if (_readoriJsoupExtrasEnabled()) {
+        // R157 (js G1, 1.1.2): Rhino exposes the full Java Element API.
+        element.hasClass = function(name) { return _readoriJsoupHasClass(row, name); };
+        element.parents = function() { return _readoriJsoupParents(this); };
+    }
+    return element;
 }
 function _readoriJsoupElements(rows, parent) {
     rows = rows || [];
     var out = rows.map(function(row){ return _readoriJsoupElement(row, parent); });
-    out._sourceHtml = out.map(function(e){ return e.toString(); }).join('');
-    out._parent = parent || null;
-    out.toArray = function(){ return this; };
-    out.isEmpty = function(){ return this.length === 0; };
-    out.size = function(){ return this.length; };
-    out.get = function(index){ return this[Number(index) || 0]; };
-    out.eq = function(index){
+    var rawRows = rows;
+    __readoriHide(out, '_sourceHtml', out.map(function(e){ return e.toString(); }).join(''));
+    __readoriHide(out, '_parent', parent || null);
+    __readoriHide(out, 'toArray', function(){ return this; });
+    __readoriHide(out, 'isEmpty', function(){ return this.length === 0; });
+    __readoriHide(out, 'size', function(){ return this.length; });
+    __readoriHide(out, 'get', function(index){ return this[Number(index) || 0]; });
+    __readoriHide(out, 'eq', function(index){
         var item = this.get(index);
         return item ? _readoriJsoupElements([item], this) : _readoriJsoupElements([], this);
-    };
-    out.text = function(){ return this.map(function(e){ return e.text(); }).join(' '); };
-    out.eachText = function(){
+    });
+    __readoriHide(out, 'text', function(){ return this.map(function(e){ return e.text(); }).join(' '); });
+    __readoriHide(out, 'eachText', function(){
         var arr = this.map(function(e){ return e.text(); });
-        arr.toArray = function(){ return this; };
+        __readoriHide(arr, 'toArray', function(){ return this; });
         return arr;
-    };
-    out.attr = function(name){ return this.length ? this[0].attr(name) : ''; };
-    out.html = function(){ return this.map(function(e){ return e.html(); }).join(''); };
-    out.outerHtml = function(){ return this.toString(); };
-    out.select = function(selector) {
+    });
+    __readoriHide(out, 'attr', function(name){ return this.length ? this[0].attr(name) : ''; });
+    __readoriHide(out, 'html', function(){ return this.map(function(e){ return e.html(); }).join(''); });
+    __readoriHide(out, 'outerHtml', function(){ return this.toString(); });
+    __readoriHide(out, 'select', function(selector) {
         return _readoriJsoupElements(_readoriJsoupRows(this.toString(), selector), this);
-    };
-    out.remove = function(){
+    });
+    __readoriHide(out, 'remove', function(){
         var htmls = this.map(function(e){ return e.toString(); }).filter(function(s){ return !!s; });
         _readoriRemoveHtmlFromParent(this._parent, htmls);
         this._sourceHtml = '';
         this.length = 0;
         return this;
-    };
-    out.toString = function(){
+    });
+    __readoriHide(out, 'toString', function(){
         if (typeof this._sourceHtml === 'string' && this._sourceHtml.length > 0) return this._sourceHtml;
         return Array.prototype.map.call(this, function(e){ return e.toString(); }).join('');
-    };
+    });
+    if (_readoriJsoupExtrasEnabled()) {
+        // R157 (js G1, 1.1.2): Elements.first() / last() (null when empty), hasClass (any element), parents() (union of the
+        // ancestors, nearest first) and java.util.List.contains (an element equals another with the same outer HTML).
+        __readoriHide(out, 'first', function(){ return this.length ? this[0] : null; });
+        __readoriHide(out, 'last', function(){ return this.length ? this[this.length - 1] : null; });
+        __readoriHide(out, 'hasClass', function(name){
+            for (var i = 0; i < rawRows.length; i++) { if (_readoriJsoupHasClass(rawRows[i], name)) return true; }
+            return false;
+        });
+        __readoriHide(out, 'parents', function(){
+            var seen = {}, rows = [];
+            for (var i = 0; i < this.length; i++) {
+                var ancestors = this[i].parents ? this[i].parents() : [];
+                for (var j = 0; j < ancestors.length; j++) {
+                    var key = String(ancestors[j].toString());
+                    if (!seen[key]) { seen[key] = true; rows.push({ outerHtml: key }); }
+                }
+            }
+            return _readoriJsoupElements(rows, null);
+        });
+        __readoriHide(out, 'contains', function(target){
+            var wanted = target === null || target === undefined ? '' : String(target.toString());
+            for (var i = 0; i < this.length; i++) { if (String(this[i].toString()) === wanted) return true; }
+            return false;
+        });
+    }
     return out;
 }
 function _readoriJsoupDocument(html) {
@@ -6006,11 +6153,134 @@ function _readoriJsoupDocument(html) {
 org.jsoup.Jsoup.parse = function(html) {
     return _readoriJsoupDocument(html);
 };
+// R157 REV: `org.jsoup.Jsoup.connect` exists in the App since before 1.1.1, so it is on both profiles.
+org.jsoup.Jsoup.connect = __readoriJsoupConnection;
+if (_readoriJsoupExtrasEnabled()) {
+    // R157 (js G1, 1.1.2): Rhino resolves `org.jsoup.*` and `Packages.org.jsoup.*` to the same Java package tree.
+    org.jsoup.Connection = Packages.org.jsoup.Connection;
+    org.jsoup.nodes = org.jsoup.nodes || { Document: function Document() {}, Element: function Element() {}, Elements: function Elements() {} };
+    Packages.org.jsoup.nodes = org.jsoup.nodes;
+    Packages.org.jsoup.Jsoup.parse = org.jsoup.Jsoup.parse;
+}
+// R157 REV (1.1.2 list rules): the `result` a JS segment after the first segment of a list rule receives - an array of the current
+// items with the helpers the App gives it (toString / first / last / text / attr / select; text() joins the items' text).
+function __readoriListResult(items, raws, jsonMode) {
+    // JSON mode (E1 final; the page content is JSON, so an empty list prints `[]`): the list's toString is `[` + the items' JSON joined by `,` + `]` and every parsed object's toString is its
+    // raw JSON; HTML mode: the outerHTML items joined by a newline, plus the Elements methods below.
+    var arr = __readoriListArray(Array.isArray(items) ? items.slice() : []);
+    function asText(item) { return typeof item === 'string' ? item : (item !== null && item !== undefined && typeof item.toString === 'function' && item.toString !== Object.prototype.toString ? String(item) : JSON.stringify(item)); }
+    {
+        for (var i = 0; i < arr.length; i++) {
+            if (arr[i] !== null && typeof arr[i] === 'object' && Array.isArray(raws) && typeof raws[i] === 'string') {
+                (function(raw) { try { Object.defineProperty(arr[i], 'toString', { value: function() { return raw; }, writable: true, configurable: true, enumerable: false }); } catch (error) {} })(raws[i]);
+            }
+        }
+    }
+    function elementTexts(list) {
+        return list.map(function(item) { return typeof item === 'string' ? org.jsoup.Jsoup.parse(item).text() : JSON.stringify(item); });
+    }
+    __readoriHide(arr, 'first', function() { return this.length ? this[0] : null; });
+    __readoriHide(arr, 'last', function() { return this.length ? this[this.length - 1] : null; });
+    __readoriHide(arr, 'toString', function() {
+        if (jsonMode) return '[' + this.map(asText).join(',') + ']';
+        return this.map(asText).join('\n');
+    });
+    __readoriHide(arr, 'text', function() { return elementTexts(this).join(' '); });
+    __readoriHide(arr, 'eachText', function() { return __readoriListArray(elementTexts(this)); });
+    __readoriHide(arr, 'html', function() {
+        return this.map(function(item) {
+            var rows = typeof item === 'string' ? _readoriJsoupRows(item, '*') : [];
+            return rows.length ? String(rows[0].html || '') : asText(item);
+        }).join('\n');
+    });
+    __readoriHide(arr, 'outerHtml', function() { return this.map(asText).join('\n'); });
+    __readoriHide(arr, 'eq', function(index) {
+        var n = Number(index);
+        return __readoriListResult(n >= 0 && n < this.length ? [this[n]] : [], null, false);
+    });
+    __readoriHide(arr, 'attr', function(name) {
+        for (var i = 0; i < this.length; i++) {
+            var value = typeof this[i] === 'string' ? String(this[i]).attr(name) : '';
+            if (value) return value;
+        }
+        return '';
+    });
+    __readoriHide(arr, 'hasClass', function(name) {
+        var wanted = String(name || '').trim().toLowerCase();
+        for (var i = 0; i < this.length; i++) {
+            var rows = typeof this[i] === 'string' ? _readoriJsoupRows(this[i], '*') : [];
+            if (rows.length && _readoriJsoupHasClass(rows[0], wanted)) return true;
+        }
+        return false;
+    });
+    // Elements.remove() detaches the nodes from their parent; the list itself is unchanged.
+    __readoriHide(arr, 'remove', function() { return this; });
+    __readoriHide(arr, 'select', function(selector) { return org.jsoup.Jsoup.parse(this.map(asText).join('')).select(selector); });
+    return arr;
+}
+// What a list-rule JS tail returned (E1 final): undefined / null / "" is an empty list, undefined / null array elements are skipped,
+// objects keep their JSON text; anything else is one item. The sentinel tells the validator "empty list".
+function __readoriListTailFinish(out) {
+    var EMPTY = '__readoriEmptyList__';
+    if (out === undefined || out === null) return EMPTY;
+    if (Array.isArray(out)) {
+        var kept = [];
+        for (var i = 0; i < out.length; i++) {
+            var value = out[i];
+            if (value === undefined || value === null) continue;
+            if (typeof value === 'string') kept.push(value);
+            else if (typeof value === 'object' && !Array.isArray(value) && typeof value.toString === 'function' && value.toString !== Object.prototype.toString) kept.push(String(value));
+            else if (typeof value === 'object') kept.push(JSON.stringify(value));
+            else kept.push(String(value));
+        }
+        return kept.length ? JSON.stringify(kept) : EMPTY;
+    }
+    var text = String(out);
+    return text === '' ? EMPTY : text;
+}
+function __readoriListTailRun(code) {
+    try { return (0, eval)(code); }
+    catch (error) {
+        if (error instanceof SyntaxError) return (new Function(code))();
+        throw error;
+    }
+}
+// R157 (js tadu isVip `result.select('i').hasClass('vip')`): in Legado `result` of a list-item rule is a Jsoup Element; the App
+// (JSEngine.swift `String.prototype.select` / `text` / `attr` / `html` / `outerHtml` / `ownText`, 1.1.1 too) gives the HTML string
+// the same methods. Non-enumerable so `for..in` over a string is unchanged.
+(function() {
+    function defineStringMethod(name, fn) {
+        if (typeof String.prototype[name] === 'function') return;
+        try { Object.defineProperty(String.prototype, name, { value: fn, writable: true, configurable: true, enumerable: false }); }
+        catch (error) {}
+    }
+    defineStringMethod('select', function(selector) { return org.jsoup.Jsoup.parse(String(this)).select(selector); });
+    defineStringMethod('text', function() { return org.jsoup.Jsoup.parse(String(this)).text(); });
+    defineStringMethod('ownText', function() { return org.jsoup.Jsoup.parse(String(this)).text(); });
+    defineStringMethod('toArray', function() { return [String(this)]; });
+    defineStringMethod('isEmpty', function() { return String(this).length === 0; });
+    defineStringMethod('html', function() { return String(this); });
+    defineStringMethod('outerHtml', function() { return String(this); });
+    defineStringMethod('attr', function(name) {
+        var wanted = String(name || '').toLowerCase();
+        var tag = String(this).match(/^\s*<[^>]*>/);
+        if (!tag) return '';
+        var found = tag[0].match(new RegExp('\\s' + wanted.replace(/[^a-z0-9_-]/g, '') + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i'));
+        return found ? (found[1] || found[2] || found[3] || '') : '';
+    });
+})();
 // Legado binds `book = ruleData as? BaseBook` and `chapter` only when set:
 // searchUrl/exploreUrl/RSS and list rules see `book == null`; `chapter` is
 // non-null only in TOC item fields and content.
 if (typeof __readoriBookIsNull !== 'undefined' && __readoriBookIsNull) { book = null; }
 if (typeof chapterActive !== 'undefined' && !chapterActive) { chapter = null; }
+// R157 (js mingzw): Legado AnalyzeRule.evalJS binds `title = chapter?.title` (AnalyzeRule.kt:784); the App binds it in chapter
+// contexts (JSEngine.swift:2395-2405). A configurable global property, so a script's own `let title` / `var title` still works.
+try {
+    if (typeof chapterActive !== 'undefined' && chapterActive && typeof globalThis.title === 'undefined') {
+        globalThis.title = String(chapterTitle || '');
+    }
+} catch (error) {}
 """
     if _dbg.active():
         # R147 (H9): java.log(msg) also lands in the debug trace (kind="log"); batch validation keeps the plain stub.
@@ -6406,7 +6676,21 @@ function __readoriAppNatives() {
       }
       return JSON.stringify(out);
     },
-    __readoriEvaluateString(rule, html) {
+    __readoriUnescapeHtml4(text) {
+      // commons-text unescapeHtml4 (Legado AnalyzeRule.getString): only entities that end in `;`.
+      const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0', copy: '\u00a9', reg: '\u00ae', hellip: '\u2026', mdash: '\u2014', ndash: '\u2013', ldquo: '\u201c', rdquo: '\u201d', lsquo: '\u2018', rsquo: '\u2019' };
+      return String(text || '').replace(/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([A-Za-z][A-Za-z0-9]*));/g, (m, dec, hex, name) => {
+        if (dec !== undefined) return String.fromCodePoint(parseInt(dec, 10));
+        if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16));
+        return Object.prototype.hasOwnProperty.call(named, name) ? named[name] : m;
+      });
+    },
+    __readoriEvaluateString(rule, html, unescape) {
+      // R157 REV: AnalyzeRule.getString(ruleStr, unescape) - the QuickJS native defaults to unescape = true as well.
+      const value = context.__readoriEvaluateStringRaw(rule, html);
+      return unescape === false ? value : context.__readoriUnescapeHtml4(value);
+    },
+    __readoriEvaluateStringRaw(rule, html) {
       rule = String(rule || '').trim();
       html = String(html || '');
       if (!rule) return '';
@@ -6601,6 +6885,10 @@ function __readoriAppNatives() {
   const suppressedInteractions = [];
   context.__readoriAllowsUserInteraction = data.allowsUserInteraction !== false;
   context.__readoriGetElementReturnsList = data.getElementReturnsList === true;
+  context.__readoriJsoupExtras = data.jsoupExtras === true;
+  context.__readoriListNonEnumerable = data.listNonEnumerable === true;
+  context.__readoriGetStringUnescapeFlag = data.getStringUnescapeFlag === true;
+  context.__readoriGetElementsJsonObjects = data.getElementsJsonObjects === true;
   context.__readoriRecordSuppressedInteraction = function(kind) {
     const name = String(kind);
     if (!suppressedInteractions.includes(name)) suppressedInteractions.push(name);
@@ -6620,6 +6908,14 @@ function __readoriAppNatives() {
       })();
     `, context, { timeout: 700 });
   } catch (error) {}
+  // R157 (js G3 goway): the replay loop re-runs the script after each materialized request; a moving clock changes every
+  // time-stamped / HMAC-signed request URL, so the fixtures of the previous pass are never hit again. Freeze Date for the
+  // whole replay (Legado runs the script once, live, so there is a single clock reading there).
+  if (data.frozenNowMs) {
+    try {
+      vm.runInContext(`(function(t){var R=Date;function D(){var a=[].slice.call(arguments);if(!(this instanceof D))return new R(t).toString();if(a.length===0)return new R(t);return new (Function.prototype.bind.apply(R,[null].concat(a)))();}D.prototype=R.prototype;D.now=function(){return t;};D.UTC=R.UTC;D.parse=R.parse;Date=D;})(${Number(data.frozenNowMs)});`, context, { timeout: 700 });
+    } catch (error) {}
+  }
   try {
     if (context.result && typeof context.result === 'object' && inputText) {
       Object.defineProperty(context.result, 'toString', {
@@ -6819,6 +7115,11 @@ def install_quickjs_app_globals(ctx: Any, runtime: RuleRuntime) -> None:
     try:
         ctx.set("__readoriAllowsUserInteraction", bool(getattr(runtime, "allows_user_interaction", True)))
         ctx.set("__readoriGetElementReturnsList", bool(app_profiles.current_app_profile().get_element_returns_list))
+        # R157 (1.1.2): Jsoup shim extras, non-enumerable list helpers, `java.getElements` JSON objects.
+        ctx.set("__readoriJsoupExtras", bool(app_profiles.current_app_profile().jsoup_shim_extras))
+        ctx.set("__readoriListNonEnumerable", bool(app_profiles.current_app_profile().js_list_helpers_non_enumerable))
+        ctx.set("__readoriGetStringUnescapeFlag", bool(app_profiles.current_app_profile().get_string_unescape_flag))
+        ctx.set("__readoriGetElementsJsonObjects", bool(app_profiles.current_app_profile().js_get_elements_json_objects))
     except Exception:
         pass
 
@@ -7051,6 +7352,10 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         "javaApi": _build_java_api_js(runtime),
         "allowsUserInteraction": bool(getattr(runtime, "allows_user_interaction", True)),
         "getElementReturnsList": bool(app_profiles.current_app_profile().get_element_returns_list),
+        "jsoupExtras": bool(app_profiles.current_app_profile().jsoup_shim_extras),
+        "listNonEnumerable": bool(app_profiles.current_app_profile().js_list_helpers_non_enumerable),
+        "getStringUnescapeFlag": bool(app_profiles.current_app_profile().get_string_unescape_flag),
+        "getElementsJsonObjects": bool(app_profiles.current_app_profile().js_get_elements_json_objects),
         "appJs": app_js_plan,
         "appJsSources": app_cryptojs_sources(app_js_plan),
         "percentEncodeMap": build_percent_encode_map(
@@ -7096,6 +7401,10 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
     node_result: dict[str, Any] | None = None
     fixtures = dict(extra_vars.get("__readoriResponseFixtures") or {})
     dynamic_session = requests.Session()
+    if should_materialize_dynamic_requests:
+        # Only evaluations that can be replayed (the request log decides whether another pass is needed) freeze the clock, so a
+        # time-derived URL is identical in every pass; a single-pass evaluation (replay disabled) sees the real clock.
+        payload["frozenNowMs"] = int(time.time() * 1000)
     for _ in range(NODE_DYNAMIC_REQUEST_REPLAY_LIMIT):
         payload["extraVars"]["__readoriRequestLog"] = []
         if fixtures:
@@ -7108,7 +7417,9 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         # If the rule already produced a value, any logged browser/navigation
         # requests are side effects rather than missing data dependencies. Do
         # not turn guarded CAPTCHA/settings fallbacks into extra validation I/O.
-        if str(node_result.get("value") or ""):
+        # R157 (js G2 jjwxc): a pass that THREW (a dynamic request still answered "" before its fixture existed) has not produced
+        # a value even if the error handler returned text; only an error-free non-empty result ends the replay.
+        if str(node_result.get("value") or "") and not node_result.get("scriptError"):
             break
         discovered = (
             materialize_js_request_log_fixtures(
@@ -7139,6 +7450,36 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         sync_runtime_book_state_from_variables(runtime)
         sync_runtime_chapter_state_from_variables(runtime)
     return "" if node_result.get("value") is None else str(node_result.get("value"))
+
+
+def _js_lib_crypto_needed(code: str, runtime: RuleRuntime) -> bool:
+    """R157 (tocContent K): the node-crypto routing looked at the rule script only. A script that merely calls a jsLib helper
+    (`encode(...)` -> `java.createSymmetricCrypto(...).encryptBase64`) ran on QuickJS where the crypto shims degrade to
+    identity, so the request carried plaintext. Route to node when the jsLib uses a crypto marker and the script calls
+    something the jsLib declares. Legado has no such split (Rhino runs everything), this only picks the emulation engine."""
+    lib = str(getattr(runtime, "js_lib", "") or "")
+    if not lib or not js_requires_node_crypto(lib):
+        return False
+    names = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)\s*\(", lib))
+    names.update(re.findall(r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:function|\()", lib))
+    return any(re.search(r"(?<![\w$.])" + re.escape(n) + r"\s*\(", code) for n in names)
+
+
+def _source_comment_crypto_needed(code: str, runtime: RuleRuntime) -> bool:
+    """R157 (searchExplore G4): a script that `eval(String(source.bookSourceComment))` runs the comment as code (bookld: the
+    `java.md5Encode` signature lives in the comment), so the comment decides the engine like the script text does."""
+    if "bookSourceComment" not in code:
+        return False
+    comment = str(getattr(runtime, "source_book_source_comment", "") or "")
+    return bool(comment) and js_requires_node_crypto(comment)
+
+
+def js_needs_node_crypto_engine(code: str, runtime: RuleRuntime) -> bool:
+    return (
+        js_requires_node_crypto(code)
+        or _js_lib_crypto_needed(code, runtime)
+        or _source_comment_crypto_needed(code, runtime)
+    )
 
 
 def js_requires_node_crypto(script: str) -> bool:
@@ -7339,6 +7680,8 @@ def materialize_js_request_log_fixtures(
             "headers": response_meta.get("headers", {}),
             "cookies": response_meta.get("cookies", {}),
         }
+        if response_meta.get("bodyBase64"):
+            payload["bodyBase64"] = response_meta["bodyBase64"]
         generated[target] = payload
         if final_url:
             generated[final_url] = payload
@@ -7922,7 +8265,7 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
         fixtures = build_js_response_fixtures(code, runtime)
         if fixtures:
             extra_vars["__readoriResponseFixtures"] = fixtures
-    if js_requires_node_crypto(code) and node_binary_path():
+    if js_needs_node_crypto_engine(code, runtime) and node_binary_path():
         return evaluate_js_with_node(code, input_text, runtime, extra_vars=extra_vars)
     # R156 (searchjs J): `result` is an object only when the WHOLE input is JSON (Legado String.isJson()). A JSONP body
     # (`search({...})`) stays the string it is, so `eval(result)` evaluates the callback (the node path already does this).
@@ -8208,7 +8551,10 @@ def _evaluate_js_quickjs_attempt(
         try:
             ctx.add_callable(
                 "__readoriEvaluateString",
-                lambda rule, html: first_result_to_text(str(html or ""), str(rule or ""), runtime),
+                lambda rule, html, unescape=True: legado_get_string(
+                    str(rule or ""), str(html or ""), runtime, "json" if is_json_content(str(html or "")) else "html",
+                    unescape=bool(unescape),
+                ),
             )
         except Exception:
             pass
@@ -8723,8 +9069,22 @@ def decode_data_url_as_hex_response(raw_url: str) -> tuple[str, str, str] | None
     return decoded.hex(), "http://localhost/", response_type
 
 
-def resolve_url_with_options(raw_url: str, base_url: str) -> tuple[str, dict[str, Any]]:
+def resolve_url_with_options(raw_url: str, base_url: str, headers: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
     url_part, opts = parse_url_options((raw_url or "").strip())
+    # R157 (tocContent K): detail / toc / content requests share Legado AnalyzeUrl.analyzeUrl (:265-268): a POST form body
+    # without an explicit Content-Type (source header included) that is not JSON / XML is encoded field by field
+    # (encodeParams :287-343; App BookSourceEngine shouldEncodeLegadoFormBody). Search / explore did this in
+    # build_url_with_options; these paths sent the body raw, so a base64 `secret_content=` with `+ / =` arrived mangled.
+    # `headers` is the runtime header set; callers that omit it keep the raw body.
+    if headers is not None and str(opts.get("method") or "").upper() == "POST" and isinstance(opts.get("body"), str):
+        merged_headers = dict(headers)
+        if isinstance(opts.get("headers"), dict):
+            merged_headers.update(opts["headers"])
+        if not _has_explicit_content_type(merged_headers) and not _is_json_or_xml_request_body(opts["body"]):
+            opts = dict(opts)
+            opts["body"] = encode_legado_form_body(
+                opts["body"], opts.get("charset") if isinstance(opts.get("charset"), str) else None
+            )
     url_part = collapse_concatenated_absolute_url(url_part)
     if not url_part:
         return "", opts
@@ -9250,9 +9610,13 @@ def resolve_plausible_url(raw_url: str, base_url: str, same_host_as: str = "") -
 
 def resolve_plausible_url_preserving_options(raw_url: str, base_url: str, same_host_as: str = "") -> str:
     url_part, opts = resolve_url_with_options(raw_url, base_url)
-    if not is_plausible_request_url(url_part):
+    # R157 (js G7 maoyan, tocContent D mowan): a `data:` carrier (`data:;base64,<payload>,{"type":"mw"}`) is a synthetic request
+    # (Legado AnalyzeUrl.getByteArrayIfDataUri / getStrResponseAwait), not a data asset. The App accepts every `data:` URL
+    # up front (BookSourceEngine.swift isPlausibleBookSourceUrl :4089), so the validator does too; it has no host to compare.
+    data_carrier = (url_part or "").strip().lower().startswith("data:")
+    if not data_carrier and not is_plausible_request_url(url_part):
         return ""
-    if same_host_as and not same_host(url_part, same_host_as):
+    if same_host_as and not data_carrier and not same_host(url_part, same_host_as):
         return ""
     if not opts:
         return url_part
@@ -10395,18 +10759,45 @@ def java_double_string(value: float) -> str:
     return f"{sign}{digits[0]}.{rest}E{point_position - 1}"
 
 
+_LEGADO_HTML4_ENTITY_RE = re.compile(r"&(?:#([0-9]+)|#[xX]([0-9a-fA-F]+)|([A-Za-z][A-Za-z0-9]*));")
+
+
+def _legado_html4_entity(match: re.Match[str]) -> str:
+    decimal, hexadecimal, name = match.group(1), match.group(2), match.group(3)
+    if name is not None:
+        code = _html_entities.name2codepoint.get(name)
+        return chr(code) if code is not None else match.group(0)
+    try:
+        code = int(decimal, 10) if decimal is not None else int(hexadecimal, 16)
+        return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else match.group(0)
+    except (TypeError, ValueError, OverflowError):
+        return match.group(0)
+
+
+def legado_unescape_html4(text: str) -> str:
+    """commons-text `StringEscapeUtils.unescapeHtml4` (Legado AnalyzeRule.getString :314-316 and every `getString` caller):
+    only the HTML 4 entity names (`html.entities.name2codepoint`) and numeric references, and every entity needs the
+    trailing `;`. Python's `html.unescape` also decodes the HTML5 names and the legacy no-semicolon forms (`&times`,
+    `&copy`, `&sect`, `&para`, `&not`...), which turned `...&timestamp=1` into `...×tamp=1` (R157 tocContent A, lc1001).
+    The validator follows Legado here. The App's own ContentCleaner.decodeHTMLEntities decodes a smaller table of named entities
+    (it does need the `;` as well), so an entity outside that table is decoded by Legado and the validator but not by the App."""
+    if "&" not in text:
+        return text
+    return _LEGADO_HTML4_ENTITY_RE.sub(_legado_html4_entity, text)
+
+
 def legado_get_string_unescape(value: Any) -> str:
     text = str(value or "")
     if "&" not in text:
         return text
-    return html_unescape(text)
+    return legado_unescape_html4(text)
 
 
 def legado_get_string_value(values: list[str]) -> str:
     text = "\n".join(str(value or "") for value in values)
     if "&" not in text:
         return text
-    return html_unescape(text)
+    return legado_unescape_html4(text)
 
 
 def legado_string_list_values(values: list[str]) -> list[str]:
@@ -10709,6 +11100,14 @@ def _evaluate_legado_js_segment(
     # R155 (B): Legado SourceRule.makeUpRule (AnalyzeRule.kt:659-705) expands `@get:{key}` in EVERY rule mode, JS
     # included (`'...&bookId=@get:{book}&...'` inside an `@js:` tail is the stored value before the script runs).
     js_code = substitute_variable_references(code.strip(), runtime)
+    replace_suffix: str | None = None
+    if app_profiles.current_app_profile().js_rule_replace_suffix:
+        # R157 (js G5 enjing, 1.1.2): Legado SourceRule.makeUpRule (AnalyzeRule.kt:690-703) cuts `##regex##replacement` off EVERY
+        # rule mode, JS included, and getString applies it to the script result (a blank script before it is not run:
+        # `<js>##、##,</js>` only replaces in the previous result).
+        cut = _split_js_rule_replace_suffix(js_code)
+        if cut is not None:
+            js_code, replace_suffix = cut[0].strip(), cut[1]
     json_tail = ""
     if is_at_js:
         # Readori compatibility: @js:…@json:… (Legado's @js: swallows the tail).
@@ -10716,11 +11115,16 @@ def _evaluate_legado_js_segment(
         if at_json and js_code[: at_json.start()].strip() and js_code[at_json.end():].strip():
             json_tail = js_code[at_json.end():].strip()
             js_code = js_code[: at_json.start()].strip()
-    js_result = try_evaluate_fast_java_aes(js_code, js_input)
-    if js_result is None and is_at_js:
-        js_result = try_evaluate_fast_toc_item_js(js_code, js_input, runtime)
-    if js_result is None:
-        js_result = evaluate_js(js_code, js_input, runtime, extra_vars=_legado_src_binding(src_content, js_input))
+    if not js_code and replace_suffix is not None and replace_suffix.split("##", 1)[0]:
+        js_result = js_input
+    else:
+        js_result = try_evaluate_fast_java_aes(js_code, js_input)
+        if js_result is None and is_at_js:
+            js_result = try_evaluate_fast_toc_item_js(js_code, js_input, runtime)
+        if js_result is None:
+            js_result = evaluate_js(js_code, js_input, runtime, extra_vars=_legado_src_binding(src_content, js_input))
+    if replace_suffix is not None and replace_suffix.split("##", 1)[0]:
+        js_result = legado_replace_regex(js_result or "", replace_suffix)
     if json_tail:
         return evaluate_rule(json_tail, js_result, runtime, "json")
     if not js_result:
@@ -10728,6 +11132,166 @@ def _evaluate_legado_js_segment(
     if is_last and is_at_js:
         return js_result_to_list(js_result)
     return [js_result]
+
+
+_JS_REGEX_KEYWORDS = frozenset(
+    ("return", "typeof", "case", "in", "of", "delete", "void", "throw", "new", "else", "do", "instanceof", "yield", "await")
+)
+
+
+def _split_js_rule_replace_suffix(code: str) -> tuple[str, str] | None:
+    """Port of the Swift `RuleEvaluator.legadoSplitJavaScriptReplace`: the first `##` outside string / template / regex literals
+    and comments -> (stripped script, text after `##`), or None.
+
+    Legado splits the rule text with a plain `rule.split("##")` (AnalyzeRule.kt:690-701), so a `##` inside a JS literal also cuts
+    the script there; the literal-aware cut is a superset for working sources and never truncates a valid script. Mirrors the App
+    exactly: a regex literal is recognised by the previous significant token (not after `)` / `]` / `}` and not after an
+    identifier unless it is a keyword such as `return`), a quote ends at a newline when unterminated, template `${ ... }`
+    interpolation nests (a `##` inside an interpolation is code of the template, never a cut)."""
+    if "##" not in code:
+        return None
+    chars = code
+    count = len(chars)
+    index = 0
+    template_depth: list[int] = []
+    previous_significant = ""
+    previous_word = ""
+    last_was_whitespace = False
+
+    def is_word(c: str) -> bool:
+        return c.isalpha() or c.isdigit() or c in "_$" or (c.isalnum())
+
+    def regex_allowed_here() -> bool:
+        if not previous_significant:
+            return True
+        if is_word(previous_significant):
+            return previous_word in _JS_REGEX_KEYWORDS
+        return previous_significant not in ")]}"
+
+    def skip_quoted(quote: str) -> None:
+        nonlocal index
+        index += 1
+        while index < count:
+            c = chars[index]
+            if c == chr(92):
+                index += 2
+                continue
+            if c == quote:
+                index += 1
+                return
+            if c == chr(10):
+                return
+            index += 1
+
+    def skip_template_text() -> None:
+        nonlocal index
+        while index < count:
+            c = chars[index]
+            if c == chr(92):
+                index += 2
+                continue
+            if c == "`":
+                index += 1
+                return
+            if c == "$" and index + 1 < count and chars[index + 1] == "{":
+                index += 2
+                template_depth.append(0)
+                return
+            index += 1
+
+    while index < count:
+        c = chars[index]
+        after_whitespace = last_was_whitespace
+        last_was_whitespace = False
+        if not template_depth and c == "#" and index + 1 < count and chars[index + 1] == "#":
+            return chars[:index].strip(), chars[index + 2:]
+        if c in "'\"":
+            skip_quoted(c)
+            previous_significant = c
+            previous_word = ""
+        elif c == "`":
+            index += 1
+            skip_template_text()
+            previous_significant = "`"
+            previous_word = ""
+        elif c == "/":
+            if index + 1 < count and chars[index + 1] == "/":
+                while index < count and chars[index] != chr(10):
+                    index += 1
+            elif index + 1 < count and chars[index + 1] == "*":
+                index += 2
+                while index + 1 < count and not (chars[index] == "*" and chars[index + 1] == "/"):
+                    index += 1
+                index = min(count, index + 2)
+            elif regex_allowed_here():
+                index += 1
+                inside_class = False
+                while index < count:
+                    rc = chars[index]
+                    if rc == chr(92):
+                        index += 2
+                        continue
+                    if rc == chr(10):
+                        break
+                    if rc == "[":
+                        inside_class = True
+                    elif rc == "]":
+                        inside_class = False
+                    elif rc == "/" and not inside_class:
+                        index += 1
+                        break
+                    index += 1
+                previous_significant = "/"
+                previous_word = "x"
+            else:
+                previous_significant = "/"
+                previous_word = ""
+                index += 1
+        elif c == "{":
+            if template_depth:
+                template_depth[-1] += 1
+            previous_significant = c
+            previous_word = ""
+            index += 1
+        elif c == "}":
+            if template_depth:
+                depth = template_depth[-1]
+                if depth == 0:
+                    template_depth.pop()
+                    index += 1
+                    skip_template_text()
+                    previous_significant = "`"
+                    previous_word = ""
+                    continue
+                template_depth[-1] = depth - 1
+            previous_significant = c
+            previous_word = ""
+            index += 1
+        else:
+            if c.isspace():
+                last_was_whitespace = True
+                index += 1
+                continue
+            if is_word(c):
+                if not after_whitespace and previous_significant and is_word(previous_significant) and previous_word:
+                    previous_word += c
+                else:
+                    previous_word = c
+            else:
+                previous_word = ""
+            previous_significant = c
+            index += 1
+    return None
+
+
+def _list_js_code(code: str) -> str:
+    """App RuleEvaluator `.javascript` list case (:1826): the `##regex##replacement` tail of a JS list rule is cut off and the
+    replacement is not applied to a list (1.1.2, `js_rule_replace_suffix`)."""
+    if app_profiles.current_app_profile().js_rule_replace_suffix:
+        cut = _split_js_rule_replace_suffix(code)
+        if cut is not None:
+            return cut[0]
+    return code
 
 
 _NON_URL_STRING_FIELD: "contextvars.ContextVar[bool]" = contextvars.ContextVar("readori_non_url_string_field", default=False)
@@ -11000,7 +11564,7 @@ def legado_get_string(
         set_legado_object_string_mode(previous_mode)
     text = "\n".join(str(value or "") for value in values)
     if unescape and "&" in text:
-        return html_unescape(text)
+        return legado_unescape_html4(text)
     return text
 
 
@@ -11049,13 +11613,25 @@ def evaluate_rule(
     stripped = rule.strip()
     segments = _split_legado_js_segments(stripped)
     if len(segments) == len(raw_segments):
+        # R157 (tocContent F): Legado SourceRule.init (AnalyzeRule.kt:587-593) turns ANY `{{..}}` SourceRule, JSONPath
+        # placeholders `{{$.x}}` included, into Mode.Regex, i.e. the expanded text is the segment's result.
         literal_flags = [
-            (not raw_is_js) and is_literal_rule_template(raw_text)
+            (not raw_is_js) and (is_literal_rule_template(raw_text) or _has_double_brace_json_placeholder(raw_text))
             for raw_text, raw_is_js, _raw_at in raw_segments
         ]
     else:
         literal_flags = [False] * len(segments)
     has_js = any(is_js for _text, is_js, _at in segments)
+    if (
+        has_js
+        and len(segments) == 1
+        and not stripped.startswith("+")
+        and app_profiles.current_app_profile().js_rule_replace_suffix
+        and _split_js_rule_replace_suffix(segments[0][0]) is not None
+    ):
+        # R157 (js G5, 1.1.2): a lone `@js:` / `<js>` rule with a `##regex##replacement` suffix goes through the segment pipeline,
+        # which cuts the suffix off and applies it to the script result.
+        return _evaluate_legado_js_pipeline(segments, literal_flags, content, runtime, content_type, string_mode)
     if has_js and (len(segments) == 1 or stripped.startswith("+")):
         # A lone JavaScript rule (or Legado's "+" list prefix) keeps its
         # dedicated fast paths.
@@ -11930,7 +12506,9 @@ def evaluate_xpath_rule(rule: str, content: str, runtime: RuleRuntime, content_t
         if path == "/":
             path = "//*"
         elif path.endswith("/"):
-            path += "/*"
+            # R157 (tocContent G): `a//@href` is `a/descendant-or-self::node()/@href`; the element ITSELF is included
+            # (`a//*` skipped it, so the `<a href>` of a link list was never read). App XPathEngine includes self.
+            path += "descendant-or-self::*"
         return xpath_extract(content, path, attr_match.group(1), runtime.base_url)
     if "@" in text and not text.startswith("/"):
         path, attr = text.rsplit("@", 1)
@@ -13225,12 +13803,19 @@ def fetch_text(
     method = (method or "GET").upper()
     base_headers = dict(headers or {})
     request_timeout = (min(REQUEST_CONNECT_TIMEOUT, max(1, timeout)), timeout)
+    structured_default_body = False
     if method == "POST" and body is not None and not any(k.lower() == "content-type" for k in base_headers):
-        base_headers["Content-Type"] = f"application/x-www-form-urlencoded; charset={charset or 'utf-8'}"
+        # R157 (searchExplore G4): without an explicit Content-Type a JSON / XML-looking body is sent as
+        # `application/json; charset=UTF-8` (Legado AnalyzeUrl postJson; App NetworkManager `bodyLooksStructured`), not as a form.
+        if _request_body_looks_structured(body):
+            structured_default_body = True
+            base_headers["Content-Type"] = "application/json; charset=UTF-8"
+        else:
+            base_headers["Content-Type"] = f"application/x-www-form-urlencoded; charset={charset or 'utf-8'}"
 
     data = body
     if method == "POST" and isinstance(body, str):
-        enc = charset or "utf-8"
+        enc = "utf-8" if structured_default_body else (charset or "utf-8")
         try:
             data = body.encode(enc, errors="ignore")
         except Exception:
@@ -13279,6 +13864,14 @@ def fetch_text(
                     str(key): str(value)
                     for key, value in resp.cookies.get_dict().items()
                 }
+                # R157 (js baidu): the raw payload (bounded) for Node replay fixtures, see materialize_js_request_log_fixtures.
+                raw_content = getattr(resp, "content", b"") or b""
+                if (
+                    isinstance(raw_content, (bytes, bytearray))
+                    and 0 < len(raw_content) <= RESPONSE_RAW_BYTES_LIMIT
+                    and _response_needs_raw_bytes(str(resp.headers.get("Content-Type") or ""), bytes(raw_content))
+                ):
+                    response_meta["bodyBase64"] = base64.b64encode(bytes(raw_content)).decode("ascii")
             verify_redirect_url = loading_verify_redirect_url(text, str(resp.url))
             if allow_redirects and verify_redirect_url and method == "GET":
                 try:
@@ -13582,7 +14175,10 @@ def is_bare_css_exclusion_rule(rule: str) -> bool:
     if parsed is None:
         return False
     selector_text, excludes, _terms = parsed
-    return bool(excludes and selector_text.strip())
+    # R157 (searchExplore G3): the bracket form `sel[a:b]` / `sel[1,3]` / `sel[-1]` is the same ElementsSingle selection
+    # (AnalyzeByJSoup.kt:282-345: ranges, negative indexes, steps) with the listed indexes KEPT, not only removed.
+    bracket_form = re.search(r"\[\s*!?\s*[\d\s,:\-]*\]\s*$", text) is not None
+    return bool((excludes or bracket_form) and selector_text.strip())
 
 
 def evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]:
@@ -13620,7 +14216,22 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
             evaluate_single_rule("@put:{" + put_body + "}", html, runtime, put_content_type)
         return evaluate_book_list(put_base, html, runtime)
 
-    sequence = _first_rule_sequence(text)
+    base_rule, trailing_js = split_trailing_js_block(text)
+    if trailing_js:
+        base_items = evaluate_book_list(base_rule, html, runtime)
+        filtered = evaluate_book_list_trailing_js_filter(trailing_js, base_items, runtime)
+        if filtered is not None:
+            return filtered
+
+    # R157 (searchExplore G1): Legado AnalyzeRule.splitSourceRule (:545-620) cuts the rule at every `<js>` / `@js:` FIRST; `&&` / `||` /
+    # `%%` only apply inside a non-JS segment (the analyzers split them), and a JS segment receives the previous segment's whole
+    # result. The `||` / `&&` that sat inside the JS code (or between a selector and the JS tail) used to be taken as the
+    # rule operator, and a JS tail ran per list item.
+    js_segments = _split_legado_js_segments(text)
+    if len(js_segments) > 1 and any(is_js for _text, is_js, _at in js_segments):
+        return _evaluate_book_list_js_segments(js_segments, html, runtime)
+
+    sequence = _first_rule_sequence(text) if not (len(js_segments) == 1 and js_segments[0][1]) else None
     if sequence is not None:
         operator, parts = sequence
         groups = [evaluate_book_list(part, html, runtime) for part in parts]
@@ -13638,18 +14249,11 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
             if index < len(group)
         ]
 
-    base_rule, trailing_js = split_trailing_js_block(text)
-    if trailing_js:
-        base_items = evaluate_book_list(base_rule, html, runtime)
-        filtered = evaluate_book_list_trailing_js_filter(trailing_js, base_items, runtime)
-        if filtered is not None:
-            return filtered
-
     low = text.lower()
     if low.startswith("<js>"):
         js_match = re.match(r"<js>([\s\S]*?)</js>([\s\S]*)$", text, re.I)
         if js_match:
-            js_code = js_match.group(1).strip()
+            js_code = _list_js_code(js_match.group(1).strip())
             tail = js_match.group(2).strip()
             js_result = evaluate_js(js_code, html, runtime)
             out = js_result_to_list(js_result)
@@ -13660,13 +14264,13 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
                 return next_values
             return out
     if low.startswith("<js>") and low.endswith("</js>"):
-        return js_result_to_list(evaluate_js(text[4:-5], html, runtime))
+        return js_result_to_list(evaluate_js(_list_js_code(text[4:-5]), html, runtime))
     if low.startswith("+<js>") and low.endswith("</js>"):
-        return js_result_to_list(evaluate_js(text[5:-5], html, runtime))
+        return js_result_to_list(evaluate_js(_list_js_code(text[5:-5]), html, runtime))
     if low.startswith("+@js:"):
-        return js_result_to_list(evaluate_js(text[5:], html, runtime))
+        return js_result_to_list(evaluate_js(_list_js_code(text[5:]), html, runtime))
     if low.startswith("@js:"):
-        return js_result_to_list(evaluate_js(text[4:], html, runtime))
+        return js_result_to_list(evaluate_js(_list_js_code(text[4:]), html, runtime))
 
     if "<js>" in text and "</js>" in text and not low.startswith(("<js>", "+<js>")):
         js_match = re.search(r"<js>([\s\S]*?)</js>", text, re.I)
@@ -13752,6 +14356,127 @@ def _evaluate_book_list(rule: str, html: str, runtime: RuleRuntime) -> list[str]
         return results
 
     return evaluate_rule(text, html, runtime, "json" if is_json_content(html) else "html")
+
+
+def _app_js_array(result: str) -> list[str]:
+    """App `JSEngine.evaluateToArray`: a JSON array result is its elements, any other non-empty result ONE item (never split on
+    newlines)."""
+    text = (result or "").strip()
+    if not text:
+        return []
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return [text]
+    if isinstance(obj, list):
+        return [x for x in (json_container_to_string(item) for item in obj) if x]
+    return [text]
+
+
+def _evaluate_book_list_js_segments(segments: list[tuple[str, bool, bool]], html: str, runtime: RuleRuntime) -> list[str]:
+    """Legado getElements over a rule with JS segments (R157 searchExplore G1).
+
+    The rule is cut at every `<js>` / `@js:` first on both profiles (App RuleType.parseUncached == Legado splitSourceRule); `&&` /
+    `||` / `%%` only apply inside a non-JS segment. What a JS segment receives differs:
+
+    * 1.1.2 (`list_rule_js_tail_whole_list`, Legado AnalyzeRule.getElements / E1): a JS segment after the first segment runs ONCE on
+      the whole current list (`result`), page text is `src`; its return is the new list. Every segment that FOLLOWS a JS segment runs on
+      the whole current list too (JSON mode: the list's JSON-array text; HTML mode: the items' outerHTML joined); selector ->
+      selector chains that never passed through JS stay per item.
+    * 1.1.1 (App RuleType `.combine`): every segment is evaluated PER ITEM of the previous segment's output; a JS segment sees the
+      item string as `result` / `src` and its result becomes an array (`evaluateToArray`: JSON array or one item)."""
+    if not app_profiles.current_app_profile().list_rule_js_tail_whole_list:
+        current = [html]
+        for segment_text, is_js, _at in segments:
+            produced: list[str] = []
+            for item in current:
+                if is_js:
+                    produced.extend(
+                        _app_js_array(evaluate_js(_list_js_code(segment_text.strip()), item, runtime, extra_vars={"src": item}))
+                    )
+                else:
+                    produced.extend(evaluate_book_list(segment_text, item, runtime))
+            current = produced
+            if not current:
+                break
+        return current
+    # 1.1.2 (E1 final): a JS segment AFTER the first segment runs once on the whole current list (`result` = the items: JSON objects
+    # parsed back into objects in JSON mode, HTML items as outerHTML strings, with the Elements-like helpers) and what it returns
+    # becomes the new list (JSON array -> items, any other non-empty result -> one item; an empty array or an exception -> empty);
+    # selector segments still run per item; a leading JS segment sees the page.
+    current = [html]
+    passed_js = False
+    for index, (segment_text, is_js, _at) in enumerate(segments):
+        if is_js:
+            code = _list_js_code(segment_text.strip())
+            if index > 0 and not code.strip():
+                continue  # a blank tail script leaves the list unchanged (Swift `tailScript.isEmpty`)
+            if index == 0:
+                output = evaluate_js(code, html, runtime, extra_vars={"src": html})
+            else:
+                # Only container items (`{...}` / `[...]`) are parsed back into objects; every other item stays a string.
+                result_items: list[Any] = []
+                result_raws: list[str] = []
+                json_mode = is_json_content(html)  # Swift `listResultIsJSON: isJSONContent(html)`: the PAGE decides, even for an empty list
+                for item in current:
+                    result_raws.append(item)
+                    stripped = item.strip()
+                    if stripped[:1] in ("{", "[") and is_json_content(item):
+                        try:
+                            parsed = json.loads(stripped)
+                        except Exception:
+                            parsed = None
+                        if isinstance(parsed, (dict, list)):
+                            result_items.append(parsed)
+                            continue
+                    result_items.append(item)
+                # An exception in the tail yields an empty list (E1 final: no per-item fallback, no leftover `result`). The tail also
+                # runs for an empty list (Legado only skips null) and a tail returning nothing is an empty list, not the bound list.
+                outer_sink = getattr(runtime, "script_error_sink", None)
+                tail_sink: list = []
+                runtime.script_error_sink = tail_sink
+                try:
+                    output = evaluate_js(
+                        "result = __readoriListResult(result, __readoriListRaw, __readoriListJson);\n"
+                        "__readoriListTailFinish(__readoriListTailRun(" + json.dumps(code) + "))",
+                        html, runtime,
+                        extra_vars={"src": html, "result": result_items, "__readoriListRaw": result_raws, "__readoriListJson": json_mode},
+                    )
+                finally:
+                    runtime.script_error_sink = outer_sink
+                    if outer_sink is not None:
+                        outer_sink.extend(tail_sink)
+                if tail_sink or output.strip() == "__readoriEmptyList__":
+                    return []
+            current = [item for item in _app_js_array(output) if item.strip()]
+            passed_js = True
+        elif passed_js:
+            # E1 final / Legado getElements (`AnalyzeByJSonPath(result).getElements(rule)`): a segment that FOLLOWS a JS segment runs on the
+            # whole current list - JSON mode on the list's JSON-array text (raw JSON for container items), HTML mode on the items'
+            # outerHTML joined (Jsoup Elements semantics). Selector -> selector chains that never passed through JS stay per item.
+            if not current:
+                continue
+            if is_json_content(html):
+                parts: list[str] = []
+                for item in current:
+                    stripped = item.strip()
+                    container = False
+                    if stripped[:1] in ("{", "["):
+                        try:
+                            container = isinstance(json.loads(stripped), (dict, list))
+                        except Exception:
+                            container = False
+                    parts.append(stripped if container else json.dumps(item, ensure_ascii=False))
+                list_text = "[" + ",".join(parts) + "]"
+            else:
+                list_text = "\n".join(current)
+            current = evaluate_book_list(segment_text, list_text, runtime)
+        else:
+            produced = []
+            for item in current:
+                produced.extend(evaluate_book_list(segment_text, item, runtime))
+            current = produced
+    return current
 
 
 def evaluate_book_list_trailing_js_filter(js_part: str, items: list[str], runtime: RuleRuntime) -> list[str] | None:
@@ -13906,6 +14631,7 @@ def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime:
     """
     content_type = "json" if is_json_content(item) else "html"
     author = ""
+    bind_fields = app_profiles.current_app_profile().search_item_fields_visible_to_book_url
     # R156 (J, 1.1.2): Legado BookList.kt:225-269 order (+ Readori's updateTime right after lastChapter, as the Swift engine does).
     fields = (
         ("author", "kind", "wordCount", "lastChapter", "updateTime", "intro", "coverUrl")
@@ -13929,6 +14655,27 @@ def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime:
                 author = legado_joined_string_list(values).strip()
             except Exception:
                 author = ""
+        if bind_fields and field in ("kind", "lastChapter", "intro", "coverUrl") and values:
+            # R157 (tocContent H qq, 1.1.2): BookList.kt:220-281 sets each evaluated field on the SearchBook before bookUrl is
+            # evaluated, so `book.kind` / `{{book.kind}}` (and the other fields) are visible to the bookUrl rule. wordCount has
+            # no JS binding in the validator's `book` shim, so only its `@put` / `java.put` effect is kept.
+            try:
+                text = (
+                    legado_joined_string_list(values).strip() if field == "kind" else legado_get_string_value(values).strip()
+                )
+            except Exception:
+                text = ""
+            if text:
+                if field == "kind":
+                    # The Swift engine's syncBookState(kind:) sets the Book binding only; Legado's variable map has no `book.kind`
+                    # key, so nothing is written to runtime.variables (templates and JS read runtime.book_kind).
+                    runtime.book_kind = text
+                elif field == "lastChapter":
+                    runtime.book_last_chapter = text
+                elif field == "intro":
+                    runtime.book_intro = text
+                else:
+                    runtime.book_cover_url = text
     return author
 
 
@@ -15188,6 +15935,18 @@ def collect_app_book_candidates(
 _FIRST_CANDIDATE_ONLY: "contextvars.ContextVar[bool]" = contextvars.ContextVar("readori_first_candidate_only", default=False)
 
 
+def has_effective_explore_book_list(src: dict[str, Any]) -> bool:
+    """R157 (searchExplore G5): an explore entry list needs a `bookList`, but a blank `ruleExplore.bookList` falls back to the
+    search rule (Legado BookSource.getExploreRule :217 / CheckSourceService.kt:154-205; App `effectiveExploreRule`,
+    BookSourceEngine+Flagship.swift:293-312). The pre-check used to reject such a source as "missing search/explore rule"
+    before `fetch_book_candidates` (which already had the fallback) ran. The Accept header is NOT part of this."""
+    explore_rule = src.get("ruleExplore")
+    if isinstance(explore_rule, dict) and str(explore_rule.get("bookList") or "").strip():
+        return True
+    search_rule = src.get("ruleSearch")
+    return isinstance(search_rule, dict) and bool(str(search_rule.get("bookList") or "").strip())
+
+
 def _fetch_first_book_candidates(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime) -> tuple[list[str], str]:
     """Batch validation search / discovery stage (R156 network T): `fetch_book_candidates` with the App's one-result window."""
     token = _FIRST_CANDIDATE_ONLY.set(True)
@@ -15332,6 +16091,7 @@ def fetch_book_candidates(
             if selected_variables:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables.update(selected_variables)
+            if book_urls:
                 runtime.validation_book_author = selected_author
             if not book_urls and error_page:
                 runtime.variables = dict(runtime.variables or {})
@@ -15427,7 +16187,9 @@ def fetch_book_candidates(
                 if selected_variables:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables.update(selected_variables)
-                    runtime.validation_book_author = selected_author
+                # R157 (tocContent E mowan): the author of the selected item is kept even when it has no variables (the
+                # assignment used to sit inside the `if selected_variables` guard).
+                runtime.validation_book_author = selected_author
                 return book_urls, final_url
             if error_page:
                 runtime.variables = dict(runtime.variables or {})
@@ -15555,7 +16317,7 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
     # App E:9147-9190: the tocUrl guesses (JSON keys, og:novel:read_url, links in the page) run only when neither
     # a tocUrl rule nor a chapterList rule exists; otherwise tocUrl falls back to the book URL.
     toc_heuristics_allowed = toc_rule_blank and chapter_list_blank
-    abs_url, request_options = resolve_url_with_options(book_url, runtime.base_url)
+    abs_url, request_options = resolve_url_with_options(book_url, runtime.base_url, runtime.headers or {})
     request_url = request_url_preserving_typed_data_options(abs_url, request_options)
     request_method = str(request_options.get("method") or "GET")
     request_body = request_options.get("body") if isinstance(request_options.get("body"), str) else None
@@ -15655,17 +16417,30 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
     # below); their errors never fail the detail stage (Legado catches them).
     evaluated_info_side_effect_fields: set[str] = set()
 
+    bind_detail_fields = app_profiles.current_app_profile().search_item_fields_visible_to_book_url
+
     def run_info_side_effect_field(side_effect_field: str) -> None:
         if side_effect_field in evaluated_info_side_effect_fields:
             return
         side_effect_rule = str(info_rule.get(side_effect_field) or "").strip()
         side_effect_low = side_effect_rule.lower()
-        if "@put:" not in side_effect_low and "java.put(" not in side_effect_low:
+        bind_field = bind_detail_fields and side_effect_field in ("lastChapter", "intro", "coverUrl") and bool(side_effect_rule)
+        if not bind_field and "@put:" not in side_effect_low and "java.put(" not in side_effect_low:
             return
         evaluated_info_side_effect_fields.add(side_effect_field)
         saved_script_error = runtime2.script_error
         try:
-            evaluate_get_string(side_effect_rule, html, runtime2, "json" if is_json_content(html) else "html")
+            field_text = evaluate_get_string(side_effect_rule, html, runtime2, "json" if is_json_content(html) else "html")
+            if bind_field and (field_text or "").strip():
+                # R157 REV (1.1.2): BookInfo.kt:86-134 / Swift extractSearchBookFromDetailRules set each evaluated field on the Book
+                # before the tocUrl rule runs, so `book.intro` / `book.lastChapter` / `book.coverUrl` are visible to it.
+                field_text = field_text.strip()
+                if side_effect_field == "lastChapter":
+                    runtime2.book_last_chapter = field_text
+                elif side_effect_field == "intro":
+                    runtime2.book_intro = field_text
+                else:
+                    runtime2.book_cover_url = legado_absolute_url(field_text, runtime2.base_url)
         except Exception as _swallowed:
             note_debug_error("detail field side effects", _swallowed)
         finally:
@@ -16615,6 +17390,10 @@ def resolve_toc_source(
     first_chapter_final_url = ""
     first_chapter_url = ""
     first_chapter_title = ""
+    # R157 REV (1.1.2 `content_sample_dedups_by_url`): the rows of the first 16-chapter window, duplicates included; the sample is
+    # chosen after the page loop (keepLastChapterPerURL, then the first remaining chapter).
+    window_rows: list[tuple[str, str, RuleRuntime, int, int, dict[str, str]]] = []
+    dedup_window = window_only and app_profiles.current_app_profile().content_sample_dedups_by_url
     seen_chapter_urls: set[str] = set()
     # R156 (network G1 / H): the "all chapters" link and the pagination guesses mirror the App's getChapterList: with no nextTocUrl rule
     # (a chapterList rule does not disable them) the first page gets `discoverTocRangeOptionCandidates`, then (>= 15 items)
@@ -16632,7 +17411,7 @@ def resolve_toc_source(
     next_toc_batch_urls: set[str] = set()
     while queue and pages < 80:
         current_url = queue.pop(0)
-        abs_url, request_options = resolve_url_with_options(current_url, runtime_seed.base_url)
+        abs_url, request_options = resolve_url_with_options(current_url, runtime_seed.base_url, runtime_seed.headers or {})
         if not abs_url:
             continue
         request_url = request_url_preserving_typed_data_options(abs_url, request_options)
@@ -16879,7 +17658,14 @@ def resolve_toc_source(
                     raw_chapter_url = substitute_css_placeholders(raw_chapter_url, item, item_runtime, item_type)
                 if "{{" in raw_chapter_url and "}}" in raw_chapter_url:
                     raw_chapter_url = _resolve_js_template_expressions(raw_chapter_url, item_runtime, input_text=item)
-                if contains_json_placeholder(chapter_url_rule) and (
+                # R157 (tocContent J, 1.1.2): a JS rule that returned "" is an empty URL (Legado -> title + index for a volume, baseUrl
+                # otherwise, BookChapterList.kt:230-241), never its own source text (the template fallback injected the script).
+                # Swift `ruleContainsJavaScriptSegment`: `@js:` or `<js>` + `</js>`; with a JS segment the whole literal-template branch is skipped.
+                chapter_url_rule_low = chapter_url_rule.lower()
+                js_chapter_url_rule = "@js:" in chapter_url_rule_low or ("<js>" in chapter_url_rule_low and "</js>" in chapter_url_rule_low)
+                if contains_json_placeholder(chapter_url_rule) and not (
+                    js_chapter_url_rule and app_profiles.current_app_profile().js_chapter_url_empty_no_literal_fallback
+                ) and (
                     not raw_chapter_url.strip() or contains_json_placeholder(raw_chapter_url)
                 ):
                     literal_chapter_url = substitute_json_placeholders(chapter_url_rule, item)
@@ -16976,24 +17762,40 @@ def resolve_toc_source(
             if chapter_url and low_raw_chapter_url.startswith(("#", "javascript:", "mailto:")):
                 chapter_url = final_url
             if chapter_url:
+                if dedup_window:
+                    window_rows.append((chapter_url, title, item_runtime, item_index, len(items), dict(runtime2.variables or {})))
                 if chapter_url not in seen_chapter_urls:
                     seen_chapter_urls.add(chapter_url)
                     if _dbg.active() and len(seen_chapter_urls) <= 200:
                         _dbg.emit("item", index=len(seen_chapter_urls) - 1, name=title, value=chapter_url, volume=False)
-                    if not first_chapter_url:
+                    if not first_chapter_url and not dedup_window:
                         first_chapter_final_url = final_url
                         first_chapter_url = chapter_url
                         first_chapter_title = title
-                        runtime.chapter_url = chapter_url
-                        runtime.chapter_title = title
-                        runtime.chapter_tag = item_runtime.chapter_tag
-                        runtime.chapter_is_volume = item_runtime.chapter_is_volume
-                        runtime.chapter_is_vip = item_runtime.chapter_is_vip
-                        runtime.chapter_is_pay = item_runtime.chapter_is_pay
-                        runtime.chapter_index = item_index
-                        runtime.chapter_count = len(items)
-                        runtime.chapter_variable = item_runtime.chapter_variable
-                        runtime.chapter_active = True
+                        _adopt_first_chapter_runtime(runtime, runtime2.variables or {}, item_runtime, chapter_url, title, item_index, len(items))
+
+        if dedup_window and window_rows and not first_chapter_url:
+            # R157 REV / tocContent C xxsy: Legado BookChapterList.kt:119-128 (App keepLastChapterPerURL): of the window's chapters only the
+            # LAST one per url stays (a reversed toc keeps the first), then the first remaining chapter is the content sample. A
+            # baseUrl placeholder row (empty link rule) that repeats later in the window therefore never is the sample.
+            kept_rows = window_rows
+            if toc_list_reversed:
+                seen_urls: set[str] = set()
+                kept_rows = [row for row in window_rows if not (row[0] in seen_urls or seen_urls.add(row[0]))]
+            else:
+                later_urls: set[str] = set()
+                survivors: list[tuple[str, str, RuleRuntime, int, int, dict[str, str]]] = []
+                for row in reversed(window_rows):
+                    if row[0] not in later_urls:
+                        later_urls.add(row[0])
+                        survivors.append(row)
+                kept_rows = list(reversed(survivors))
+            pick_url, pick_title, pick_runtime, pick_index, pick_count, pick_base = kept_rows[0]
+            first_chapter_final_url = final_url
+            first_chapter_url = pick_url
+            first_chapter_title = pick_title
+            _adopt_first_chapter_runtime(runtime, pick_base, pick_runtime, pick_url, pick_title, pick_index, pick_count)
+        window_rows.clear()
 
         # App `newChaptersThisPage == 0` branch on a jump page: the guessed page produced no chapter at all (items without a usable
         # chapter, all duplicates) -> restore the first page like a failed / empty jump page.
@@ -17055,6 +17857,42 @@ def resolve_toc_source(
     return bool(first_chapter_url), first_chapter_final_url, first_chapter_url, first_chapter_title, pages, first_page_item_count, len(seen_chapter_urls)
 
 
+def _adopt_first_chapter_runtime(
+    runtime: RuleRuntime,
+    toc_variables: dict[str, str],
+    item_runtime: RuleRuntime,
+    chapter_url: str,
+    title: str,
+    item_index: int,
+    item_count: int,
+) -> None:
+    """The first sampled chapter becomes the runtime the content stage copies (chapter binding + chapter-stage variables)."""
+    runtime.chapter_url = chapter_url
+    runtime.chapter_title = title
+    runtime.chapter_tag = item_runtime.chapter_tag
+    runtime.chapter_is_volume = item_runtime.chapter_is_volume
+    runtime.chapter_is_vip = item_runtime.chapter_is_vip
+    runtime.chapter_is_pay = item_runtime.chapter_is_pay
+    runtime.chapter_index = item_index
+    runtime.chapter_count = item_count
+    runtime.chapter_variable = item_runtime.chapter_variable
+    runtime.chapter_active = True
+    if app_profiles.current_app_profile().chapter_put_reaches_content:
+        # R157 (tocContent B image.baidu, js G3 goway): Legado AnalyzeRule.put (:740-749) writes `@put` / java.put into the
+        # chapter (BookChapter.putVariable) while a TOC item is evaluated and BookContent reads it back with `@get` /
+        # java.get. The variables this item wrote (delta vs the toc-page runtime) go to the content-stage runtime; the
+        # synthetic `__chapter.*` binding keys are set above and stay out of it. App 1.1.2: RuleEvaluator `.putVariable`
+        # also calls setChapterVariable while a chapter is bound.
+        baseline = toc_variables
+        delta = {
+            key: value
+            for key, value in (item_runtime.variables or {}).items()
+            if not str(key).startswith("__chapter.") and baseline.get(key) != value
+        }
+        if delta:
+            runtime.variables = {**(runtime.variables or {}), **delta}
+
+
 def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, chapter_url: str, chapter_title: str, book_name: str) -> tuple[bool, str, int]:
     begin_network_stage()
     # R155 (B): the content request URL expands any leftover `@get:{key}` (BookSourceEngine.swift:5397 / :8149).
@@ -17106,13 +17944,13 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
     did_resolve_content_title = False
     used_source_regex_resource = False
     seed_runtime_variables_from_url(runtime2, chapter_url)
-    first_abs_url, first_options = resolve_url_with_options(chapter_url, runtime2.base_url)
+    first_abs_url, first_options = resolve_url_with_options(chapter_url, runtime2.base_url, runtime2.headers or {})
     if not first_abs_url:
         first_abs_url = urljoin(runtime2.base_url, chapter_url)
 
     while pending_urls and page_count < 12:
         current_url, should_follow_next = pending_urls.pop(0)
-        abs_url, request_options = resolve_url_with_options(current_url, runtime2.base_url)
+        abs_url, request_options = resolve_url_with_options(current_url, runtime2.base_url, runtime2.headers or {})
         if not abs_url:
             continue
         request_url = request_url_preserving_typed_data_options(abs_url, request_options)
@@ -17375,6 +18213,15 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         merged = apply_legado_content_replace_indent(merged).strip("\r\n")
     if is_likely_access_gated_content_preview(merged):
         return False, merged, page_count
+    if (
+        not merged
+        and runtime.chapter_is_volume
+        and not content_rule_blank
+        and app_profiles.current_app_profile().validation_content_sample_skips_volumes
+    ):
+        # R157 (sfacg, 1.1.2): Legado BookContent.kt:149 throws ContentEmptyException only for a chapter that is NOT a volume, so a
+        # volume sample (CheckSourceService.kt:211-215 keeps volumes whose URL is real) with an empty body still passes.
+        return True, merged, page_count
     # R156 (tocContent C): Legado BookContent.kt:149 only rejects a blank content and the App's validation accepts any
     # non-empty trimmed text (`BookSourceValidator` content stage), so a non-blank result of a NON-EMPTY content rule is a
     # usable chapter; the stricter `is_usable_chapter_text` heuristics stay for rule-less content. `_run_content_stage`
@@ -17667,7 +18514,7 @@ def _quick_scan_single_source(
         detail["failureReason"] = app_profiles.APP_IMPORT_REJECTED_REASON
         detail["error"] = decode_error
         return False, None, detail
-    if source_requires_interactive_verification(src):
+    if not app_profiles.current_app_profile().interaction_runtime_verdict_only and source_requires_interactive_verification(src):
         detail["failureReason"] = "interactive verification required"
         detail["error"] = "source requires getVerificationCode/startBrowserAwait/openUrl user input"
         detail["staticInteractionKinds"] = app_profiles.static_interaction_kinds(original)
@@ -17679,7 +18526,7 @@ def _quick_scan_single_source(
     search_rule = src.get("ruleSearch") if isinstance(src.get("ruleSearch"), dict) else {}
     explore_rule = src.get("ruleExplore") if isinstance(src.get("ruleExplore"), dict) else {}
     has_search = bool(str(src.get("searchUrl") or "").strip()) and bool(str(search_rule.get("bookList") or "").strip())
-    has_explore = bool(str(src.get("exploreUrl") or "").strip()) and bool(str(explore_rule.get("bookList") or "").strip())
+    has_explore = bool(str(src.get("exploreUrl") or "").strip()) and has_effective_explore_book_list(src)
     if not has_search and not has_explore:
         detail["failureReason"] = "missing search/explore rule"
         return False, None, detail
@@ -17918,6 +18765,9 @@ def _run_explore_candidate_chain(
     info["detailBookName"] = name
     normalized_toc_url = (toc_url or "").strip()
     ex_runtime.book_name = name
+    if not (ex_runtime.book_author or "").strip():
+        # R157 (tocContent E): Legado BookInfo.kt:76-78 keeps the search / explore author unless the detail author is non-empty.
+        ex_runtime.book_author = (ex_runtime.validation_book_author or "").strip()
     ex_runtime.book_url = book_url
     toc_ok, _toc_final_url, chapter_url, chapter_title, _pages, _first_page, _unique = _run_toc_stage(
         session, src, ex_runtime, detail, book_url, normalized_toc_url, stage="explore toc", label=EXPLORE_CANDIDATE_LABEL
@@ -17998,7 +18848,7 @@ def _validate_single_source(
         detail["failureReason"] = app_profiles.APP_IMPORT_REJECTED_REASON
         detail["error"] = decode_error
         return ValidationOutcome(False, reason=app_profiles.APP_IMPORT_REJECTED_REASON), None, detail
-    if source_requires_interactive_verification(src):
+    if not app_profiles.current_app_profile().interaction_runtime_verdict_only and source_requires_interactive_verification(src):
         detail["failureReason"] = "interactive verification required"
         detail["error"] = "source requires getVerificationCode/startBrowserAwait/openUrl user input"
         detail["staticInteractionKinds"] = app_profiles.static_interaction_kinds(original)
@@ -18012,7 +18862,7 @@ def _validate_single_source(
         detail["failureReason"] = "invalid base url"
         return ValidationOutcome(False, reason="invalid base url"), None, detail
     has_search = bool(str(src.get("searchUrl") or "").strip()) and isinstance(src.get("ruleSearch"), dict) and bool(str((src.get("ruleSearch") or {}).get("bookList") or "").strip())
-    has_explore = bool(str(src.get("exploreUrl") or "").strip()) and isinstance(src.get("ruleExplore"), dict) and bool(str((src.get("ruleExplore") or {}).get("bookList") or "").strip())
+    has_explore = bool(str(src.get("exploreUrl") or "").strip()) and has_effective_explore_book_list(src)
     if not has_search and not has_explore:
         detail["failureReason"] = "missing search/explore rule"
         return ValidationOutcome(False, reason="missing search/explore rule"), None, detail
@@ -18107,6 +18957,9 @@ def _validate_single_source(
         detail["detailBookAuthor"] = (runtime.book_author or runtime.validation_book_author or "").strip()
         detail["detailTocUrl"] = normalized_toc_url
         runtime.book_name = name
+        if not (runtime.book_author or "").strip():
+            # R157 (tocContent E mowan): Legado BookInfo.kt:76-78 keeps the search author unless the detail author is non-empty.
+            runtime.book_author = (runtime.validation_book_author or "").strip()
         runtime.book_url = first_book_url
         if is_download_only_file_source(src):
             detail["failureReason"] = "download-only source"

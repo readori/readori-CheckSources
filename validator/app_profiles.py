@@ -92,6 +92,47 @@ class AppProfile:
     # H: when the request of the "all chapters" jump page fails (HTTP / transport error) the first page's chapters, backed up before
     #    the jump, are restored (BookSourceEngine getChapterList catch block); 1.1.1 leaves the cleared list and the TOC fails.
     all_chapters_jump_failure_restores: bool = False
+    # A10 (R157 E1, mirrors the Swift engine package): rule-engine parity gaps closed in 1.1.2 only.
+    # H: every search / explore item field evaluated before bookUrl (kind, wordCount, lastChapter, intro, coverUrl) is visible to
+    #    the bookUrl rule as `book.*` (Legado BookList.kt:220-281 sets each field on the SearchBook first).
+    search_item_fields_visible_to_book_url: bool = False
+    # B: a chapter-list `@put` / `java.put` is stored on the chapter and reaches the content stage (Legado AnalyzeRule.put
+    #    :740-749 writes BookChapter.variable; BookContent reads it back).
+    chapter_put_reaches_content: bool = False
+    # J: a chapterUrl rule with a JS segment that returns "" does not fall back to the literal template (that injected the
+    #    script source as the URL); the chapter URL stays empty -> BookChapterList.kt:230-241.
+    js_chapter_url_empty_no_literal_fallback: bool = False
+    # G1: the JS Jsoup shim has Element.hasClass / first / last / parents / contains and the `org.jsoup` /
+    #     `Packages.org.jsoup` aliases (Rhino exposes the whole Java package tree).
+    jsoup_shim_extras: bool = False
+    # G4: list helpers (`toArray`, `size`, `get`...) are not enumerable, so `for (i in list)` only sees the indices
+    #     (Rhino NativeJavaList).
+    js_list_helpers_non_enumerable: bool = False
+    # G4: `java.getElements` in JSON mode returns the matched objects (Legado AnalyzeRule.getElements), not strings.
+    js_get_elements_json_objects: bool = False
+    # G5: a `##regex##replacement` suffix on an `@js:` / `<js>` rule is cut off and applied to the script result
+    #     (Legado AnalyzeRule.SourceRule.init :545-620 cuts it for every mode).
+    js_rule_replace_suffix: bool = False
+    # 7: the validation content sample skips volume chapters and accepts an empty volume body (CheckSourceService.kt:211-215,
+    #    BookContent.kt:149).
+    validation_content_sample_skips_volumes: bool = False
+    # I (R157 tocContent): no static "needs interaction" pre-verdict from rule text. The App decides at run time: the bulk
+    #   validation suppresses the interaction (BookSourceInteractionContext.allowsUserInteraction == false), records it, and the
+    #   verdict becomes needsInteraction only when the executed path actually hit it (applySuppressedInteraction). A script that
+    #   merely mentions getVerificationCode / startBrowserAwait on a branch that is not taken (danmeirouwen, lenglengbb) passes.
+    interaction_runtime_verdict_only: bool = False
+    # R157 REV: the validation content sample dedups the first 16 chapters by URL BEFORE the volume filter (App
+    #   BookSourceValidator.keepLastChapterPerURL == Legado BookChapterList.kt:119-128: keep only the LAST chapter per url, reversed
+    #   toc keeps the first), then takes the first remaining chapter. 1.1.1 App takes chapters.first without dedup (a baseUrl
+    #   placeholder row, BookChapterList.kt:230-241, is then the sample).
+    content_sample_dedups_by_url: bool = False
+    # R157 REV: a trailing JS segment of a list rule (`selector<js>..</js>`, `<js>..</js>selector`) runs ONCE on the whole previous
+    #   list / string like Legado AnalyzeRule.getElements. 1.1.1 App: RuleType `.combine` evaluates every segment per item of the
+    #   previous segment (`result` = the item string).
+    list_rule_js_tail_whole_list: bool = False
+    # R157 REV: `java.getString(rule, bool)` honours the second argument as the unescape flag (AnalyzeRule.kt:256). 1.1.1 App
+    #   ignores it and always unescapes.
+    get_string_unescape_flag: bool = False
 
 
 APP_PROFILES: dict[str, AppProfile] = {
@@ -105,6 +146,12 @@ APP_PROFILES: dict[str, AppProfile] = {
         empty_chapter_url_rule_uses_base_url=True, js_strip_format_chars=True,
         http_error_body_to_rules=True, page_segment_in_post_body=True,
         all_chapters_jump_failure_restores=True,
+        search_item_fields_visible_to_book_url=True, chapter_put_reaches_content=True,
+        js_chapter_url_empty_no_literal_fallback=True, jsoup_shim_extras=True,
+        js_list_helpers_non_enumerable=True, js_get_elements_json_objects=True,
+        js_rule_replace_suffix=True, validation_content_sample_skips_volumes=True,
+        interaction_runtime_verdict_only=True, content_sample_dedups_by_url=True,
+        list_rule_js_tail_whole_list=True, get_string_unescape_flag=True,
     ),
 }
 

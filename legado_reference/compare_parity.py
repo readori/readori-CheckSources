@@ -54,7 +54,13 @@ FLAKY_READORI_CLASSES = ("timeout", "network", "missing")
 #                       (user decision: Readori keeps certificate validation).
 #   disabled          - the source has enabled=false; Legado CheckSource ignores the flag, the validator does not check
 #                       disabled sources.
-EXCLUDED_READORI_CLASSES = ("legadoInsecureTls", "disabled")
+# R157 (user decision 2026-10-20): ``unsupportedSourceType`` - `file`-type sources (bookSourceType 3, labelled "download-only source" by the
+#                       validator) and sources with an empty content rule ("content rule empty": the App would show the chapter
+#                       URL itself) are not supported for now. They stay in the work list as their own rows and are counted
+#                       separately, like legadoInsecureTls.
+EXCLUDED_READORI_CLASSES = ("legadoInsecureTls", "disabled", "unsupportedSourceType")
+# Validator failureReason labels of the unsupported source shapes (compared case-insensitively, whitespace-trimmed).
+UNSUPPORTED_SOURCE_REASONS = ("content rule empty", "download-only source")
 SKIPPED_PREFIX = "skipped:"
 SKIP_REASON_LIMIT = "validator-limit"
 SKIP_REASON_NOT_VALIDATED = "not-validated"
@@ -143,9 +149,21 @@ def _index_results(results: list[Any], normalize) -> dict[str, dict[str, Any]]:
 # ------------------------------------------------------------ classification
 
 
+def _is_unsupported_source_type(entry: dict[str, Any], reason: str) -> bool:
+    """`file`-type source (bookSourceType 3) or an empty content rule; matched by the validator's failure label (the report
+    entry carries no source type) and, when a report does carry ``bookSourceType``, by the type itself."""
+    if reason.strip().lower() in UNSUPPORTED_SOURCE_REASONS:
+        return True
+    try:
+        return int(entry.get("bookSourceType")) == 3
+    except (TypeError, ValueError):
+        return False
+
+
 def classify_readori_failure(entry: dict[str, Any] | None) -> str:
     """``pass`` | ``timeout`` | ``network`` | ``needsInteraction`` | ``rule`` | ``missing`` | ``disabled`` |
-    ``legadoInsecureTls`` (the last two are excluded from the headline rate, see ``EXCLUDED_READORI_CLASSES``)."""
+    ``legadoInsecureTls`` | ``unsupportedSourceType`` (the last three are excluded from the headline rate, see
+    ``EXCLUDED_READORI_CLASSES``)."""
     if entry is None:
         return "missing"
     if entry.get("ok"):
@@ -160,6 +178,8 @@ def classify_readori_failure(entry: dict[str, Any] | None) -> str:
         return "legadoInsecureTls"
     if reason.lower().replace(" ", "") == "networkerror:tls":
         return "legadoInsecureTls"
+    if _is_unsupported_source_type(entry, reason):
+        return "unsupportedSourceType"
     if verdict == "timeout" or _TIMEOUT_PATTERN.search(reason) or _TIMEOUT_PATTERN.search(error):
         return "timeout"
     if verdict in ("needsinteraction", "needs_interaction"):
@@ -430,7 +450,7 @@ def compare(
         return round(numerator / denominator, 6) if denominator else None
 
     # Headline: vacuous Legado passes (nothing was checked) are not evidence of a working source, and the R156
-    # deliberate-difference classes (insecure TLS, disabled sources) are left out of both sides.
+    # deliberate-difference classes (insecure TLS, disabled sources, unsupported source types) are left out of both sides.
     headline_denominator = legado_pass_non_vacuous - excluded_non_vacuous
     relative = ratio(both_non_vacuous, headline_denominator)
     relative_incl_vacuous = ratio(both, legado_pass_count - excluded_total)
@@ -442,6 +462,7 @@ def compare(
         "missing": 4,
         "legadoInsecureTls": 5,
         "disabled": 6,
+        "unsupportedSourceType": 7,
     }
     legado_only.sort(key=lambda item: (work_order.get(item["readoriFailureClass"], 9), item["bookSourceUrl"]))
     readori_only.sort(key=lambda item: (item["legadoFailureClass"], item["bookSourceUrl"]))
@@ -596,6 +617,10 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
             "Excluded: source disabled (Legado ignores enabled=false)",
             (counts.get("legadoOnlyExcludedClasses") or {}).get("disabled", 0),
         ),
+        (
+            "Excluded: unsupported source type (file type / empty content rule)",
+            (counts.get("legadoOnlyExcludedClasses") or {}).get("unsupportedSourceType", 0),
+        ),
         ("Relative rate if the excluded classes were counted", _percent(rates.get("relativeRateInclExcludedClasses"))),
         ("Readori verdict via the group representative", counts["readoriMapping"]["group"]),
         ("Skipped by the validator", counts["readoriSkipped"]),
@@ -620,7 +645,7 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
         lines.append("")
         lines.append(
             "`rule` and `needsInteraction` are engine gaps; `timeout`, `network` and `missing` are usually site flakiness; "
-            "`legadoInsecureTls` and `disabled` are deliberate differences and are excluded from the headline rate."
+            "`legadoInsecureTls`, `disabled` and `unsupportedSourceType` are deliberate differences and are excluded from the headline rate."
         )
         lines.append("")
 
