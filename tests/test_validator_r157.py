@@ -955,3 +955,34 @@ def test_segment_after_a_js_segment_runs_on_the_joined_outer_html_in_html_mode_o
         assert _plain(rows) == ["aa", "bb"]
         # a selector -> selector chain that never passed through JS stays per item
         assert _plain(vsp.evaluate_book_list(".b@a", html, _runtime())) == ["aa", "bb"]
+
+
+@needs_quickjs
+def test_js_returning_a_string_hands_that_raw_string_to_the_next_segment_on_1_1_2() -> None:
+    """R157b zhongyue: `<js>…ajax(…)</js>$.chapter_list` - the JS returns the JSON text of the toc, which the next segment parses as content
+    (Legado getElements: String -> content, list/array -> list)."""
+    inner = json.dumps({"chapter_list": [{"n": 1}, {"n": 2}]})
+    page = json.dumps({"data": {"link": inner}})
+    rule = "<js>JSON.parse(result).data.link</js>$.chapter_list"
+    expected = [{"n": 1}, {"n": 2}]
+    with app_profiles.app_profile_scope("1.1.2"):
+        rows = vsp.evaluate_book_list(rule, page, _runtime())
+        assert [json.loads(row) for row in rows] == expected
+        # the same through a JS tail after a first segment (`result` is the list, the JS returns a string)
+        tail = "$.data<js>JSON.parse(result.first()).link</js>$.chapter_list"
+        assert [json.loads(row) for row in vsp.evaluate_book_list(tail, page, _runtime())] == expected
+    with app_profiles.app_profile_scope("1.1.1"):
+        assert [json.loads(row) for row in vsp.evaluate_book_list(rule, page, _runtime())] == expected
+
+
+@needs_quickjs
+def test_js_returning_an_html_string_then_a_css_selector_and_array_returns_stay_lists_on_1_1_2() -> None:
+    with app_profiles.app_profile_scope("1.1.2"):
+        rows = vsp.evaluate_book_list("<js>'<ul><li>a</li><li>b</li></ul>'</js>li", "<p>x</p>", _runtime())
+        assert _plain(rows) == ["a", "b"]
+        # an array return is a list for the next segment (ndlib shape): the selector sees the list, not a string
+        body = '{"a": [{"n": 1}, {"n": 2}]}'
+        rows = vsp.evaluate_book_list("$.a<js>result.toArray()</js>$.[*]", body, _runtime())
+        assert [json.loads(row) for row in rows] == [{"n": 1}, {"n": 2}]
+        # a JS that is the last segment keeps its result
+        assert vsp.evaluate_book_list("$.a<js>'k'</js>", body, _runtime()) == ["k"]

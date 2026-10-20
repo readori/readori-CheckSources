@@ -6219,7 +6219,8 @@ function __readoriListResult(items, raws, jsonMode) {
     return arr;
 }
 // What a list-rule JS tail returned (E1 final): undefined / null / "" is an empty list, undefined / null array elements are skipped,
-// objects keep their JSON text; anything else is one item. The sentinel tells the validator "empty list".
+// objects keep their JSON text; anything else is one item. The sentinel tells the validator "empty list"; the prefix tells it
+// whether the JS returned an array (a list for the next segment) or a string (raw content for the next segment).
 function __readoriListTailFinish(out) {
     var EMPTY = '__readoriEmptyList__';
     if (out === undefined || out === null) return EMPTY;
@@ -6233,10 +6234,10 @@ function __readoriListTailFinish(out) {
             else if (typeof value === 'object') kept.push(JSON.stringify(value));
             else kept.push(String(value));
         }
-        return kept.length ? JSON.stringify(kept) : EMPTY;
+        return kept.length ? '__readoriTail:arr:' + JSON.stringify(kept) : EMPTY;
     }
     var text = String(out);
-    return text === '' ? EMPTY : text;
+    return text === '' ? EMPTY : '__readoriTail:str:' + text;
 }
 function __readoriListTailRun(code) {
     try { return (0, eval)(code); }
@@ -14406,13 +14407,35 @@ def _evaluate_book_list_js_segments(segments: list[tuple[str, bool, bool]], html
     # selector segments still run per item; a leading JS segment sees the page.
     current = [html]
     passed_js = False
+    # Legado getElements: a JS segment that returned a String hands that raw string to the next segment as its content; one that returned a
+    # list/array hands the list. `pending_string` is the former (consumed by the next segment).
+    pending_string: str | None = None
     for index, (segment_text, is_js, _at) in enumerate(segments):
         if is_js:
             code = _list_js_code(segment_text.strip())
             if index > 0 and not code.strip():
                 continue  # a blank tail script leaves the list unchanged (Swift `tailScript.isEmpty`)
+            returned_string: str | None = None
             if index == 0:
                 output = evaluate_js(code, html, runtime, extra_vars={"src": html})
+                if output.strip() and not output.strip().startswith("["):
+                    returned_string = output
+            elif pending_string is not None:
+                # the previous JS returned a string: `result` is that string, not a list
+                outer_sink = getattr(runtime, "script_error_sink", None)
+                tail_sink = []
+                runtime.script_error_sink = tail_sink
+                try:
+                    output = evaluate_js(
+                        "__readoriListTailFinish(__readoriListTailRun(" + json.dumps(code) + "))", pending_string, runtime,
+                        extra_vars={"src": html, "result": pending_string},
+                    )
+                finally:
+                    runtime.script_error_sink = outer_sink
+                    if outer_sink is not None:
+                        outer_sink.extend(tail_sink)
+                if tail_sink or output.strip() == "__readoriEmptyList__":
+                    return []
             else:
                 # Only container items (`{...}` / `[...]`) are parsed back into objects; every other item stays a string.
                 result_items: list[Any] = []
@@ -14448,13 +14471,25 @@ def _evaluate_book_list_js_segments(segments: list[tuple[str, bool, bool]], html
                         outer_sink.extend(tail_sink)
                 if tail_sink or output.strip() == "__readoriEmptyList__":
                     return []
+            if index > 0:
+                if output.startswith("__readoriTail:str:"):
+                    output = output[len("__readoriTail:str:"):]
+                    returned_string = output
+                elif output.startswith("__readoriTail:arr:"):
+                    output = output[len("__readoriTail:arr:"):]
             current = [item for item in _app_js_array(output) if item.strip()]
+            pending_string = returned_string if current else None
             passed_js = True
         elif passed_js:
             # E1 final / Legado getElements (`AnalyzeByJSonPath(result).getElements(rule)`): a segment that FOLLOWS a JS segment runs on the
             # whole current list - JSON mode on the list's JSON-array text (raw JSON for container items), HTML mode on the items'
             # outerHTML joined (Jsoup Elements semantics). Selector -> selector chains that never passed through JS stay per item.
             if not current:
+                continue
+            if pending_string is not None:
+                # the JS returned a String: the next segment parses that raw string as its content
+                content_string, pending_string = pending_string, None
+                current = evaluate_book_list(segment_text, content_string, runtime)
                 continue
             if is_json_content(html):
                 parts: list[str] = []
@@ -14472,6 +14507,7 @@ def _evaluate_book_list_js_segments(segments: list[tuple[str, bool, bool]], html
                 list_text = "\n".join(current)
             current = evaluate_book_list(segment_text, list_text, runtime)
         else:
+            pending_string = None
             produced = []
             for item in current:
                 produced.extend(evaluate_book_list(segment_text, item, runtime))
