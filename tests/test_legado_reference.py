@@ -113,6 +113,75 @@ def synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
 # ------------------------------------------------------------ compare_parity
 
 
+def test_r156_tls_and_disabled_are_own_classes_excluded_from_the_headline() -> None:
+    """R156: a Readori TLS-certificate failure and a disabled source (Legado ignores `enabled`) are deliberate
+    differences: they keep their own rows but leave the headline numerator and denominator."""
+    legado = {
+        "engine": "legado-live",
+        "results": [
+            legado_entry("http://ok.test", True),
+            legado_entry("http://gap.test", True),
+            legado_entry("http://tls.test", True),
+            legado_entry("http://tls-reason.test", True),
+            legado_entry("http://off.test", True),
+            legado_entry("http://off-vacuous.test", True, vacuous=True),
+        ],
+    }
+    readori = {
+        "summary": {"appVersion": "1.1.2"},
+        "results": [
+            readori_entry("http://ok.test", True),
+            readori_entry("http://gap.test", False),
+            readori_entry(
+                "http://tls.test",
+                False,
+                failureReason="network error: tls",
+                error="tls: certificate verify failed",
+                networkError={"category": "tls", "message": "certificate verify failed", "stage": "search"},
+            ),
+            readori_entry("http://tls-reason.test", False, failureReason="network error: tls"),
+            readori_entry("http://off.test", False, failureReason="disabled", enabled=False, appVerdict="invalid"),
+            readori_entry("http://off-vacuous.test", False, failureReason="disabled", enabled=False),
+        ],
+    }
+    parity = cp.compare(legado, readori, normalize=lambda url: (url or "").strip())
+    classes = {item["bookSourceUrl"]: item["readoriFailureClass"] for item in parity["legadoOnly"]}
+    assert classes == {
+        "http://gap.test": "rule",
+        "http://tls.test": "legadoInsecureTls",
+        "http://tls-reason.test": "legadoInsecureTls",
+        "http://off.test": "disabled",
+        "http://off-vacuous.test": "disabled",
+    }
+    counts, rates = parity["counts"], parity["rates"]
+    assert counts["legadoOnly"] == 5
+    assert counts["legadoOnlyExcluded"] == 4
+    assert counts["legadoOnlyExcludedClasses"] == {"legadoInsecureTls": 2, "disabled": 2}
+    # 1 of the 4 non-vacuous Legado passes outside the excluded classes (ok, gap) -> 1/2.
+    assert counts["legadoPassNonVacuous"] == 5
+    assert counts["legadoPassHeadlineDenominator"] == 2
+    assert rates["relativeRate"] == 0.5
+    assert rates["relativeRateInclExcludedClasses"] == round(1 / 5, 6)
+    # The work list orders engine gaps first, deliberate differences last.
+    assert [item["readoriFailureClass"] for item in parity["legadoOnly"]][0] == "rule"
+    assert {item["readoriFailureClass"] for item in parity["legadoOnly"][-4:]} == {"legadoInsecureTls", "disabled"}
+    markdown = cp.render_markdown(parity)
+    assert "| legadoInsecureTls | 2 |" in markdown
+    assert "| disabled | 2 |" in markdown
+    assert "Excluded: Readori TLS certificate failure" in markdown
+    assert "Excluded: source disabled" in markdown
+
+
+def test_r156_other_network_errors_stay_network_class() -> None:
+    assert cp.classify_readori_failure(
+        readori_entry("http://x.test", False, failureReason="network error: dns", networkError={"category": "dns"})
+    ) == "network"
+    assert cp.classify_readori_failure(readori_entry("http://x.test", False)) == "rule"
+    assert cp.classify_readori_failure(readori_entry("http://x.test", False, failureReason="disabled")) == "disabled"
+
+
+
+
 def test_compare_counts_and_rates() -> None:
     legado, readori = synthetic_documents()
     parity = cp.compare(legado, readori, normalize=lambda url: (url or "").strip())

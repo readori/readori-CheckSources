@@ -281,7 +281,9 @@ def test_task3_r139_broken_variants_fail_and_the_working_one_is_kept(site: Simpl
     assert [item["bookSourceName"] for item in kept] == [site.sources["good"]["bookSourceName"]]
 
 
-def test_task3_both_legitimate_but_unequal_variants_keep_the_fuller_one(site: SimpleNamespace) -> None:
+def test_task3_both_legitimate_but_unequal_variants_keep_the_fuller_one(site: SimpleNamespace, monkeypatch) -> None:
+    # R156: the batch TOC stage is capped at the App's first-page window; the variant comparison needs the whole walk.
+    monkeypatch.setattr(vsp, "FULL_TOC_WALK", True)
     full, full_detail = _validated(site.sources["good"])
     no_next = copy.deepcopy(site.sources["no_next_toc"])  # walks only the first TOC page: 3 of 5 chapters
     stub = copy.deepcopy(site.sources["good"])

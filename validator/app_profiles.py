@@ -66,6 +66,32 @@ class AppProfile:
     detail_error_json_requires_empty_info: bool = False
     # A8 (R155b): the toc JSON fallback for `isVolume` no longer reads the key `volume` (a volume NUMBER in many APIs).
     toc_volume_key_excluded: bool = False
+    # A9 (R156 E1, mirrors the Swift engine package): rule-engine parity gaps closed in 1.1.2 only.
+    # A: the `.txt` bookUrl single-chapter shortcut applies only when the toc chapterList rule is empty
+    #    (BookSourceEngine.swift getChapterList; Legado BookChapterList always evaluates ruleToc).
+    txt_shortcut_only_without_toc_rule: bool = False
+    # D: a JSON / CSS segment that matches nothing still runs the following JS segments with an empty input
+    #    (Legado AnalyzeRule.getString / getStringList loop only `continue`s on a null result).
+    json_miss_runs_following_js: bool = False
+    # J: search / explore list item fields are evaluated in Legado BookList.getSearchItem order
+    #    (name, author, kind, wordCount, lastChapter, intro, coverUrl, bookUrl last, BookList.kt:220-281).
+    list_item_legado_field_order: bool = False
+    # G: `java.getElement` returns the whole element list outside JSON mode (Legado AnalyzeRule.getElement).
+    get_element_returns_list: bool = False
+    # E: an empty chapterUrl rule makes the chapter URL the toc page URL (Legado BookChapterList.kt:230-241).
+    empty_chapter_url_rule_uses_base_url: bool = False
+    # U: Unicode format characters (Cf, e.g. U+200B) in source JS are ignored outside string literals (Rhino lexer).
+    js_strip_format_chars: bool = False
+    # G2: the body of a non-2xx response reaches the rules (Legado AnalyzeUrl never checks the status):
+    #     search / explore 404 and 410, and any non-2xx for a pure-JS rule; 403 / 429 / 5xx / Cloudflare stay errors.
+    http_error_body_to_rules: bool = False
+    # Q: a `<first,other>` page segment inside the POST body of a search / explore URL option is chosen by page too
+    #    (Legado AnalyzeUrl.replaceKeyPageJs covers the whole `url,{options}`); only comma segments, so XML body tags
+    #    such as `<search>` survive (BookSourceEngine.swift buildUrlWithOptions applyLegadoPageSegments(requiresComma:)).
+    page_segment_in_post_body: bool = False
+    # H: when the request of the "all chapters" jump page fails (HTTP / transport error) the first page's chapters, backed up before
+    #    the jump, are restored (BookSourceEngine getChapterList catch block); 1.1.1 leaves the cleared list and the TOC fails.
+    all_chapters_jump_failure_restores: bool = False
 
 
 APP_PROFILES: dict[str, AppProfile] = {
@@ -74,6 +100,11 @@ APP_PROFILES: dict[str, AppProfile] = {
         "1.1.2", False, "gson-text", "on-demand-builtin", "needsInteraction",
         list_put_on_whole_content=True, json_leading_dot_deep_scan=True,
         detail_error_json_requires_empty_info=True, toc_volume_key_excluded=True,
+        txt_shortcut_only_without_toc_rule=True, json_miss_runs_following_js=True,
+        list_item_legado_field_order=True, get_element_returns_list=True,
+        empty_chapter_url_rule_uses_base_url=True, js_strip_format_chars=True,
+        http_error_body_to_rules=True, page_segment_in_post_body=True,
+        all_chapters_jump_failure_restores=True,
     ),
 }
 

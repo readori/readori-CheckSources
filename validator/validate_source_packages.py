@@ -12,6 +12,8 @@ import argparse
 import ast
 import atexit
 import base64
+import contextlib
+import contextvars
 import copy
 import hashlib
 import http.cookiejar
@@ -309,16 +311,28 @@ def make_quickjs_context():
     return ctx
 
 
+_NODE_BINARY_CACHE: dict[str, str] = {}
+
+
 def node_binary_path() -> str:
+    # R156 (network T): the lookup (Path.is_file x3 + shutil.which) ran once per JS evaluation; the answer only
+    # depends on the READORI_NODE_BIN override, so it is cached per override value.
+    override = os.environ.get("READORI_NODE_BIN", "")
+    cached = _NODE_BINARY_CACHE.get(override)
+    if cached is not None:
+        return cached
     candidates = [
-        os.environ.get("READORI_NODE_BIN", ""),
+        override,
         str(Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "node" / "bin" / "node.exe"),
         shutil.which("node") or "",
     ]
+    found = ""
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
-            return candidate
-    return ""
+            found = candidate
+            break
+    _NODE_BINARY_CACHE[override] = found
+    return found
 
 
 @dataclass
@@ -1041,6 +1055,11 @@ def source_rule_fingerprint(source: dict[str, Any]) -> str:
     }
     if url_options:
         payload["bookSourceUrlOptions"] = _stable_rule_value(url_options)
+    if not source.get("enabled", True):
+        # R156 (dedupe): a disabled source is not checked (`failureReason: disabled`), so it must never become the group
+        # representative of enabled copies with the same rules (or the other way round). Enabled sources keep their
+        # historical fingerprint (the key is only added for a disabled source; same predicate as the full validation).
+        payload["enabled"] = False
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -1904,6 +1923,9 @@ def _resolve_js_template_expressions(
             ctx.set("pageSize", 20)
             ctx.set("baseUrl", runtime.base_url)
             ctx.set("sourceUrl", runtime.source_url)
+            # R156 (searchjs R): `_build_java_api_js` references `bookSourceUrl`; unbound it raised a ReferenceError that the
+            # blanket `except` below swallowed, so every expression fell through to the slow path.
+            ctx.set("bookSourceUrl", runtime.book_source_url)
             ctx.set("result", input_text)
             ctx.set("src", input_text)
             ctx.set("input", input_text)
@@ -1929,6 +1951,12 @@ def _resolve_js_template_expressions(
         finally:
             if fast_ctx is not None:
                 drain_quickjs_interactions(fast_ctx, runtime)
+        # R156 (searchjs R): Legado AnalyzeUrl.kt:185-193 replaces `{{js}}` with the script result even when it is the empty string
+        # (`index{{page - 1 == 0 ? '' : '_' + page}}.html` on page 1). An empty result counts only when the script raised no
+        # error; the stage sink is swapped for a local one to tell the two apart and its entries are forwarded afterwards.
+        outer_sink = getattr(runtime, "script_error_sink", None)
+        local_sink: list = []
+        runtime.script_error_sink = local_sink
         try:
             result = evaluate_js(
                 inner,
@@ -1944,10 +1972,15 @@ def _resolve_js_template_expressions(
                     "pagePlus1": page + 1,
                 },
             )
-            if result and result != inner:
+            if outer_sink is not None:
+                outer_sink.extend(local_sink)
+            if result != inner and (result or (result == "" and not local_sink)):
                 return result
         except Exception:
-            pass
+            if outer_sink is not None:
+                outer_sink.extend(local_sink)
+        finally:
+            runtime.script_error_sink = outer_sink
         return match.group(0)
 
     # R150 (B11): RuleType.evalPattern `\{\{[\w\W]*?\}\}` (RuleType.swift:413-416, RuleParser.templateParts): the inner text
@@ -2017,7 +2050,12 @@ def resolve_template(
     for key, value in replacements.items():
         if rule_template and not key.startswith("{{"):
             continue
-        out = out.replace(key, value)
+        if "${" in out and not key.startswith("{{"):
+            # R156 (searchjs Q): `${page}` / `${key}` is a JS template literal placeholder, not a legacy `{page}` token (the App
+            # has no single-brace replacement; `$1` left the POST body of "笔趣小说" with `page=$1`).
+            out = re.sub(r"(?<!\$)" + re.escape(key), lambda _match, _value=value: _value, out)
+        else:
+            out = out.replace(key, value)
     for key, value in (runtime.variables or {}).items():
         replacement = str(value).lower() if isinstance(value, bool) else str(value)
         out = out.replace(f"{{{{{key}}}}}", replacement)
@@ -2467,11 +2505,17 @@ def apply_page_expression_templates(raw: str, page: int) -> str:
     return pattern.sub(repl, raw)
 
 
-def apply_legado_page_segments(raw: str, page: int) -> str:
+def apply_legado_page_segments(raw: str, page: int, requires_comma: bool = False) -> str:
     if not raw or "<" not in raw or ">" not in raw:
         return raw
 
     def repl(match: re.Match[str]) -> str:
+        if requires_comma:
+            # POST body (App applyLegadoPageSegments, requiresComma): only obvious page segments; `</x>`, `<?xml ...?>`, `<!-- -->`
+            # and start tags with attributes (`<root a="x,y">`) are XML.
+            body = match.group(1)
+            if "," not in body or body[:1] in ("/", "?", "!") or re.match(r"[A-Za-z][\w:.-]*\s", body):
+                return match.group(0)
         segments = match.group(1).split(",")
         if not segments:
             return match.group(0)
@@ -4438,6 +4482,12 @@ var java = {
         var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
         var rows = _readoriJsoupRowsByLegadoRule(sourceHtml, String(selector || ''));
         if (rows === null) rows = _readoriJsoupRows(sourceHtml, String(selector || ''));
+        // R156 (tocContent G, App profile 1.1.2): Legado AnalyzeRule.getElement (:332-358) returns the whole Elements list in
+        // Default / XPath mode; only Json mode answers a single object.
+        if (typeof __readoriGetElementReturnsList !== 'undefined' && __readoriGetElementReturnsList
+            && !/^\s*(\$[.\[]|@json:)/i.test(String(selector || '')) && !/^\s*[\[{]/.test(sourceHtml)) {
+            return _readoriJsoupElements(rows, null);
+        }
         return rows.length ? _readoriJsoupElement(rows[0], null) : _readoriJsoupElement({}, null);
     },
     getElements: function(selector, html) {
@@ -6550,6 +6600,7 @@ function __readoriAppNatives() {
   // R143 (S1 = A): blocked interactions are reported back to Python in the result JSON.
   const suppressedInteractions = [];
   context.__readoriAllowsUserInteraction = data.allowsUserInteraction !== false;
+  context.__readoriGetElementReturnsList = data.getElementReturnsList === true;
   context.__readoriRecordSuppressedInteraction = function(kind) {
     const name = String(kind);
     if (!suppressedInteractions.includes(name)) suppressedInteractions.push(name);
@@ -6767,6 +6818,7 @@ def install_quickjs_app_globals(ctx: Any, runtime: RuleRuntime) -> None:
         pass
     try:
         ctx.set("__readoriAllowsUserInteraction", bool(getattr(runtime, "allows_user_interaction", True)))
+        ctx.set("__readoriGetElementReturnsList", bool(app_profiles.current_app_profile().get_element_returns_list))
     except Exception:
         pass
 
@@ -6995,9 +7047,10 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         "headers": runtime.headers,
         "variables": runtime.variables or {},
         "extraVars": extra_vars,
-        "jsLib": runtime.js_lib or "",
+        "jsLib": _js_lib_for_engine(runtime),
         "javaApi": _build_java_api_js(runtime),
         "allowsUserInteraction": bool(getattr(runtime, "allows_user_interaction", True)),
+        "getElementReturnsList": bool(app_profiles.current_app_profile().get_element_returns_list),
         "appJs": app_js_plan,
         "appJsSources": app_cryptojs_sources(app_js_plan),
         "percentEncodeMap": build_percent_encode_map(
@@ -7713,10 +7766,118 @@ def evaluate_js_string_list(rule: str, html: str, runtime: RuleRuntime) -> list[
     return values
 
 
+_JS_REGEX_LITERAL_PREFIXES = frozenset("(,=:[!&|?{};+-*%<>~^")
+
+
+def _is_js_format_character(char: str) -> bool:
+    return ord(char) > 127 and char != "\ufeff" and unicodedata.category(char) == "Cf"
+
+
+def _js_lib_for_engine(runtime: "RuleRuntime") -> str:
+    """The shared jsLib as the engine evaluates it: App 1.1.2 strips Unicode format characters from it like from every script
+    (`JSEngine` bootstrap `strippingJSFormatCharactersOutsideStrings`)."""
+    lib = runtime.js_lib or ""
+    if lib and app_profiles.current_app_profile().js_strip_format_chars:
+        return strip_js_format_characters_outside_strings(lib)
+    return lib
+
+
+def strip_js_format_characters_outside_strings(code: str) -> str:
+    """R156 (U+200B, App profile 1.1.2): Rhino (Legado, TokenStream.getChar(skipFormattingChars = true)) skips Unicode format
+    characters (Cf: U+200B, U+200C, U+200D, U+2060, ...) everywhere outside string / template text, so a script such as
+    `source.getSource()` copied with a zero-width space (U+200B) in the name runs in Legado, while QuickJS / JavaScriptCore reject it.
+    Mirrors `JSEngine.strippingJSFormatCharactersOutsideStrings`: strings, templates, comments and regex literals are copied
+    untouched; U+FEFF stays (it is whitespace to the lexer)."""
+    if not any(_is_js_format_character(char) for char in code):
+        return code
+    out: list[str] = []
+    index = 0
+    length = len(code)
+    previous_significant = ""
+
+    def copy_quoted(quote: str) -> None:
+        nonlocal index
+        out.append(code[index])
+        index += 1
+        while index < length:
+            current = code[index]
+            out.append(current)
+            index += 1
+            if current == "\\" and index < length:
+                out.append(code[index])
+                index += 1
+                continue
+            if current == quote:
+                break
+            if current == "\n" and quote != "`":
+                break
+
+    def copy_regex_literal() -> None:
+        nonlocal index
+        out.append(code[index])
+        index += 1
+        in_class = False
+        while index < length:
+            current = code[index]
+            out.append(current)
+            index += 1
+            if current == "\\" and index < length:
+                out.append(code[index])
+                index += 1
+                continue
+            if current == "\n":
+                break
+            if current == "[":
+                in_class = True
+            elif current == "]":
+                in_class = False
+            if current == "/" and not in_class:
+                break
+
+    while index < length:
+        char = code[index]
+        if _is_js_format_character(char):
+            index += 1
+            continue
+        following = code[index + 1] if index + 1 < length else ""
+        if char == "/" and following == "/":
+            while index < length:
+                current = code[index]
+                out.append(current)
+                index += 1
+                if current == "\n":
+                    break
+        elif char == "/" and following == "*":
+            out.append("/*")
+            index += 2
+            while index < length:
+                current = code[index]
+                out.append(current)
+                index += 1
+                if current == "*" and index < length and code[index] == "/":
+                    out.append("/")
+                    index += 1
+                    break
+        elif char in "\"'`":
+            copy_quoted(char)
+            previous_significant = char
+        elif char == "/" and (not previous_significant or previous_significant in _JS_REGEX_LITERAL_PREFIXES):
+            copy_regex_literal()
+            previous_significant = "/"
+        else:
+            out.append(char)
+            index += 1
+            if not char.isspace():
+                previous_significant = char
+    return "".join(out)
+
+
 def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: dict[str, Any] | None = None) -> str:
     code = script.strip()
     if not code:
         return ""
+    if app_profiles.current_app_profile().js_strip_format_chars:
+        code = strip_js_format_characters_outside_strings(code)
     code = repair_glued_var_declarations(code)
     extra_vars = dict(extra_vars or {})
     inject_rar_script_fixtures(code, runtime, extra_vars)
@@ -7763,7 +7924,10 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
             extra_vars["__readoriResponseFixtures"] = fixtures
     if js_requires_node_crypto(code) and node_binary_path():
         return evaluate_js_with_node(code, input_text, runtime, extra_vars=extra_vars)
-    return _evaluate_js_quickjs(code, input_text, runtime, extra_vars, json_obj)
+    # R156 (searchjs J): `result` is an object only when the WHOLE input is JSON (Legado String.isJson()). A JSONP body
+    # (`search({...})`) stays the string it is, so `eval(result)` evaluates the callback (the node path already does this).
+    result_object = json_obj if is_legado_json_text(input_text or "") else None
+    return _evaluate_js_quickjs(code, input_text, runtime, extra_vars, result_object)
 
 
 # python-quickjs refuses callbacks into Python while a time limit is set ("Can not call into Python with a time limit
@@ -8261,7 +8425,7 @@ def _evaluate_js_quickjs_attempt(
         # 注入 jsLib（书源共享 JS 库）
         if runtime.js_lib:
             try:
-                ctx.eval(runtime.js_lib)
+                ctx.eval(_js_lib_for_engine(runtime))
             except Exception:
                 pass
         install_quickjs_app_cryptojs(ctx, app_js_plan, "code")
@@ -8466,11 +8630,27 @@ def parse_url_options(raw: str) -> tuple[str, dict[str, Any]]:
     return url_part, normalize_url_options(opts)
 
 
+def _lenient_header_pairs(text: str) -> dict[str, Any]:
+    """R156 (searchjs T): a `headers` option given as a loose string (`{Content-Type: application/x-www-form-urlencoded}`,
+    unquoted keys and values) read as `Key: value` pairs; anything unreadable is an empty header set - never an exception."""
+    inner = (text or "").strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    pairs: dict[str, Any] = {}
+    for chunk in re.split(r",\s*(?=[\"']?[\w-]+[\"']?\s*:)|\n", inner):
+        parsed = parse_header_line(chunk)
+        if parsed:
+            pairs[parsed[0]] = parsed[1]
+    return pairs
+
+
 def normalize_url_options(opts: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(opts)
     headers = normalized.get("headers")
     if isinstance(headers, str):
         headers = parse_json_dict(headers)
+        if headers is None:
+            headers = _lenient_header_pairs(str(normalized.get("headers") or ""))
     if isinstance(headers, dict):
         normalized_headers: dict[str, str] = {}
         for key, value in headers.items():
@@ -9229,7 +9409,12 @@ def build_url_with_options(template: str, keyword: str, page: int, runtime: Rule
 
 
 def _build_url_with_options(template: str, keyword: str, page: int, runtime: RuleRuntime, session: requests.Session | None = None) -> tuple[str, dict[str, Any]]:
-    pre_resolved = resolve_template(template, runtime, page=page)
+    # R156 (network): a plain URL template binds the keyword already in this first pass, so a `{{js}}` expression that uses
+    # `key` (`data:;base64,{{java.base64Encode("/search?keyword="+key)}}`) sees it. Script URLs get it through `js_vars`.
+    if template.lstrip().lower().startswith(("@js:", "<js>")):
+        pre_resolved = resolve_template(template, runtime, page=page)
+    else:
+        pre_resolved = resolve_template(template, runtime, keyword=keyword, page=page, raw_keyword=keyword)
     raw = normalize_legacy_template(strip_leading_cookie_side_effect_template(pre_resolved))
     raw = apply_page_expression_templates(raw, page)
     js_vars = {
@@ -9254,6 +9439,11 @@ def _build_url_with_options(template: str, keyword: str, page: int, runtime: Rul
     # Page segments belong to the URL only. Applying them to the complete
     # `url,{options}` string strips XML body tags such as <search>/<key>.
     raw = apply_legado_page_segments(raw, page).strip()
+    if app_profiles.current_app_profile().page_segment_in_post_body and isinstance(opts.get("body"), str):
+        # R156 (searchjs Q, App profile 1.1.2): Legado AnalyzeUrl.replaceKeyPageJs (:196-208) replaces `<a,b>` in the WHOLE rule,
+        # `,{options}` included, so `<,&page=2>` in a POST body is chosen by page. Comma segments only: an XML body keeps
+        # `<search>` / `<key>` (BookSourceEngine.swift applies the same restriction).
+        opts["body"] = apply_legado_page_segments(opts["body"], page, requires_comma=True)
     option_js = opts.get("js")
     if isinstance(option_js, str) and option_js.strip():
         evaluated_url = evaluate_js(
@@ -9354,7 +9544,7 @@ def parse_explore_kinds_app(text: str, source_name: str) -> list[tuple[str, str]
         return []
     if trimmed.startswith("["):
         try:
-            array = json.loads(trimmed)
+            array = json.loads(trimmed, strict=False)  # R156: Gson is lenient - literal newlines inside strings are fine
         except Exception:
             array = None
         if isinstance(array, list) and all(isinstance(item, dict) for item in array):
@@ -9449,7 +9639,7 @@ def parse_explore_urls(text: str, source_name: str) -> list[tuple[str, str]]:
         return []
     if raw.startswith("["):
         try:
-            arr = json.loads(raw)
+            arr = json.loads(raw, strict=False)  # R156: Gson is lenient - literal newlines inside strings are fine
             if isinstance(arr, list):
                 out = []
                 for item in arr:
@@ -9472,7 +9662,7 @@ def parse_explore_urls(text: str, source_name: str) -> list[tuple[str, str]]:
     for line in split_explore_url_entries(raw):
         try:
             if line.startswith("{") and line.endswith("}"):
-                obj = json.loads(line)
+                obj = json.loads(line, strict=False)
                 if isinstance(obj, dict):
                     url = explore_object_value(obj, ["url", "href", "link", "value"])
                     if url:
@@ -9620,6 +9810,11 @@ def looks_like_css_selector(text: str) -> bool:
         "strong", "em", "b", "i", "font", "small", "figure", "figcaption",
         "center",
     ]
+    # R156 (searchjs P): `a!1@text` - Legado ElementsSingle exclusion index (AnalyzeByJSoup.kt:294-345) after a bare tag name,
+    # in the middle of an `@` chain (R155 only recognised the whole-rule form `tr!0`).
+    exclusion = re.fullmatch(r"([a-z][a-z0-9]*)![-\d:,]+", base_lower)
+    if exclusion is not None and exclusion.group(1) in html_tags:
+        return True
     return any(
         base_lower == tag or base_lower.startswith(f"{tag}.") or base_lower.startswith(f"{tag} ") or base_lower.startswith(f"{tag}>")
         for tag in html_tags
@@ -9748,12 +9943,62 @@ def normalize_selector(selector: str) -> str:
     return selector
 
 
+_JSOUP_REGEX_ATTR_RE = re.compile(r"\[\s*([A-Za-z_][-\w:.]*)\s*~=\s*([^\]]*?)\s*\]")
+
+
+def _jsoup_regex_attr_prepare(root: Any, selector: str) -> tuple[str, list[tuple[Any, str]]]:
+    """R156 (tocContent F / searchjs E): Jsoup `[attr~=regex]` is Evaluator.AttributeWithValueMatching (a regex `find` on the
+    attribute value); soupsieve's `~=` is the whitespace-separated word operator and rejects most regexes. Every element under
+    `root` (and `root` itself) whose attribute matches gets a synthetic marker attribute and the clause becomes `[marker]`.
+    Returns (selector, [(element, marker)]); the caller strips the markers with `_jsoup_regex_attr_cleanup` (try / finally)."""
+    if "~=" not in selector:
+        return selector, []
+    marked: list[tuple[Any, str]] = []
+    counter = [0]
+
+    def rewrite(match: re.Match[str]) -> str:
+        name, raw = match.group(1), match.group(2)
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        try:
+            pattern = re.compile(raw)
+        except re.error:
+            return match.group(0)
+        counter[0] += 1
+        marker = "data-jsrx%d" % counter[0]
+        nodes = list(root.find_all(True)) if hasattr(root, "find_all") else []
+        if getattr(root, "name", None) not in (None, "[document]"):
+            nodes.append(root)
+        for node in nodes:
+            value = node.get(name)
+            if isinstance(value, (list, tuple)):
+                value = " ".join(value)
+            if value is not None and pattern.search(str(value)):
+                node[marker] = "1"
+                marked.append((node, marker))
+        return "[%s]" % marker
+
+    return _JSOUP_REGEX_ATTR_RE.sub(rewrite, selector), marked
+
+
+def _jsoup_regex_attr_cleanup(marked: list[tuple[Any, str]]) -> None:
+    for node, marker in marked:
+        try:
+            del node.attrs[marker]
+        except Exception:
+            pass
+
+
 def css_extract(html: str, selector: str, attr: str | None, index: int | None, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     if "tbody" in selector.lower():
         _insert_implicit_tbody(soup)  # R149 (B4): Jsoup's HTML5 tree builder always puts <tr> into a <tbody>
     try:
-        elems = soup.select(normalize_selector(selector))
+        _css_selector, _regex_marked = _jsoup_regex_attr_prepare(soup, normalize_selector(selector))
+        try:
+            elems = soup.select(_css_selector)
+        finally:
+            _jsoup_regex_attr_cleanup(_regex_marked)
     except Exception as _swallowed:
         note_debug_error("css selector", _swallowed)
         return []
@@ -9767,6 +10012,10 @@ def css_extract(html: str, selector: str, attr: str | None, index: int | None, b
                 return []
             elems = [elems[actual]]
     results: list[str] = []
+    # R156: the explicit `@css:sel@textNodes` path hands the attribute over unlowered (Legado's last-rule keywords are `text`,
+    # `textNodes`, `ownText`, `html`, `all`); compare the keywords case-insensitively, real attribute names stay as written.
+    raw_attr = attr
+    attr = attr.lower() if isinstance(attr, str) and attr.lower() in _CSS_LAST_RULE_KEYWORDS else attr
     for el in elems:
         if attr is None or attr == "outerhtml":
             results.append(_serialize_html(el))
@@ -9781,10 +10030,13 @@ def css_extract(html: str, selector: str, attr: str | None, index: int | None, b
         elif attr == "textnodes":
             results.append("\n".join(s.strip() for s in el.find_all(string=True, recursive=False) if s.strip()))
         else:
-            value = _css_raw_attr_value(el, attr, base_url)
+            value = _css_raw_attr_value(el, raw_attr or attr, base_url)
             if value:
                 results.append(value)
     return [x for x in results if x]
+
+
+_CSS_LAST_RULE_KEYWORDS = frozenset({"outerhtml", "all", "html", "innerhtml", "text", "owntext", "textnodes"})
 
 
 def _css_raw_attr_value(el: Any, attr: str, base_url: str) -> str:
@@ -9811,7 +10063,11 @@ def _css_raw_attr_value(el: Any, attr: str, base_url: str) -> str:
 def select_elements_json(selector: str, html: str, base_url: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     try:
-        elems = soup.select(normalize_selector(selector or "*"))
+        _css_selector, _regex_marked = _jsoup_regex_attr_prepare(soup, normalize_selector(selector or "*"))
+        try:
+            elems = soup.select(_css_selector)
+        finally:
+            _jsoup_regex_attr_cleanup(_regex_marked)
     except Exception:
         elems = []
     if not elems and (selector or "").strip().lower() == "body":
@@ -9924,7 +10180,25 @@ def html_to_xhtml(html: str) -> str:
     return xhtml
 
 
+_XPATH_FULL_DOCUMENT_MARKERS = ("<html", "<body", "<!doctype", "<?xml")
+
+
 def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> list[str]:
+    """R156 (searchjs X): a list item is a bare HTML fragment and Legado evaluates its field rules with the ELEMENT as context
+    (AnalyzeByXPath.kt:12-21), so `/a/p[1]/text()` means `./a/p[1]`. Mirrors the App's `XPathEngine.select` single-slash fragment fallback: when a single-slash
+    path finds nothing in a fragment, it is evaluated again relative to the fragment's root element."""
+    results = _xpath_extract_document(html, xpath, attr, base_url)
+    if results:
+        return results
+    path = (xpath or "").strip()
+    head = (html or "").lstrip()[:2048].lower()
+    is_fragment = head.startswith("<") and not any(marker in head for marker in _XPATH_FULL_DOCUMENT_MARKERS)
+    if path.startswith("/") and not path.startswith("//") and is_fragment:
+        return _xpath_extract_document(html, "." + path, attr, base_url)
+    return results
+
+
+def _xpath_extract_document(html: str, xpath: str, attr: str | None, base_url: str) -> list[str]:
     """XPath 提取 — 与 Swift XPathEngine 双策略完全对齐：
     策略1: HTML→XHTML + lxml.etree（对应 Foundation.XMLParser 严格 XML 路径）
     策略2: lxml.html 降级（对应 SwiftSoup CSS 降级方向）
@@ -10072,7 +10346,14 @@ def extract_next_data_json(content: str) -> str:
     return text
 
 
+_JSOUP_SHIM_ELEMENT_KEYS = frozenset({"_html", "_innerHtml", "_parent"})
+
+
 def json_container_to_string(value: Any) -> str:
+    if isinstance(value, dict) and isinstance(value.get("_html"), str) and set(value) <= _JSOUP_SHIM_ELEMENT_KEYS:
+        # R156 (searchjs D): a JS-side Jsoup element (the `_readoriJsoupElement` shim) is Legado's Element, whose toString() is its
+        # outerHtml - not a JSON object `{"_html": ...}` that the next rule would then parse as JSON.
+        return value["_html"]
     if isinstance(value, (dict, list)):
         if not value:
             return ""
@@ -10449,6 +10730,71 @@ def _evaluate_legado_js_segment(
     return [js_result]
 
 
+_NON_URL_STRING_FIELD: "contextvars.ContextVar[bool]" = contextvars.ContextVar("readori_non_url_string_field", default=False)
+
+
+@contextlib.contextmanager
+def _evaluating_non_url_string_field():
+    """The rules evaluated inside are Legado getString(non-isUrl) fields (author, wordCount, lastChapter, intro, coverUrl,
+    chapterUrl, ...): the validator reads them with the list-mode evaluator, but a Jsoup miss must behave as getString does."""
+    token = _NON_URL_STRING_FIELD.set(True)
+    try:
+        yield
+    finally:
+        _NON_URL_STRING_FIELD.reset(token)
+
+
+_APP_BARE_ATTRIBUTE_RULES = frozenset({
+    "href", "src", "text", "html", "innerhtml", "outerhtml", "all", "textnodes", "owntext",
+    "name", "title", "id", "class", "value", "content", "alt", "data-src", "data-href", "type", "style", "action", "onclick",
+})
+
+
+def _app_segment_yields_empty_for_next_js(text: str, content_is_json: bool, list_mode: bool) -> bool:
+    """RuleEvaluator `segmentYieldsEmptyStringForNextJavaScript`: JSON path / XPath segments always answer "" on a miss; an explicit
+    `@css:` / bare-attribute / CSS-shaped segment only in list mode (Jsoup getString answers null, so the JS is skipped - also on
+    JSON content, the parser cannot tell them from Legado's isJSON switch); the content-dependent shapes (bare JSONPath such as
+    `data.list`, and the Jsoup fallback) in list mode or on JSON content; regex / text / template / variable segments never."""
+    base = text.split("##", 1)[0].strip()
+    put = base.lower().find("@put:{")
+    if put > 0:
+        base = base[:put].strip()
+    low = base.lower()
+    if not base:
+        return False
+    if base.startswith(("$.", "$[")) or low.startswith(("@json:", "@xpath:")) or base.startswith("/"):
+        return True
+    if low.startswith(("@css:", "@@")):
+        return list_mode
+    if low.startswith(("@get:", ":", "@put:")) or "{{" in base:
+        return False
+    if looks_like_bare_jsonpath(base):
+        return list_mode or content_is_json
+    if low.startswith("@") and low[1:] in _APP_BARE_ATTRIBUTE_RULES:
+        return list_mode
+    if low in _APP_BARE_ATTRIBUTE_RULES or looks_like_css_selector(base):
+        return list_mode
+    return list_mode or content_is_json
+
+
+def _selector_miss_continues_into_js(
+    segments: list[tuple[str, bool, bool]], offset: int, content_is_json: bool, list_mode: bool
+) -> bool:
+    """R156 (tocContent D, App profile 1.1.2): Legado AnalyzeRule.getString / getStringList only `continue` on a null result, so the
+    JS segment after a segment that matched nothing still runs, with an empty input, when that segment answered "" / an empty list
+    instead of null. Mirrors the App's `segmentYieldsEmptyStringForNextJavaScript` classification (`_app_segment_yields_empty_for_next_js`);
+    a getString field of a list item (`_NON_URL_STRING_FIELD`) is evaluated with `list_mode` False."""
+    if not app_profiles.current_app_profile().json_miss_runs_following_js:
+        return False
+    if offset + 1 >= len(segments) or not segments[offset + 1][1]:
+        return False
+    text, is_js, _is_at_js = segments[offset]
+    if is_js:
+        return False
+    effective_list_mode = bool(list_mode) and not _NON_URL_STRING_FIELD.get()
+    return _app_segment_yields_empty_for_next_js(text, content_is_json, effective_list_mode)
+
+
 def _evaluate_legado_js_pipeline(
     segments: list[tuple[str, bool, bool]],
     literal_flags: list[bool],
@@ -10487,6 +10833,9 @@ def _evaluate_legado_js_pipeline(
             finally:
                 set_legado_object_string_mode(previous_mode)
             if not values:
+                if _selector_miss_continues_into_js(segments, offset, content_type == "json" or is_json_content(content), False):
+                    text_value = ""
+                    continue
                 return []
             text_value = "\n".join(values)
         return [text_value]
@@ -10515,6 +10864,9 @@ def _evaluate_legado_js_pipeline(
         finally:
             set_legado_object_string_mode(previous_mode)
         if not current:
+            if _selector_miss_continues_into_js(segments, offset, content_type == "json" or is_json_content(content), True):
+                current = [""]
+                continue
             break
     return current
 
@@ -10660,6 +11012,24 @@ def evaluate_rule(
     string_mode: bool = False,
 ) -> list[str]:
     raw_rule = rule or ""
+    # R156 (searchjs A / tocContent JS##): Legado SourceRule.makeUpRule (AnalyzeRule.kt:708-719) cuts `##regex##replacement` off
+    # EVERY source rule - JS included - and applies it to the result: `@js:code##regex##to`. The validator used to hand the
+    # whole text to the JS engine ("invalid first character of private name").
+    _js_start = re.search(r"@js:", raw_rule, re.I)
+    if _js_start is not None and "##" in raw_rule[_js_start.end():]:
+        _js_replace = _split_top_level_replace(raw_rule[_js_start.end():])
+        if _js_replace is not None and _js_replace[0].strip():
+            _js_values = evaluate_rule(raw_rule[:_js_start.end()] + _js_replace[0], content, runtime, content_type, string_mode)
+            if not _js_values:
+                return []
+            if string_mode:
+                return [legado_replace_regex("\n".join(_js_values), _js_replace[1])]
+            return [legado_replace_regex(_value, _js_replace[1]) for _value in _js_values]
+    # R156 (tocContent N): `@Json:` only selects the JSONPath mode and AnalyzeByJSonPath.getString then expands every inline
+    # `{$.x}` (innerRule), so `@Json:{$.a}|{$.b}` / `@json:/b/{$.name}` is the text template `a|b` / `/b/name`.
+    _json_prefix = re.match(r"\s*@json:", raw_rule, re.I)
+    if _json_prefix is not None and is_literal_json_template_rule(raw_rule[_json_prefix.end():]):
+        raw_rule = raw_rule[_json_prefix.end():]
     literal_json_template = is_literal_json_template_rule(raw_rule)
     raw_segments = _split_legado_js_segments(raw_rule.strip())
     # Legado makeUpRule / RuleEvaluator resolves JSONPath-shaped placeholders
@@ -11475,9 +11845,13 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
                     # R149 (B3): Jsoup Element.select(css) collects from the element itself as well
                     # (RuleEvaluator.swift:1034-1041 -> SwiftSoup select), so `.item-link@a@href` on an `<a class=item-link>`
                     # item matches the item. soupsieve's select() only visits descendants.
-                    if _css_node_matches_selector(node, normalized):
-                        selected.append(node)
-                    selected.extend(node.select(normalized))
+                    node_selector, node_regex_marked = _jsoup_regex_attr_prepare(node, normalized)
+                    try:
+                        if _css_node_matches_selector(node, node_selector):
+                            selected.append(node)
+                        selected.extend(node.select(node_selector))
+                    finally:
+                        _jsoup_regex_attr_cleanup(node_regex_marked)
         except Exception as _swallowed:
             note_debug_error("css chain selector", _swallowed)
             return []
@@ -11551,6 +11925,12 @@ def evaluate_xpath_rule(rule: str, content: str, runtime: RuleRuntime, content_t
     attr_match = re.search(r"/@([A-Za-z_:][-A-Za-z0-9_:.]*)$", text)
     if attr_match:
         path = text[: attr_match.start()]
+        # R156 (tocContent B): `//@href` leaves the remainder "/" (and `//div//@href` leaves "//div/"): the attribute of
+        # EVERY element (descendant axis) - Swift parseXPathRule keeps `//` + the attribute (`XPathEngine.select`).
+        if path == "/":
+            path = "//*"
+        elif path.endswith("/"):
+            path += "/*"
         return xpath_extract(content, path, attr_match.group(1), runtime.base_url)
     if "@" in text and not text.startswith("/"):
         path, attr = text.rsplit("@", 1)
@@ -12678,7 +13058,12 @@ def app_http_error_blocks_rules(status: int, body: str, operation: str, has_logi
     """Whether the App refuses to hand an HTTP response to the rules (BookSourceEngine.executeRequestWithRetry
     :571-577 + shouldPassHTTPErrorBodyToRules :10353): any non-2xx status throws httpError unless the source has a
     loginCheckJs, or the status is a 4xx other than 401/403/407/408/429 whose body is non-empty without error-page
-    signals and is JSON (HTML is accepted for search/explore only). status 0 = transport failure (handled apart)."""
+    signals and is JSON (HTML is accepted for search/explore only). status 0 = transport failure (handled apart).
+
+    This is the F3 rule that App 1.1.1 applies unchanged. App 1.1.2 (R156 G2) additionally hands the body to the rules for a
+    search / explore 404 or 410 (error pages included), and for any 4xx (except 401 / 403 / 407 / 408 / 429) when every rule of the
+    operation is a pure-JS script; anti-bot pages and all 5xx still fail - that layer is `app_http_error_passes_to_rules_legado_parity`,
+    applied by `app_http_failure` under the 1.1.2 profile flag `http_error_body_to_rules`."""
     status = int(status or 0)
     # Only real HTTP status codes (100-599) are judged: 0 is a transport failure (recorded apart) and test stubs /
     # synthetic responses use small placeholder numbers.
@@ -12698,10 +13083,93 @@ def app_http_error_blocks_rules(status: int, body: str, operation: str, has_logi
     return operation not in ("search", "explore")
 
 
+_HTTP_ANTI_BOT_MARKERS = (
+    "cf-chl", "cf_chl_opt", "cf-turnstile", "challenge-platform", "challenges.cloudflare.com",
+    "just a moment", "verifying you are human", "ddos-guard", "hcaptcha", "cf-browser-verification",
+)
+_PURE_JS_READS_CONTENT = re.compile(
+    r"\b(result|src)\b|java\s*\.\s*(getString|getStringList|getElements?|setContent|getStrResponse)\b"
+)
+
+
+def rules_are_pure_javascript(rules: list[Any]) -> bool:
+    """R156 (G2): BookSourceEngine.rulesArePureJavaScript - every non-empty rule is a whole `@js:` / `<js>…</js>` script that does
+    not read the response (no result / src, no java.getString / getElements / setContent / getStrResponse)."""
+    present = [str(rule).strip() for rule in rules if rule is not None and str(rule).strip()]
+    if not present:
+        return False
+    for rule in present:
+        lowered = rule.lower()
+        if lowered.startswith("@js:"):
+            script = rule[4:]
+        elif lowered.startswith("<js>") and lowered.endswith("</js>"):
+            script = rule[4:-5]
+        else:
+            return False
+        if _PURE_JS_READS_CONTENT.search(script):
+            return False
+    return True
+
+
+def pure_javascript_rules_for_operation(src: dict[str, Any] | None, operation: str) -> bool:
+    """BookSourceEngine.pureJavaScriptRulesForHTTPOperation: the rules the request's result feeds."""
+    if not isinstance(src, dict):
+        return False
+
+    def rule_dict(key: str) -> dict[str, Any]:
+        value = src.get(key)
+        return value if isinstance(value, dict) else {}
+
+    if operation == "search":
+        rule = rule_dict("ruleSearch")
+        fields = ("init", "bookList", "name", "author", "kind", "wordCount", "lastChapter", "intro", "coverUrl", "bookUrl")
+    elif operation == "explore":
+        rule = rule_dict("ruleExplore")
+        fields = ("bookList", "name", "author", "kind", "wordCount", "lastChapter", "intro", "coverUrl", "bookUrl")
+    elif operation == "toc":
+        rule = rule_dict("ruleToc")
+        fields = ("chapterList", "chapterName", "chapterUrl")
+    elif operation == "content":
+        rule = rule_dict("ruleContent")
+        fields = ("content",)
+    else:
+        return False
+    if not rule:
+        return False
+    # The search rule's init script is stored under the JSON key `init` (BookSource `SearchRule.initJs` CodingKey); accept `initJs` too.
+    return rules_are_pure_javascript([(rule.get(field) or rule.get("initJs")) if field == "init" else rule.get(field) for field in fields])
+
+
+def app_http_error_passes_to_rules_legado_parity(
+    status: int, body: str, operation: str, pure_javascript_rules: bool
+) -> bool:
+    """R156 G2 (App profile 1.1.2), BookSourceEngine.passesLegadoParityHTTPErrorBody: Legado's AnalyzeUrl never looks at the
+    status, so rules always get the body. Beyond the F3 rule, the body also goes to the rules for a search / explore 404 or 410
+    (a non-empty error page included) and, whatever the body, for rules that are pure JavaScript. 401 / 403 / 407 / 408 / 429,
+    every 5xx and anti-bot / Cloudflare challenge pages stay errors."""
+    status = int(status or 0)
+    if not (400 <= status < 500) or status in (401, 403, 407, 408, 429):
+        return False
+    trimmed = (body or "").strip()
+    if trimmed and any(marker in trimmed[:200_000].lower() for marker in _HTTP_ANTI_BOT_MARKERS):
+        return False
+    if pure_javascript_rules:
+        return True
+    return status in (404, 410) and bool(trimmed) and operation in ("search", "explore")
+
+
 def app_http_failure(url: str, status: int, body: str, operation: str, src: dict[str, Any] | None = None) -> bool:
     """app_http_error_blocks_rules + record the HTTP status for the report. True = the stage's request failed."""
     has_login_check = bool(str((src or {}).get("loginCheckJs") or "").strip())
     if app_http_error_blocks_rules(status, body, operation, has_login_check):
+        if app_profiles.current_app_profile().http_error_body_to_rules and app_http_error_passes_to_rules_legado_parity(
+            status, body, operation, pure_javascript_rules_for_operation(src, operation)
+        ):
+            if operation in ("search", "explore"):
+                # The App probe (PassedHTTPErrorProbe) keeps the error visible: it is attached to the stage only when the
+                # rules then find nothing (`attach_network_error` runs on a failed stage).
+                record_http_status_event(url, status)
+            return False
         record_http_status_event(url, status)
         return True
     return False
@@ -13079,6 +13547,8 @@ def request_search_or_explore(
     if not url:
         return None
     abs_url = urljoin(runtime.base_url, url) if not url.lower().startswith(("http://", "https://", "@js:", "<js>")) else url
+    # R156 (network): a `data:` carrier keeps its typed options (`,{"type":"x"}`), which choose the synthetic response type.
+    abs_url = request_url_preserving_typed_data_options(abs_url, opts)
     charset = opts.get("charset") if isinstance(opts.get("charset"), str) else None
     method = opts.get("method", "GET")
     body = opts.get("body") if isinstance(opts.get("body"), str) else None
@@ -13436,20 +13906,22 @@ def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime:
     """
     content_type = "json" if is_json_content(item) else "html"
     author = ""
-    for field in (
-        "author",
-        "coverUrl",
-        "intro",
-        "kind",
-        "lastChapter",
-        "wordCount",
-        "updateTime",
-    ):
+    # R156 (J, 1.1.2): Legado BookList.kt:225-269 order (+ Readori's updateTime right after lastChapter, as the Swift engine does).
+    fields = (
+        ("author", "kind", "wordCount", "lastChapter", "updateTime", "intro", "coverUrl")
+        if app_profiles.current_app_profile().list_item_legado_field_order
+        else ("author", "coverUrl", "intro", "kind", "lastChapter", "wordCount", "updateTime")
+    )
+    for field in fields:
         rule_text = str(rule.get(field) or "").strip()
         if not rule_text:
             continue
         try:
-            values = evaluate_rule(rule_text, item, runtime, content_type)
+            if field == "kind":  # getStringList
+                values = evaluate_rule(rule_text, item, runtime, content_type)
+            else:  # getString (non-isUrl): a Jsoup miss skips the following JS (R156 D)
+                with _evaluating_non_url_string_field():
+                    values = evaluate_rule(rule_text, item, runtime, content_type)
         except Exception:
             continue
         if field == "author" and values:
@@ -14409,6 +14881,47 @@ def guess_toc_range_option_urls_from_html(html: str, page_base_url: str) -> list
     return sorted(urls, key=toc_pagination_sort_key)
 
 
+_TOC_PAGINATION_LIST_RULES = (
+    ".pages a@href", ".pagination a@href", ".listpage a@href",
+    ".pages option@value", ".pagination option@value", ".listpage option@value", "select option@value",
+)
+
+
+def is_likely_toc_option_value_url(raw: str) -> bool:
+    """App `isLikelyTocOptionValueURL`: an <option value> that is a request URL, not a bare page number for the page's own JS."""
+    value = (raw or "").strip()
+    if not value:
+        return False
+    if value.lower().startswith(("http://", "https://", "//")):
+        return True
+    return any(token in value for token in ("/", ".", "?", "="))
+
+
+def discover_toc_pagination_candidates(html: str, page_base_url: str, content_type: str, runtime: RuleRuntime) -> list[str]:
+    """App `discoverTocPaginationCandidates`: pagination links / selects of the page, ordered by `toc_pagination_sort_key`."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for rule in _TOC_PAGINATION_LIST_RULES:
+        is_option_rule = rule.endswith("option@value")
+        try:
+            values = evaluate_rule(rule, html, runtime, content_type)
+        except Exception as _swallowed:
+            note_debug_error("toc pagination candidates", _swallowed)
+            continue
+        for raw in values:
+            raw = (raw or "").strip()
+            if not raw or raw.startswith("#") or raw.lower().startswith("javascript:"):
+                continue
+            if is_option_rule and not is_likely_toc_option_value_url(raw):
+                continue
+            resolved, _options = resolve_url_with_options(raw, page_base_url)
+            if not resolved or resolved in seen or not is_plausible_source_url(resolved):
+                continue
+            seen.add(resolved)
+            candidates.append(resolved)
+    return sorted(candidates, key=lambda url: (toc_pagination_sort_key(url), url))
+
+
 def heuristic_book_items_from_html(html: str, base_url: str, keyword: str = "") -> list[str]:
     if contains_http_error_page_signals(html):
         return []
@@ -14599,8 +15112,15 @@ def collect_app_book_candidates(
     rule: dict[str, Any],
     items: list[str],
     runtime2: RuleRuntime,
+    *,
+    first_only: bool = False,
 ) -> tuple[list[str], dict[str, str] | None, str]:
     """Per-item extraction exactly like BookSourceEngine.parseSearchResult / parseExploreResult (R144a F4).
+
+    R156 (network T): `first_only` (the batch validation passes it) stops after the first acceptable item, like the App's validation search
+    `engine.search(maximumResults: 1)` / `explore(maximumResults: 1)` (`BookSourceValidator` search / explore stages); every
+    further item would cost a full set of rule / JS evaluations (3000+ items on some sources). The workbench passes
+    False to list every candidate.
 
     * name: the rule result; the `<a>` / title / JSON-key recovery runs only when the name rule is blank
       (App E:931-957: `lacksRule`). A non-blank rule that yields nothing skips the item. No placeholder name.
@@ -14617,6 +15137,7 @@ def collect_app_book_candidates(
     selected_variables: dict[str, str] | None = None
     selected_author = ""
     dbg_skipped = 0
+    legado_field_order = app_profiles.current_app_profile().list_item_legado_field_order
     for item in items:
         item_runtime = RuleRuntime(**{**runtime2.__dict__, "variables": dict(runtime2.variables or {})})
         name = "" if name_rule_blank else first_result_to_text(item, name_rule, item_runtime)
@@ -14632,6 +15153,11 @@ def collect_app_book_candidates(
         if name_recovered and not is_usable_search_book_title(name):
             dbg_skipped += 1
             continue
+        item_author = ""
+        if legado_field_order:
+            # R156 (J, App profile 1.1.2): BookList.kt:220-281 evaluates name, author, kind, wordCount, lastChapter, intro,
+            # coverUrl and only then bookUrl, so an `@put` / `java.put` in any of them is visible to bookUrl.
+            item_author = capture_search_item_rule_variables(rule, item, item_runtime)
         if url_rule_blank:
             book_url = fallback_url_from_item(item, runtime2.base_url, item_runtime)
         else:
@@ -14643,17 +15169,32 @@ def collect_app_book_candidates(
         if not str(book_url or "").strip() or not is_usable_rule_extracted_book_url(book_url, item, name, item_runtime):
             dbg_skipped += 1
             continue
-        item_author = capture_search_item_rule_variables(rule, item, item_runtime)
+        if not legado_field_order:
+            item_author = capture_search_item_rule_variables(rule, item, item_runtime)
         book_urls.append(book_url)
         if _dbg.active() and len(book_urls) <= 50:
             _dbg.emit("item", index=len(book_urls) - 1, name=name, value=book_url)
         if selected_variables is None:
             selected_variables = dict(item_runtime.variables or {})
             selected_author = item_author
+        if first_only:
+            break
     if _dbg.active() and dbg_skipped:
         _dbg.emit("warn", code="items_skipped", count=dbg_skipped,
                   value=f"列表 {len(items)} 项中 {dbg_skipped} 项因书名为空或详情链接不可用被跳过")
     return book_urls, selected_variables, selected_author
+
+
+_FIRST_CANDIDATE_ONLY: "contextvars.ContextVar[bool]" = contextvars.ContextVar("readori_first_candidate_only", default=False)
+
+
+def _fetch_first_book_candidates(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime) -> tuple[list[str], str]:
+    """Batch validation search / discovery stage (R156 network T): `fetch_book_candidates` with the App's one-result window."""
+    token = _FIRST_CANDIDATE_ONLY.set(True)
+    try:
+        return fetch_book_candidates(session, src, runtime)
+    finally:
+        _FIRST_CANDIDATE_ONLY.reset(token)
 
 
 def fetch_book_candidates(
@@ -14666,7 +15207,9 @@ def fetch_book_candidates(
     explore_url: str | None = None,
 ) -> tuple[list[str], str]:
     """Search / discovery stage. R146 (debug): `keywords` replaces the validation keyword list, `modes` limits the
-    stage to search and / or explore, `explore_url` replaces the first `exploreUrl` entry. Defaults = batch behavior."""
+    stage to search and / or explore, `explore_url` replaces the first `exploreUrl` entry. Defaults = batch behavior.
+    R156 (network T): inside `_fetch_first_book_candidates` (the batch validation) every entry stops at its first acceptable
+    item like the App's `maximumResults: 1`; called directly it lists every candidate (workbench, tests)."""
     begin_network_stage()
     runtime.explore_candidate = None
     search_rule = src.get("ruleSearch") or {}
@@ -14781,7 +15324,7 @@ def fetch_book_candidates(
                     if _dbg.active():
                         _dbg.emit("warn", code="challenge", url=final_url)
                 return [], ""
-            book_urls, selected_variables, selected_author = collect_app_book_candidates(src, explore_rule, items, runtime2)
+            book_urls, selected_variables, selected_author = collect_app_book_candidates(src, explore_rule, items, runtime2, first_only=_FIRST_CANDIDATE_ONLY.get())
             if book_urls:
                 # R151 (E1): the first selected item is the App's `.discovery` candidate (its own variables / author).
                 explore_capture.clear()
@@ -14879,7 +15422,7 @@ def fetch_book_candidates(
                     if _dbg.active():
                         _dbg.emit("warn", code="challenge", url=final_url)
                 continue
-            book_urls, selected_variables, selected_author = collect_app_book_candidates(src, search_rule, items, runtime2)
+            book_urls, selected_variables, selected_author = collect_app_book_candidates(src, search_rule, items, runtime2, first_only=_FIRST_CANDIDATE_ONLY.get())
             if book_urls:
                 if selected_variables:
                     runtime.variables = dict(runtime.variables or {})
@@ -15354,7 +15897,7 @@ def _normalized_text_for_quality(text: str) -> str:
 
 def is_usable_chapter_text(text: str) -> bool:
     """The validator's own final "does the chapter hold readable text" gate (unchanged since before R144a: 30 characters,
-    signal 15, digits x0.5). The App's validation (BookSourceValidator.swift:2514) passes any non-empty trimmed text or
+    signal 15, digits x0.5). The App's validation (`BookSourceValidator` content stage) passes any non-empty trimmed text or
     any image, so this gate is stricter than the App (it only rejects blank / navigation-like leftovers). It is kept
     separate from `is_meaningful_content` (the App's fallback gate, ported exactly) so that short real chapters are not
     rejected by the stricter 80 / 40 fallback thresholds."""
@@ -15993,8 +16536,30 @@ def fallback_search_items_from_content(html: str) -> list[str]:
     return []
 
 
-def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, book_url: str, toc_url: str) -> tuple[bool, str, str, str, int, int, int]:
-    """返回: ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages_walked, first_page_item_count"""
+# R156 (network T): BookSourceValidator.validateCandidate asks for `engine.fetchFirstTocPage(book:, chapterLimit: 16)`
+# (`BookSourceValidator` TOC stage, `fetchFirstTocPage(chapterLimit: 16)`) = getChapterList(firstPageOnly: true, firstPageChapterLimit: 16).
+APP_VALIDATION_TOC_CHAPTER_LIMIT = 16
+# Deep inspection switch: READORI_VALIDATOR_FULL_TOC=1 makes the batch validation walk the whole table of contents again
+# (variant aggregation compares `tocUniqueChapterCount`, which is capped by the window otherwise).
+FULL_TOC_WALK = os.environ.get("READORI_VALIDATOR_FULL_TOC", "").strip() == "1"
+
+
+def resolve_toc_source(
+    session: requests.Session,
+    src: dict[str, Any],
+    runtime: RuleRuntime,
+    book_url: str,
+    toc_url: str,
+    *,
+    first_page_only: bool = False,
+) -> tuple[bool, str, str, str, int, int, int]:
+    """返回: ok, toc_final_url, first_chapter_url, first_chapter_title, toc_pages_walked, first_page_item_count
+
+    `first_page_only` (R156 network T; the batch validation stage `_run_toc_stage` passes True) mirrors the App's validation window: chapter items are evaluated only until
+    APP_VALIDATION_TOC_CHAPTER_LIMIT (16) chapters were collected (`getChapterList` `firstPageChapterLimit`) and the walk stops
+    after the first page that produced a chapter (:3568); it is off for a reversed list with a nextTocUrl rule (:2684).
+    The default (workbench / debug engine, unit tests) walks the whole table of contents.
+    """
     begin_network_stage()
     if _dbg.active():
         _dbg.set_stage("toc")
@@ -16011,12 +16576,23 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
     # own rule is blank. A non-blank rule result is never replaced.
     heuristic_toc = not chapter_list_rule
     name_rule_blank = heuristic_toc or not chapter_name_rule
-    url_rule_blank = heuristic_toc or not chapter_url_rule
+    # R156 (E, App profile 1.1.2): Legado BookChapterList.kt:230-241 - an empty chapterUrl result is the page URL (baseUrl),
+    # never the item's first link; that recovery stays only for sources without a chapterList rule.
+    url_rule_blank = heuristic_toc or (
+        not chapter_url_rule and not app_profiles.current_app_profile().empty_chapter_url_rule_uses_base_url
+    )
     has_next_toc_rule = bool(str(toc_rule.get("nextTocUrl") or "").strip())
+    toc_list_reversed = len(chapter_list_rule) > 1 and chapter_list_rule.startswith("-")
+    window_only = bool(first_page_only) and not (toc_list_reversed and has_next_toc_rule)
+    window_chapter_count = 0
+    current_profile = app_profiles.current_app_profile()
 
     normalized_toc_url = (toc_url or "").strip()
     effective_toc_url = normalized_toc_url or book_url
-    if is_direct_text_document_url(effective_toc_url):
+    # R156 (A, App profile 1.1.2): Legado BookChapterList has no `.txt` shortcut - a source with a chapterList rule is read
+    # through its rule (the App's `.txt` shortcut in `getChapterList` applies only without a chapterList rule).
+    txt_shortcut_allowed = heuristic_toc or not current_profile.txt_shortcut_only_without_toc_rule
+    if txt_shortcut_allowed and is_direct_text_document_url(effective_toc_url):
         return True, effective_toc_url, effective_toc_url, "正文", 1, 1, 1
 
     runtime_seed = RuleRuntime(**{**runtime.__dict__, "variables": dict(runtime.variables or {})})
@@ -16040,6 +16616,16 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
     first_chapter_url = ""
     first_chapter_title = ""
     seen_chapter_urls: set[str] = set()
+    # R156 (network G1 / H): the "all chapters" link and the pagination guesses mirror the App's getChapterList: with no nextTocUrl rule
+    # (a chapterList rule does not disable them) the first page gets `discoverTocRangeOptionCandidates`, then (>= 15 items)
+    # `discoverTocPaginationCandidates`, and only when both found nothing `guessAllChaptersUrlFromHTML`. The App backs the first page's
+    # chapters up before the jump (`chaptersBeforeAllChaptersJump`) and restores them when the jump page yields no new chapter (the
+    # `newChaptersThisPage == 0` branch) or, App 1.1.2 only, when its request fails; a jump page with fewer but > 0 new chapters keeps its
+    # result (the backup is dropped). `guess_origin` remembers, for a guessed page that REPLACES the unprocessed first page, how to
+    # re-queue it; `all_chapters_jump_urls` marks the "all chapters" pages.
+    guessed_toc_urls: set[str] = set()
+    guess_origin: dict[str, tuple[str, str]] = {}
+    all_chapters_jump_urls: set[str] = set()
     # R155 (A): Legado BookChapterList:77-104 / :160-175 - a first page whose nextTocUrl yields several URLs fetches them
     # as a one-shot batch and those pages never evaluate nextTocUrl again; a single URL is followed serially (only the
     # first URL of each page). BookSourceEngine.swift:3326-3350 `nextTocRuleBatchUrls` is the App mirror.
@@ -16087,11 +16673,22 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 final_url = retry_final_url
                 status = retry_status
                 response_meta = retry_meta
-        if app_http_failure(request_url, status, html, "toc", src):
-            # App E:2793-2809: a page reached through a nextTocUrl rule that answers with an HTTP error counts as an
+        jump_transport_failure = current_url in all_chapters_jump_urls and not status and not html.strip()
+        if jump_transport_failure or app_http_failure(request_url, status, html, "toc", src):
+            # App getChapterList catch block: a page reached through a nextTocUrl rule that answers with an HTTP error counts as an
             # empty page; any other request error fails the whole table of contents.
             if _dbg.active():
                 _dbg.emit("warn", code="http_error", url=request_url, status=status)
+            if current_url in all_chapters_jump_urls and not app_profiles.current_app_profile().all_chapters_jump_failure_restores:
+                # App 1.1.1: the first page's chapters were cleared for the jump and a failed jump page does not restore them.
+                return False, "", "", "", pages + 1, first_page_item_count, len(seen_chapter_urls)
+            if current_url in guessed_toc_urls:
+                pages += 1
+                origin = guess_origin.pop(current_url, None)
+                if origin is not None:
+                    visited.discard(origin[1])
+                    queue.insert(0, origin[0])
+                continue
             if pages == 0 or not has_next_toc_rule:
                 return False, "", "", "", pages, first_page_item_count, len(seen_chapter_urls)
             pages += 1
@@ -16149,6 +16746,11 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
         if pages == 0:
             first_page_item_count = len(items)
         pages += 1
+        if not items and current_url in guess_origin:
+            origin = guess_origin.pop(current_url)
+            visited.discard(origin[1])
+            queue.insert(0, origin[0])
+            continue
         if _dbg.active():
             _dbg.emit("page", index=pages, url=final_url, count=len(items))
             _dbg.emit("list", field="chapterList", rule=chapter_list_rule or "(无规则，自动识别)", count=len(items),
@@ -16159,27 +16761,55 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             normalized_book_candidate_url_for_comparison(final_url),
         }
 
+        # App getChapterList, `if !hasNextTocRule`: range-option candidates (discoverTocRangeOptionCandidates), then - from 15 items on -
+        # the pagination-list candidates (discoverTocPaginationCandidates); only when both found nothing, on the first page, the
+        # "all chapters" link (guessAllChaptersUrlFromHTML; a chapterList rule does not disable any of these). A guessed page that
+        # fails / yields nothing re-queues this page (the App's backup restore).
+        heuristic_page_candidates: list[str] = []
+        range_page_candidates: list[str] = []
+        if not has_next_toc_rule:
+            def _fresh_candidate(candidate_url: str) -> bool:
+                candidate_key = normalized_book_candidate_url_for_comparison(candidate_url)
+                return (
+                    candidate_key not in current_toc_keys
+                    and f"GET {candidate_url} " not in visited
+                    and candidate_url not in queue
+                )
+
+            range_page_candidates = [url for url in guess_toc_range_option_urls_from_html(html, final_url) if _fresh_candidate(url)]
+            if len(items) >= 15:
+                heuristic_page_candidates = [
+                    url
+                    for url in discover_toc_pagination_candidates(html, final_url, content_type, runtime2)
+                    if _fresh_candidate(url) and url not in range_page_candidates
+                ]
         if pages == 1 and not has_next_toc_rule:
-            all_chapters_url = guess_all_chapters_url_from_html(html, final_url)
-            all_chapters_key = normalized_book_candidate_url_for_comparison(all_chapters_url)
-            if all_chapters_url and all_chapters_key not in current_toc_keys and f"GET {all_chapters_url} " not in visited and all_chapters_url not in queue:
-                queue.insert(0, all_chapters_url)
-                if _dbg.active():
-                    _dbg.emit("fallback", what="guess_all_chapters_url_from_html（校验器自己猜的「全部章节」页，App 不会）", value=all_chapters_url)
-                continue
+            if not range_page_candidates and not heuristic_page_candidates:
+                all_chapters_url = guess_all_chapters_url_from_html(html, final_url)
+                all_chapters_key = normalized_book_candidate_url_for_comparison(all_chapters_url)
+                if all_chapters_url and all_chapters_key not in current_toc_keys and f"GET {all_chapters_url} " not in visited and all_chapters_url not in queue:
+                    queue.insert(0, all_chapters_url)
+                    guessed_toc_urls.add(all_chapters_url)
+                    all_chapters_jump_urls.add(all_chapters_url)
+                    guess_origin[all_chapters_url] = (current_url, visit_key)
+                    if _dbg.active():
+                        _dbg.emit("fallback", what="guess_all_chapters_url_from_html（对应 App guessAllChaptersUrlFromHTML 的「全部章节」猜测；失败 / 无新章节时回退首页）", value=all_chapters_url)
+                    continue
             if len(items) < 15:
-                for range_url in guess_toc_range_option_urls_from_html(html, final_url):
-                    range_key = normalized_book_candidate_url_for_comparison(range_url)
-                    if range_key in current_toc_keys:
-                        continue
-                    if f"GET {range_url} " not in visited and range_url not in queue:
-                        queue.append(range_url)
-                        if _dbg.active():
-                            _dbg.emit("fallback", what="guess_toc_range_option_urls_from_html（校验器自己猜的分页下拉，App 不会）", value=range_url)
+                for range_url in range_page_candidates:
+                    queue.append(range_url)
+                    guessed_toc_urls.add(range_url)
+                    guess_origin[range_url] = (current_url, visit_key)
+                    if _dbg.active():
+                        _dbg.emit("fallback", what="guess_toc_range_option_urls_from_html（对应 App discoverTocRangeOptionCandidates 的分页下拉猜测）", value=range_url)
                 if queue:
                     continue
 
         for item_index, item in enumerate(items):
+            # R156 (network T): firstPageChapterLimit - stop evaluating items once the App's 16-chapter window is full
+            # (`getChapterList` firstPageChapterLimit); every item costs several rule / JS evaluations.
+            if window_only and window_chapter_count >= APP_VALIDATION_TOC_CHAPTER_LIMIT:
+                break
             item_type = "json" if is_json_content(item) else content_type
             if item_type == "json" and is_redundant_json_digest_toc_item(item, items):
                 continue
@@ -16211,7 +16841,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 if expanded_chapter_name_rule != chapter_name_rule and "$" not in expanded_chapter_name_rule:
                     title_values = [expanded_chapter_name_rule]
                 else:
-                    title_values = evaluate_rule(chapter_name_rule, item, item_runtime, item_type)
+                    with _evaluating_non_url_string_field():  # App evaluateGetString (listMode false)
+                        title_values = evaluate_rule(chapter_name_rule, item, item_runtime, item_type)
                 title = legado_get_string_value(title_values).strip() if title_values else ""
             else:
                 title = ""
@@ -16234,7 +16865,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 if expanded_chapter_url_rule != chapter_url_rule and "$" not in expanded_chapter_url_rule:
                     raw_urls = [expanded_chapter_url_rule]
                 else:
-                    raw_urls = evaluate_rule(chapter_url_rule, item, item_runtime, item_type)
+                    with _evaluating_non_url_string_field():  # Legado: getString(urlRule), not isUrl
+                        raw_urls = evaluate_rule(chapter_url_rule, item, item_runtime, item_type)
                 if len(raw_urls) > 1 and raw_urls[0].strip().lower().startswith(("http://", "https://")) and ",{" in "\n".join(raw_urls):
                     raw_chapter_url = "\n".join(raw_urls)
                 else:
@@ -16278,7 +16910,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             update_time_rule = str(toc_rule.get("updateTime") or "").strip()
             chapter_tag = ""
             if update_time_rule:
-                tag_values = evaluate_rule(update_time_rule, item, item_runtime, item_type)
+                with _evaluating_non_url_string_field():
+                    tag_values = evaluate_rule(update_time_rule, item, item_runtime, item_type)
                 chapter_tag = legado_get_string_value(tag_values).strip() if tag_values else ""
             if not chapter_tag and toc_item_object and (heuristic_toc or not update_time_rule):
                 chapter_tag = json_first_text(
@@ -16292,7 +16925,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             item_runtime.variables["__chapter.tag"] = chapter_tag
 
             is_volume_rule = str(toc_rule.get("isVolume") or "").strip()
-            volume_values = evaluate_rule(is_volume_rule, item, item_runtime, item_type) if is_volume_rule else []
+            with _evaluating_non_url_string_field():
+                volume_values = evaluate_rule(is_volume_rule, item, item_runtime, item_type) if is_volume_rule else []
             is_volume_text = legado_get_string_value(volume_values)
             if not is_volume_text and toc_item_object and (heuristic_toc or not is_volume_rule):
                 # R155b (1.1.2): "volume" is a volume number in many APIs, not a boolean (BookSourceEngine.swift isVolume fallback).
@@ -16308,9 +16942,11 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                 item_runtime.variables["__chapter.url"] = chapter_url
             if not title:
                 continue
+            window_chapter_count += 1
 
             is_vip_rule = str(toc_rule.get("isVip") or "").strip()
-            vip_values = evaluate_rule(is_vip_rule, item, item_runtime, item_type) if is_vip_rule else []
+            with _evaluating_non_url_string_field():
+                vip_values = evaluate_rule(is_vip_rule, item, item_runtime, item_type) if is_vip_rule else []
             is_vip_text = legado_get_string_value(vip_values)
             if not is_vip_text and toc_item_object and (heuristic_toc or not is_vip_rule):
                 is_vip_text = json_first_text(toc_item_object, ["isVip", "is_vip", "vip"])
@@ -16319,7 +16955,8 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             item_runtime.variables["__chapter.isVip"] = is_vip
 
             is_pay_rule = str(toc_rule.get("isPay") or "").strip()
-            pay_values = evaluate_rule(is_pay_rule, item, item_runtime, item_type) if is_pay_rule else []
+            with _evaluating_non_url_string_field():
+                pay_values = evaluate_rule(is_pay_rule, item, item_runtime, item_type) if is_pay_rule else []
             is_pay_text = legado_get_string_value(pay_values)
             if not is_pay_text and toc_item_object and (heuristic_toc or not is_pay_rule):
                 is_pay_text = json_first_text(toc_item_object, ["isPay", "is_pay", "pay", "paid"])
@@ -16329,7 +16966,9 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
 
             # Volume rows are valid Legado chapters, but the validator selects
             # the first fetchable text chapter for its content-stage probe.
-            if is_volume:
+            # App batch validation (BookSourceValidator `fetchFirstTocPage`): only volume rows whose URL is the synthetic `title + index`
+            # are dropped from the sample; a volume with a real URL stays a chapter. The full walk keeps skipping every volume row.
+            if is_volume and (not window_only or chapter_url.startswith(title)):
                 continue
             if heuristic_toc and is_likely_toc_noise_title(title, chapter_url, final_url):
                 continue
@@ -16356,6 +16995,17 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                         runtime.chapter_variable = item_runtime.chapter_variable
                         runtime.chapter_active = True
 
+        # App `newChaptersThisPage == 0` branch on a jump page: the guessed page produced no chapter at all (items without a usable
+        # chapter, all duplicates) -> restore the first page like a failed / empty jump page.
+        if current_url in guess_origin and not seen_chapter_urls:
+            origin = guess_origin.pop(current_url)
+            visited.discard(origin[1])
+            queue.insert(0, origin[0])
+            continue
+        # R156 (network T): firstPageOnly - the first page that produced a chapter is the whole validation sample
+        # (`getChapterList` `firstPageOnly && !chapters.isEmpty`; volume rows count), the nextTocUrl rule is not evaluated and no further page is requested.
+        if window_only and window_chapter_count > 0:
+            break
         next_rule = str(toc_rule.get("nextTocUrl") or "").strip()
         if next_rule and current_url not in next_toc_batch_urls:
             next_values = legado_string_list_values(evaluate_rule(next_rule, html, runtime2, content_type))
@@ -16387,12 +17037,10 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
                     queue.append(first_next_url)
 
         if not next_rule and len(items) >= 15:
-            for range_url in guess_toc_range_option_urls_from_html(html, final_url):
-                range_key = normalized_book_candidate_url_for_comparison(range_url)
-                if range_key in current_toc_keys:
-                    continue
+            for range_url in [*range_page_candidates, *heuristic_page_candidates]:
                 if f"GET {range_url} " not in visited and range_url not in queue:
                     queue.append(range_url)
+                    guessed_toc_urls.add(range_url)
         if (
             not first_chapter_url
             and not queue
@@ -16727,7 +17375,12 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         merged = apply_legado_content_replace_indent(merged).strip("\r\n")
     if is_likely_access_gated_content_preview(merged):
         return False, merged, page_count
-    return is_usable_chapter_text(merged) or has_meaningful_image_content(merged) or (used_source_regex_resource and bool(merged)), merged, page_count
+    # R156 (tocContent C): Legado BookContent.kt:149 only rejects a blank content and the App's validation accepts any
+    # non-empty trimmed text (`BookSourceValidator` content stage), so a non-blank result of a NON-EMPTY content rule is a
+    # usable chapter; the stricter `is_usable_chapter_text` heuristics stay for rule-less content. `_run_content_stage`
+    # flags such near-empty passes in the details (`contentNearEmpty`).
+    legado_nonblank = (not content_rule_blank) and bool(re.sub(r"<(?!img)[^>]+>", "", merged).strip())
+    return is_usable_chapter_text(merged) or legado_nonblank or has_meaningful_image_content(merged) or (used_source_regex_resource and bool(merged)), merged, page_count
 
 
 def _empty_detail(src: dict[str, Any]) -> dict[str, Any]:
@@ -16887,6 +17540,68 @@ def is_likely_access_gated_content_preview(text: str) -> bool:
     return any(marker in compact for marker in markers)
 
 
+def _js_code_skeleton(prefix: str) -> tuple[str, bool]:
+    """R156 (tocContent Q): `prefix` with comments removed and string / template-literal contents emptied (`"a{b"` -> `""`), so
+    braces that are text no longer count. Returns (skeleton, ends_inside_a_string)."""
+    out: list[str] = []
+    index = 0
+    length = len(prefix)
+    while index < length:
+        char = prefix[index]
+        following = prefix[index + 1] if index + 1 < length else ""
+        if char == "/" and following == "/":
+            end = prefix.find("\n", index)
+            index = length if end < 0 else end
+            out.append(" ")
+            continue
+        if char == "/" and following == "*":
+            end = prefix.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            out.append(" ")
+            continue
+        if char in "\"'`":
+            quote = char
+            index += 1
+            closed = False
+            while index < length:
+                current = prefix[index]
+                if current == "\\":
+                    index += 2
+                    continue
+                if current == quote:
+                    closed = True
+                    index += 1
+                    break
+                index += 1
+            if not closed:
+                return "".join(out), True
+            out.append(quote + quote)
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out), False
+
+
+_JS_BLOCK_GUARD_HEADER = re.compile(r"(?:\bif\s*\([^{}]*\)|\belse(?:\s+if\s*\([^{}]*\))?)\s*$", re.I | re.S)
+
+
+def _browser_call_is_guarded(prefix: str) -> bool:
+    """True when the call that follows `prefix` sits in a block opened by `if (...) {` / `else {` / `else if (...) {`, or is the
+    single statement of an `if (...)` (brace stack over the string / comment-free skeleton, R156 tocContent Q)."""
+    skeleton, inside_string = _js_code_skeleton(prefix)
+    if inside_string:
+        return False
+    stack: list[bool] = []
+    for position, char in enumerate(skeleton):
+        if char == "{":
+            stack.append(bool(_JS_BLOCK_GUARD_HEADER.search(skeleton[max(0, position - 600):position])))
+        elif char == "}" and stack:
+            stack.pop()
+    if any(stack):
+        return True
+    return bool(re.search(r"\bif\s*\([^;{}]*\)\s*$", skeleton[-600:], flags=re.I | re.S))
+
+
 def is_browser_deferred_content_source(src: dict[str, Any]) -> bool:
     content_rule = src.get("ruleContent") if isinstance(src.get("ruleContent"), dict) else {}
     expressions = [
@@ -16895,15 +17610,7 @@ def is_browser_deferred_content_source(src: dict[str, Any]) -> bool:
     ]
     for expression in expressions:
         for match in re.finditer(r"\b(?:java\s*\.\s*)?startBrowser(?:Await|Dp)?\s*\(", expression, flags=re.I):
-            prefix = expression[:match.start()]
-            opening_brace = prefix.rfind("{")
-            if opening_brace >= 0 and re.search(
-                r"\bif\s*\([^{}]*\)\s*$",
-                prefix[max(0, opening_brace - 600):opening_brace],
-                flags=re.I | re.S,
-            ):
-                continue
-            if re.search(r"\bif\s*\([^;{}]*\)\s*$", prefix[-600:], flags=re.I | re.S):
+            if _browser_call_is_guarded(expression[:match.start()]):
                 continue
             return True
     # A guarded browser call is a challenge/paywall fallback, not proof that
@@ -16993,7 +17700,7 @@ def _quick_scan_single_source(
         # search must fail here as well; otherwise heuristic book detection would pass a source the App marks
         # js失效 / needs interaction.
         stage_sink = begin_script_error_stage(runtime)
-        book_urls, search_base = fetch_book_candidates(session, src, runtime)
+        book_urls, search_base = _fetch_first_book_candidates(session, src, runtime)
         runtime.script_error_sink = None
         blocked_error = next(
             (
@@ -17105,7 +17812,7 @@ def _run_toc_stage(
         _dbg.set_stage("toc")
         _dbg.emit("begin", url=toc_url or book_url, **begin_extra)
     stage_sink = begin_script_error_stage(runtime)
-    result = resolve_toc_source(session, src, runtime, book_url, toc_url or book_url)
+    result = resolve_toc_source(session, src, runtime, book_url, toc_url or book_url, first_page_only=not FULL_TOC_WALK)
     finish_script_error_stage(runtime, stage_sink, detail, stage)
     if _dbg.active():
         _dbg.emit("end", ok=bool(result[0]), count=result[6], value=result[3] or "")
@@ -17133,6 +17840,10 @@ def _run_content_stage(
     stage_sink = begin_script_error_stage(runtime)
     result = resolve_chapter_content(session, src, runtime, chapter_url, chapter_title, book_name)
     finish_script_error_stage(runtime, stage_sink, detail, stage)
+    if result[0] and not is_usable_chapter_text(result[1] or "") and not has_meaningful_image_content(result[1] or ""):
+        # R156 (tocContent C): accepted only because the content rule produced non-blank text (Legado / App accept any).
+        detail["contentNearEmpty"] = True
+        detail["contentNearEmptyChars"] = len(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", result[1] or "")))
     if _dbg.active():
         _dbg.emit("end", ok=bool(result[0]), count=len(result[1] or ""))
     return result
@@ -17354,7 +18065,7 @@ def _validate_single_source(
                 _dbg.set_stage("search")
                 _dbg.emit("begin")
             stage_sink = begin_script_error_stage(runtime)
-            book_urls, search_base = fetch_book_candidates(session, src, runtime)
+            book_urls, search_base = _fetch_first_book_candidates(session, src, runtime)
             finish_script_error_stage(runtime, stage_sink, detail, "search")
             explore_candidate = runtime.explore_candidate if isinstance(runtime.explore_candidate, dict) else None
             if _dbg.active():

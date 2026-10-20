@@ -543,7 +543,8 @@ def test_item11_validation_reports_the_network_category_and_http_status(monkeypa
 
 
 def test_item11_http_status_semantics_follow_the_app() -> None:
-    """E:10353 shouldPassHTTPErrorBodyToRules: non-2xx throws, except loginCheckJs sources and passable 4xx JSON bodies."""
+    """E:10353 shouldPassHTTPErrorBodyToRules (F3 rule = App 1.1.1): non-2xx throws, except loginCheckJs sources and passable 4xx
+    bodies. App 1.1.2 (R156 G2) widens it for search / explore 404 / 410 and pure-JS rules; see test_validator_r156.py."""
     blocks = validator.app_http_error_blocks_rules
     assert not blocks(200, "x", "toc") and not blocks(0, "", "toc") and not blocks(10, "", "toc")  # stub / transport statuses
     assert blocks(500, '{"a":1}', "content") and blocks(403, '{"a":1}', "content") and blocks(429, '{"a":1}', "search")

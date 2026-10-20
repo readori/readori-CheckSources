@@ -48,6 +48,13 @@ DEFAULT_MAX_ROWS = 300
 
 # Readori failure classes that are not rule/engine gaps.
 FLAKY_READORI_CLASSES = ("timeout", "network", "missing")
+# R156: Legado-only classes that are deliberate differences, not engine gaps. They stay in the work list as their own
+# rows but are excluded from the headline rate (numerator and denominator):
+#   legadoInsecureTls - Readori failed on a TLS certificate error; Legado's HTTP client trusts every certificate
+#                       (user decision: Readori keeps certificate validation).
+#   disabled          - the source has enabled=false; Legado CheckSource ignores the flag, the validator does not check
+#                       disabled sources.
+EXCLUDED_READORI_CLASSES = ("legadoInsecureTls", "disabled")
 SKIPPED_PREFIX = "skipped:"
 SKIP_REASON_LIMIT = "validator-limit"
 SKIP_REASON_NOT_VALIDATED = "not-validated"
@@ -137,7 +144,8 @@ def _index_results(results: list[Any], normalize) -> dict[str, dict[str, Any]]:
 
 
 def classify_readori_failure(entry: dict[str, Any] | None) -> str:
-    """``pass`` | ``timeout`` | ``network`` | ``needsInteraction`` | ``rule`` | ``missing``."""
+    """``pass`` | ``timeout`` | ``network`` | ``needsInteraction`` | ``rule`` | ``missing`` | ``disabled`` |
+    ``legadoInsecureTls`` (the last two are excluded from the headline rate, see ``EXCLUDED_READORI_CLASSES``)."""
     if entry is None:
         return "missing"
     if entry.get("ok"):
@@ -145,6 +153,13 @@ def classify_readori_failure(entry: dict[str, Any] | None) -> str:
     verdict = str(entry.get("appVerdict") or "").lower()
     reason = str(entry.get("failureReason") or "")
     error = str(entry.get("error") or "")
+    if reason.strip().lower() == "disabled" or entry.get("enabled") is False:
+        return "disabled"
+    network_info = entry.get("networkError")
+    if isinstance(network_info, dict) and str(network_info.get("category") or "").lower() == "tls":
+        return "legadoInsecureTls"
+    if reason.lower().replace(" ", "") == "networkerror:tls":
+        return "legadoInsecureTls"
     if verdict == "timeout" or _TIMEOUT_PATTERN.search(reason) or _TIMEOUT_PATTERN.search(error):
         return "timeout"
     if verdict in ("needsinteraction", "needs_interaction"):
@@ -402,22 +417,43 @@ def compare(
     flaky_non_vacuous = sum(
         1 for item in legado_only if item["readoriFailureClass"] in FLAKY_READORI_CLASSES and not item["vacuous"]
     )
+    excluded_classes: dict[str, int] = {name: 0 for name in EXCLUDED_READORI_CLASSES}
+    excluded_non_vacuous = 0
+    for item in legado_only:
+        if item["readoriFailureClass"] in EXCLUDED_READORI_CLASSES:
+            excluded_classes[item["readoriFailureClass"]] += 1
+            if not item["vacuous"]:
+                excluded_non_vacuous += 1
+    excluded_total = sum(excluded_classes.values())
 
     def ratio(numerator: int, denominator: int) -> float | None:
         return round(numerator / denominator, 6) if denominator else None
 
-    # Headline: vacuous Legado passes (nothing was checked) are not evidence of a working source.
-    relative = ratio(both_non_vacuous, legado_pass_non_vacuous)
-    relative_incl_vacuous = ratio(both, legado_pass_count)
-    work_order = {"rule": 0, "needsInteraction": 1, "network": 2, "timeout": 3, "missing": 4}
+    # Headline: vacuous Legado passes (nothing was checked) are not evidence of a working source, and the R156
+    # deliberate-difference classes (insecure TLS, disabled sources) are left out of both sides.
+    headline_denominator = legado_pass_non_vacuous - excluded_non_vacuous
+    relative = ratio(both_non_vacuous, headline_denominator)
+    relative_incl_vacuous = ratio(both, legado_pass_count - excluded_total)
+    work_order = {
+        "rule": 0,
+        "needsInteraction": 1,
+        "network": 2,
+        "timeout": 3,
+        "missing": 4,
+        "legadoInsecureTls": 5,
+        "disabled": 6,
+    }
     legado_only.sort(key=lambda item: (work_order.get(item["readoriFailureClass"], 9), item["bookSourceUrl"]))
     readori_only.sort(key=lambda item: (item["legadoFailureClass"], item["bookSourceUrl"]))
 
     rates = {
         "relativeRate": relative,
         "relativeRateInclVacuous": relative_incl_vacuous,
-        "relativeRateExcludingFlaky": ratio(both_non_vacuous, legado_pass_non_vacuous - flaky_non_vacuous),
-        "relativeRateExcludingFlakyInclVacuous": ratio(both, legado_pass_count - flaky_legado_only),
+        "relativeRateExcludingFlaky": ratio(
+            both_non_vacuous, headline_denominator - flaky_non_vacuous
+        ),
+        "relativeRateExcludingFlakyInclVacuous": ratio(both, legado_pass_count - excluded_total - flaky_legado_only),
+        "relativeRateInclExcludedClasses": ratio(both_non_vacuous, legado_pass_non_vacuous),
         "relativeRateNonVacuous": relative,
         "legadoPassRate": ratio(legado_pass_count, total),
         "readoriPassRate": ratio(readori_pass_count, total),
@@ -434,8 +470,11 @@ def compare(
         "readoriOnly": len(readori_only),
         "neither": neither,
         "legadoOnlyFlaky": flaky_legado_only,
+        "legadoOnlyExcluded": excluded_total,
+        "legadoOnlyExcludedClasses": excluded_classes,
         "legadoVacuousPass": legado_vacuous_pass,
         "legadoPassNonVacuous": legado_pass_non_vacuous,
+        "legadoPassHeadlineDenominator": headline_denominator,
         "readoriMissing": readori_missing,
         "readoriSkipped": mapping["skipped"],
         "readoriReportOnly": len(set(readori) - matched_readori),
@@ -526,7 +565,8 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
     lines.append(
         f"**Relative rate (non-vacuous): {_percent(rates['relativeRate'])}** "
         f"(target {_percent(rates['target'])}, {verdict} target) = both pass / Legado pass, "
-        f"vacuous Legado passes excluded = {counts['bothNonVacuous']} / {counts['legadoPassNonVacuous']}"
+        f"vacuous Legado passes and the excluded classes below left out = "
+        f"{counts['bothNonVacuous']} / {counts.get('legadoPassHeadlineDenominator', counts['legadoPassNonVacuous'])}"
     )
     lines.append("")
     lines.append("| Metric | Value |")
@@ -548,6 +588,15 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
         ),
         ("Relative rate including vacuous Legado passes", _percent(rates["relativeRateInclVacuous"])),
         ("Legado vacuous passes (no search / explore ran)", counts["legadoVacuousPass"]),
+        (
+            "Excluded: Readori TLS certificate failure (Legado trusts all certificates)",
+            (counts.get("legadoOnlyExcludedClasses") or {}).get("legadoInsecureTls", 0),
+        ),
+        (
+            "Excluded: source disabled (Legado ignores enabled=false)",
+            (counts.get("legadoOnlyExcludedClasses") or {}).get("disabled", 0),
+        ),
+        ("Relative rate if the excluded classes were counted", _percent(rates.get("relativeRateInclExcludedClasses"))),
         ("Readori verdict via the group representative", counts["readoriMapping"]["group"]),
         ("Skipped by the validator", counts["readoriSkipped"]),
         ("Missing from Readori report", counts["readoriMissing"]),
@@ -570,7 +619,8 @@ def render_markdown(parity: dict[str, Any], max_rows: int = DEFAULT_MAX_ROWS) ->
             lines.append(f"| {md_cell(name, 40)} | {number} |")
         lines.append("")
         lines.append(
-            "`rule` and `needsInteraction` are engine gaps; `timeout`, `network` and `missing` are usually site flakiness."
+            "`rule` and `needsInteraction` are engine gaps; `timeout`, `network` and `missing` are usually site flakiness; "
+            "`legadoInsecureTls` and `disabled` are deliberate differences and are excluded from the headline rate."
         )
         lines.append("")
 
