@@ -1169,12 +1169,15 @@ def response_url_differs_from_request(request_url: str, final_url: str) -> bool:
     carriers compare by their URL part."""
     request_part = parse_url_options(request_url or "")[0].strip()
     final_part = str(final_url or "").strip()
+    # R155b (P3-5): `http://host` and `http://host/` are the same resource, not a redirect.
+    request_part = request_part.rstrip("/")
+    final_part = final_part.rstrip("/")
     if final_part == request_part:
         return False
     try:
         from requests.utils import requote_uri
 
-        if final_part == requote_uri(request_part):
+        if final_part == requote_uri(request_part).rstrip("/"):
             return False
     except Exception:
         pass
@@ -9858,6 +9861,9 @@ def is_legado_element_rule(selector: str) -> bool:
     low = text.lower()
     if "@js:" in low or "<js>" in low:
         return False
+    # R155b (P3-8): `{{...}}` template rules would evaluate nested JS from inside a QuickJS callback; keep the CSS path.
+    if "{{" in text:
+        return False
     if _LEGADO_ELEMENT_RULE_PREFIX_RE.search(text):
         return True
     if "@" in text or "||" in text or "&&" in text or "%%" in text:
@@ -11287,6 +11293,16 @@ class _SourceOrderHTMLFormatter(HTMLFormatter):
     def quoted_attribute_value(self, value: str) -> str:
         return '"' + str(value) + '"'
 
+    def substitute(self, ns: str) -> str:
+        """R155b (P2-3): text nodes are escaped like Jsoup Entities.escape (base mode): `&` -> `&amp;`, `<` -> `&lt;`,
+        `>` -> `&gt;`, U+00A0 -> `&nbsp;`. Text under `<script>` / `<style>` is a Jsoup DataNode and stays raw."""
+        from bs4.element import NavigableString
+
+        parent = getattr(ns, "parent", None)
+        if isinstance(ns, NavigableString) and parent is not None and getattr(parent, "name", None) in ("script", "style"):
+            return ns
+        return str(ns).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\u00a0", "&nbsp;")
+
 
 _SOURCE_ORDER_HTML_FORMATTER = _SourceOrderHTMLFormatter()
 
@@ -11294,6 +11310,9 @@ _SOURCE_ORDER_HTML_FORMATTER = _SourceOrderHTMLFormatter()
 def _serialize_html(value: Any) -> str:
     if hasattr(value, "decode"):
         return value.decode(formatter=_SOURCE_ORDER_HTML_FORMATTER)
+    if type(value).__name__ == "NavigableString":
+        # R155b (P2-3): a bare text-node child (innerHtml) is escaped like the text nodes inside an element.
+        return _SOURCE_ORDER_HTML_FORMATTER.substitute(value)
     return str(value)
 
 
@@ -11649,7 +11668,17 @@ def evaluate_json_rule(rule: str, content: str, runtime: RuleRuntime) -> list[st
         return []
     path = text
     if path and not path.startswith(("$", "[")):
-        path = "$." + path
+        if (
+            path.startswith(".")
+            and app_profiles.current_app_profile().json_leading_dot_deep_scan
+            and (path.startswith(("..", ".[")) or path in {".", ".*"})
+        ):
+            # R155b (P3-3), App profile 1.1.2: JSONPathEngine.normalizePath deep-scans a single leading `.` only; `..x`, `.[`,
+            # `.` and `.*` keep their own meaning (same exclusions as evaluate_json_object_list). Every other
+            # path (and the whole of 1.1.1) keeps the Jayway `"$." + path`.
+            path = "$" + path
+        else:
+            path = "$." + path
     if path.startswith("$.["):
         path = "$" + path[2:]
     property_union = evaluate_legado_jsonpath_property_union(obj, path)
@@ -15075,6 +15104,31 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
             runtime2.book_name = name
     if _dbg.active() and str(info_rule.get("name") or "").strip():
         _dbg.emit("field", field="name", rule=str(info_rule.get("name")), value=name)
+    # R155 (Q) / R155b (P3-9): Legado BookInfo.kt:68-140 evaluates EVERY info field in order (name, author, kind, wordCount,
+    # lastChapter, intro, coverUrl, then tocUrl) and the App does the same, so the `@put:{k:rule}` / `java.put` of a field the
+    # validator otherwise ignores still runs before the TOC / content stages ask for it (漫客栈 `wordCount:
+    # "@put:{p:$.comic_id}"` feeds `comic_id=@get:{p}` of chapterUrl). Only fields whose rule can have such a side effect are
+    # evaluated (once each, in Legado order, interleaved with the fields the validator evaluates itself: name above, kind
+    # below); their errors never fail the detail stage (Legado catches them).
+    evaluated_info_side_effect_fields: set[str] = set()
+
+    def run_info_side_effect_field(side_effect_field: str) -> None:
+        if side_effect_field in evaluated_info_side_effect_fields:
+            return
+        side_effect_rule = str(info_rule.get(side_effect_field) or "").strip()
+        side_effect_low = side_effect_rule.lower()
+        if "@put:" not in side_effect_low and "java.put(" not in side_effect_low:
+            return
+        evaluated_info_side_effect_fields.add(side_effect_field)
+        saved_script_error = runtime2.script_error
+        try:
+            evaluate_get_string(side_effect_rule, html, runtime2, "json" if is_json_content(html) else "html")
+        except Exception as _swallowed:
+            note_debug_error("detail field side effects", _swallowed)
+        finally:
+            runtime2.script_error = saved_script_error
+
+    run_info_side_effect_field("author")
     kind = ""
     if str(info_rule.get("kind") or "").strip():
         kind_values = evaluate_rule(str(info_rule.get("kind")), html, runtime2, "json" if is_json_content(html) else "html")
@@ -15097,23 +15151,8 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
         runtime2.book_kind = kind
         runtime2.variables = runtime2.variables or {}
         runtime2.variables.update({"book.kind": kind, "bookKind": kind, "kind": kind})
-    # R155 (Q): Legado BookInfo.kt:68-140 evaluates EVERY info field in order (name, author, kind, wordCount, lastChapter,
-    # intro, coverUrl, then tocUrl) and the App does the same (BookSourceEngine.swift:9059 ...), so the `@put:{k:rule}` /
-    # `java.put` of a field the validator otherwise ignores still runs before the TOC / content stages ask for it
-    # (漫客栈 `wordCount: "@put:{p:$.comic_id}"` feeds `comic_id=@get:{p}` of chapterUrl). Only fields whose rule can
-    # have such a side effect are evaluated; their errors never fail the detail stage (Legado catches them).
-    for side_effect_field in ("author", "wordCount", "lastChapter", "intro", "coverUrl"):
-        side_effect_rule = str(info_rule.get(side_effect_field) or "").strip()
-        side_effect_low = side_effect_rule.lower()
-        if "@put:" not in side_effect_low and "java.put(" not in side_effect_low:
-            continue
-        saved_script_error = runtime2.script_error
-        try:
-            evaluate_get_string(side_effect_rule, html, runtime2, "json" if is_json_content(html) else "html")
-        except Exception as _swallowed:
-            note_debug_error("detail field side effects", _swallowed)
-        finally:
-            runtime2.script_error = saved_script_error
+    for side_effect_field in ("wordCount", "lastChapter", "intro", "coverUrl"):
+        run_info_side_effect_field(side_effect_field)
     if str(info_rule.get("tocUrl") or "").strip():
         toc_rule_text = str(info_rule.get("tocUrl"))
         content_type = "json" if is_json_content(html) else "html"
@@ -15196,7 +15235,14 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
     # let an error body pass whenever a rule happened to pull a value from it). HTML pages with embedded JSON are not JSON
     # responses, so the check is limited to a body that is JSON itself.
     if isinstance(json_obj, dict) and not html.lstrip().startswith("<") and is_likely_detail_error_json(json_obj):
-        return False, "", "", _app_json_fallback_string(json_obj, ["msg", "message", "error", "errorMsg", "reason"]) or "detail api error"
+        detail_error_text = _app_json_fallback_string(json_obj, ["msg", "message", "error", "errorMsg", "reason"]) or "detail api error"
+        if not app_profiles.current_app_profile().detail_error_json_requires_empty_info:
+            return False, "", "", detail_error_text
+        # R155b J (1.1.2): Legado BookInfo never rejects a body; the App only throws when nothing usable was extracted
+        # (no book name and no tocUrl distinct from the book URL; BookSourceEngine.swift getBookInfo).
+        stripped_toc_url = toc_url.strip()
+        if not name.strip() and (not stripped_toc_url or stripped_toc_url in {book_url, abs_url}):
+            return False, "", "", detail_error_text
 
     should_recover_toc_from_html = toc_heuristics_allowed and (not toc_url.strip() or is_likely_search_or_explore_landing_url(toc_url, runtime2))
     html_for_toc_recovery = original_html if original_html.strip() and not is_json_content(original_html) else html
@@ -16249,7 +16295,9 @@ def resolve_toc_source(session: requests.Session, src: dict[str, Any], runtime: 
             volume_values = evaluate_rule(is_volume_rule, item, item_runtime, item_type) if is_volume_rule else []
             is_volume_text = legado_get_string_value(volume_values)
             if not is_volume_text and toc_item_object and (heuristic_toc or not is_volume_rule):
-                is_volume_text = json_first_text(toc_item_object, ["isVolume", "is_volume", "volume", "isPart"])
+                # R155b (1.1.2): "volume" is a volume number in many APIs, not a boolean (BookSourceEngine.swift isVolume fallback).
+                is_volume_keys = ["isVolume", "is_volume", "isPart"] if app_profiles.current_app_profile().toc_volume_key_excluded else ["isVolume", "is_volume", "volume", "isPart"]
+                is_volume_text = json_first_text(toc_item_object, is_volume_keys)
             is_volume = legado_is_true(is_volume_text) or (heuristic_toc and is_likely_volume_title(title))
             item_runtime.chapter_is_volume = is_volume
             item_runtime.variables["__chapter.isVolume"] = is_volume

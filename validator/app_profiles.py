@@ -60,6 +60,12 @@ class AppProfile:
     interaction_verdict: str  # A4: "invalid" | "needsInteraction"
     list_put_on_whole_content: bool = False  # A5 (R155 C): list rule `base@put:{…}` runs the put on the whole content
     json_leading_dot_deep_scan: bool = False  # A6 (R155 N): `.key[*]` is `$..key[*]` (Jayway), not a root-level key
+    # A7 (R155b J): an error-shaped JSON detail body fails the detail stage only when the rules / fallbacks extracted
+    # neither a book name nor a tocUrl distinct from the book URL (Legado BookInfo never rejects a body); 1.1.1 fails it
+    # before any field rule runs.
+    detail_error_json_requires_empty_info: bool = False
+    # A8 (R155b): the toc JSON fallback for `isVolume` no longer reads the key `volume` (a volume NUMBER in many APIs).
+    toc_volume_key_excluded: bool = False
 
 
 APP_PROFILES: dict[str, AppProfile] = {
@@ -67,6 +73,7 @@ APP_PROFILES: dict[str, AppProfile] = {
     "1.1.2": AppProfile(
         "1.1.2", False, "gson-text", "on-demand-builtin", "needsInteraction",
         list_put_on_whole_content=True, json_leading_dot_deep_scan=True,
+        detail_error_json_requires_empty_info=True, toc_volume_key_excluded=True,
     ),
 }
 
