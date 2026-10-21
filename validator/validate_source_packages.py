@@ -10978,7 +10978,7 @@ def _jsoup_text_regex_pseudo_prepare(root: Any, selector: str) -> tuple[str, lis
         # ignored): `_jsoup_text` is the text `@text` uses; `_jsoup_own_text` is Jsoup ownText() (direct text nodes, no separator).
         for node in nodes:
             node_text = _jsoup_own_text(node) if own else _jsoup_text(node)
-            if pattern.search(node_text):
+            if regex_find(pattern, node_text):
                 node[marker] = "1"
                 marked.append((node, marker))
         out.append(selector[pos:found.start()])
@@ -11015,7 +11015,7 @@ def _jsoup_regex_attr_prepare(root: Any, selector: str) -> tuple[str, list[tuple
             value = node.get(name)
             if isinstance(value, (list, tuple)):
                 value = " ".join(value)
-            if value is not None and pattern.search(str(value)):
+            if value is not None and regex_find(pattern, str(value)):
                 node[marker] = "1"
                 marked.append((node, marker))
         return "[%s]" % marker
@@ -14021,6 +14021,247 @@ def apply_replace_chain(value: str, chain: str) -> str:
     return out
 
 
+# --------------------------------------------------------------------------------------------------------------------------------------------------
+# R158c: user regexes over whole pages must neither be O(n^2) nor freeze every other worker.
+#
+# `re` holds the GIL for the whole call, so one catastrophic `re.sub` (m.hongxiu.com ruleContent.replaceRegex `##(\s|\S)*?阅读上一章|目录.*\s|-/-` on a
+# 100K-char chapter whose literals are absent: ~150 s) freezes the batch's idle-timeout loop and every other worker. Two measures:
+#   1. an EXACT literal prefilter: a top-level alternation branch that provably needs a literal run absent from the text can never match, so it is
+#      dropped (all dropped = no match, instantly). Semantics stay those of `re`.
+#   2. for inputs over REGEX_LARGE_INPUT_CHARS the optional `regex` module (GIL released while matching, honours `timeout=`) runs the search; its
+#      TimeoutError becomes SourceValidationDeadlineExceeded. Without `regex` the code uses `re` as before.
+REGEX_LARGE_INPUT_CHARS = 20000
+REGEX_LARGE_INPUT_TIMEOUT_CAP_SECONDS = 120.0
+REGEX_PREFILTER_MIN_LITERAL = 2
+
+try:  # optional: requirements-validate-sources.txt lists it; the validator still works without it
+    import regex as _regex_module  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - depends on the environment
+    _regex_module = None
+
+try:  # Python 3.11+: `re._parser`; older versions had `sre_parse`
+    import re._parser as _re_parser  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    _re_parser = None
+
+
+def _literal_runs_of_branch(items: Any, parser: Any) -> list[str]:
+    """Literal runs (consecutive LITERAL opcodes at the branch's TOP level, plus those of plain non-alternating groups) every match of the branch
+    must contain. Anything else (repeats, optionals, alternations, lookarounds, flag groups, back-references) contributes nothing."""
+    runs: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            runs.append("".join(current))
+            current.clear()
+
+    for opcode, argument in items:
+        name = str(opcode)
+        if name == "LITERAL":
+            current.append(chr(argument))
+            continue
+        flush()
+        if name == "SUBPATTERN":
+            # (group, add_flags, del_flags, subpattern): a plain group is matched exactly once, so its own top-level runs are required too
+            group_flags = argument[1] | argument[2]
+            inner = list(argument[3])
+            if not group_flags and not any(str(op) == "BRANCH" for op, _arg in inner):
+                runs.extend(_literal_runs_of_branch(inner, parser))
+    flush()
+    return runs
+
+
+def _has_unsafe_opcode(items: Any) -> bool:
+    """Back-references / conditionals anywhere make group renumbering or branch dropping unsafe."""
+    stack = [items]
+    while stack:
+        current = stack.pop()
+        for opcode, argument in current:
+            name = str(opcode)
+            if name in {"GROUPREF", "GROUPREF_EXISTS", "GROUPREF_IGNORE", "GROUPREF_LOC_IGNORE", "GROUPREF_UNI_IGNORE"}:
+                return True
+            if name == "BRANCH":
+                for branch in argument[1]:
+                    stack.append(branch)
+            elif name == "SUBPATTERN":
+                stack.append(argument[3])
+            elif name in {"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"}:
+                stack.append(argument[2])
+            elif name in {"ASSERT", "ASSERT_NOT"}:
+                stack.append(argument[1])
+            elif name in {"ATOMIC_GROUP"}:
+                stack.append(argument)
+    return False
+
+
+def _split_top_level_alternation(pattern: str) -> list[str] | None:
+    """The textual top-level `|` branches of `pattern` (escapes, character classes and groups respected); None when the text carries anything that
+    makes a re-join unsafe (an inline flag group other than at the very start would change what a lone branch means)."""
+    branches: list[str] = []
+    start = 0
+    depth = 0
+    in_class = False
+    index = 0
+    length = len(pattern)
+    while index < length:
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+            index += 1
+            continue
+        if char == "[":
+            in_class = True
+            index += 1
+            if index < length and pattern[index] == "^":
+                index += 1
+            if index < length and pattern[index] == "]":
+                index += 1
+            continue
+        if char == "(":
+            if pattern.startswith("(?", index) and index + 2 < length and pattern[index + 2] in "aiLmsux-":
+                return None  # inline flags (global or scoped): keep the whole pattern
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "|" and depth == 0:
+            branches.append(pattern[start:index])
+            start = index + 1
+        index += 1
+    branches.append(pattern[start:])
+    return branches
+
+
+@functools.lru_cache(maxsize=256)
+def _analyze_regex_for_prefilter(pattern: str, flags: int) -> tuple[int, int, tuple[tuple[str, tuple[str, ...]], ...]] | None:
+    """(compile flags, capturing group count, ((branch text | "", required literal runs of length >= 2), ...)) or None when nothing can be said.
+    A single-branch pattern is reported as one entry whose text is the whole pattern."""
+    if _re_parser is None:
+        return None
+    try:
+        parsed = _re_parser.parse(pattern, flags)
+    except Exception:
+        return None
+    try:
+        state_flags = int(parsed.state.flags)
+        group_count = int(parsed.state.groups) - 1
+        items = list(parsed)
+        if _has_unsafe_opcode(items):
+            return None
+        if len(items) == 1 and str(items[0][0]) == "BRANCH":
+            branch_items = [list(branch) for branch in items[0][1][1]]
+            texts = _split_top_level_alternation(pattern)
+            if texts is None or len(texts) != len(branch_items):
+                texts = [""] * len(branch_items)  # runs are still usable for the all-branches-dropped case
+        else:
+            branch_items = [items]
+            texts = [pattern]
+        entries = []
+        for text, branch in zip(texts, branch_items):
+            runs = tuple(run for run in _literal_runs_of_branch(branch, _re_parser) if len(run) >= REGEX_PREFILTER_MIN_LITERAL)
+            entries.append((text, runs))
+        return state_flags, group_count, tuple(entries)
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=256)
+def _ignore_case_literal_pattern(literal: str, flags: int) -> "re.Pattern[str]":
+    return re.compile(re.escape(literal), flags)
+
+
+def _text_contains_literal(text: str, literal: str, flags: int) -> bool:
+    """Whether a match of the literal is possible in `text`: a plain substring test, or `re` itself under IGNORECASE (the same per-character case
+    folding the compiled pattern uses)."""
+    if not flags & re.IGNORECASE:
+        return literal in text
+    return _ignore_case_literal_pattern(literal, flags & (re.IGNORECASE | re.ASCII | re.UNICODE)).search(text) is not None
+
+
+def prefiltered_regex(compiled: "re.Pattern[str]", text: str, replacement_uses_groups: bool) -> tuple[bool, "re.Pattern[str]"]:
+    """R158c exact prefilter. Returns (can_match, pattern_to_run): `can_match` False means NO match is possible in `text` (every top-level
+    alternation branch needs a literal run that `text` lacks); otherwise the surviving branches (when some were dropped and renumbering is
+    harmless) or the original pattern. Results are identical to running `compiled` on `text`."""
+    analysis = _analyze_regex_for_prefilter(compiled.pattern, compiled.flags)
+    if analysis is None:
+        return True, compiled
+    state_flags, group_count, entries = analysis
+    survivors: list[str] = []
+    dropped = 0
+    for branch_text, runs in entries:
+        if any(not _text_contains_literal(text, run, state_flags) for run in runs):
+            dropped += 1
+        else:
+            survivors.append(branch_text)
+    if dropped == len(entries):
+        return False, compiled
+    if dropped == 0 or len(entries) == 1:
+        return True, compiled
+    if (group_count and replacement_uses_groups) or any(not branch for branch in survivors) or ("" in survivors):
+        return True, compiled
+    try:
+        rebuilt = re.compile("|".join(survivors), compiled.flags)
+    except re.error:
+        return True, compiled
+    return True, rebuilt
+
+
+def _regex_large_timeout() -> float:
+    return remaining_source_validation_seconds(REGEX_LARGE_INPUT_TIMEOUT_CAP_SECONDS)
+
+
+@functools.lru_cache(maxsize=128)
+def _regex_module_pattern(pattern: str, flags: int) -> Any:
+    return _regex_module.compile(pattern, flags=flags | _regex_module.VERSION0)
+
+
+def large_input_pattern(compiled: "re.Pattern[str]", text: str) -> Any:
+    """The `regex`-module twin of `compiled` for a large `text` (GIL-free, timeout-capable); `compiled` itself for small inputs, when `regex` is
+    missing, or when `regex` cannot compile the pattern."""
+    if _regex_module is None or len(text) <= REGEX_LARGE_INPUT_CHARS:
+        return compiled
+    try:
+        return _regex_module_pattern(compiled.pattern, compiled.flags)
+    except Exception:
+        return compiled
+
+
+def regex_search(compiled: "re.Pattern[str]", text: str) -> Any:
+    """`compiled.search(text)`; over REGEX_LARGE_INPUT_CHARS with the `regex` module and the source's remaining budget as its timeout."""
+    runner = large_input_pattern(compiled, text)
+    if runner is compiled:
+        return compiled.search(text)
+    timeout = _regex_large_timeout()
+    try:
+        return runner.search(text, timeout=timeout, concurrent=True)
+    except TimeoutError as error:
+        raise SourceValidationDeadlineExceeded("regex search exceeded the source validation budget") from error
+
+
+def regex_sub(compiled: "re.Pattern[str]", replacer: Any, text: str, count: int = 0) -> str:
+    """`compiled.sub(replacer, text, count)` with the same large-input handling as `regex_search`."""
+    runner = large_input_pattern(compiled, text)
+    if runner is compiled:
+        return compiled.sub(replacer, text, count=count)
+    timeout = _regex_large_timeout()
+    try:
+        return runner.sub(replacer, text, count=count, timeout=timeout, concurrent=True)
+    except TimeoutError as error:
+        raise SourceValidationDeadlineExceeded("regex substitution exceeded the source validation budget") from error
+
+
+def regex_find(compiled: "re.Pattern[str]", text: str) -> Any:
+    """`compiled.search(text)` through the prefilter and the large-input path (the Jsoup `:matches` / `[attr~=regex]` marker searches)."""
+    can_match, runner = prefiltered_regex(compiled, text, False)
+    if not can_match:
+        return None
+    return regex_search(runner, text)
+
+
 def _java_regex_replacement(match: re.Match[str], replacement: str) -> str:
     """Expand a Java Matcher replacement string (``$n``, ``${name}``, ``\\x``)."""
     out: list[str] = []
@@ -14138,13 +14379,23 @@ def legado_replace_regex(value: str, chain: str) -> str:
             regex = re.compile(pattern)
     except re.error:
         return replacement if replace_first else value.replace(pattern, replacement)
+    # R158c: the exact literal prefilter (no match possible -> no scan at all) and the GIL-free large-input path; results equal plain `re`.
+    uses_groups = "$" in replacement
+    can_match, runner = prefiltered_regex(regex, value, uses_groups)
     if replace_first:
-        first = regex.search(value)
+        if not can_match:
+            return ""
+        first = regex_search(runner, value)
         if first is None:
             return ""
         matched = first.group(0)
-        return regex.sub(lambda m: _java_regex_replacement(m, replacement), matched, count=1)
-    return regex.sub(lambda m: _java_regex_replacement(m, replacement), value)
+        can_match_inner, inner_runner = prefiltered_regex(regex, matched, uses_groups)
+        if not can_match_inner:
+            return matched
+        return regex_sub(inner_runner, lambda m: _java_regex_replacement(m, replacement), matched, count=1)
+    if not can_match:
+        return value
+    return regex_sub(runner, lambda m: _java_regex_replacement(m, replacement), value)
 
 
 def apply_legado_content_replace_indent(value: str) -> str:
@@ -18903,15 +19154,23 @@ def resolve_toc_source(
                 seen_urls: set[str] = set()
                 kept_rows = [row for row in window_rows if not (row[0] in seen_urls or seen_urls.add(row[0]))]
             else:
-                later_urls: set[str] = set(tail_urls)
-                survivors: list[tuple[str, str, RuleRuntime, int, int, dict[str, str]]] = []
-                for row in reversed(window_rows):
-                    if row[0] not in later_urls:
-                        later_urls.add(row[0])
-                        survivors.append(row)
-                kept_rows = list(reversed(survivors))
-            # Every window row can repeat later on the page: nothing is left to sample (App `guard let firstChapter = chapters.first else`
-            # fails the stage, BookSourceValidator.swift ~2504), which is the ordinary "no usable chapter" outcome below.
+                def _keep_last_per_url(later_urls: set[str]) -> list[tuple[str, str, RuleRuntime, int, int, dict[str, str]]]:
+                    survivors: list[tuple[str, str, RuleRuntime, int, int, dict[str, str]]] = []
+                    for row in reversed(window_rows):
+                        if row[0] not in later_urls:
+                            later_urls.add(row[0])
+                            survivors.append(row)
+                    return list(reversed(survivors))
+
+                kept_rows = _keep_last_per_url(set(tail_urls))
+                # R158c (dbxsd / dbxsn, App `validationChapterSample`): a toc page that lists its chapters more than once puts every window
+                # row into `tail_urls`, which would empty the sample ("no usable chapter"). Legado keeps the last occurrence of a url (the
+                # repeated list), whose page is the very one the window row points at, so an EMPTY sample falls back to the window-only
+                # dedup (the pre-R158 behaviour). `tail_urls` is empty unless 1.1.2 `content_sample_dedups_whole_toc_page` collected it.
+                if not kept_rows and tail_urls:
+                    kept_rows = _keep_last_per_url(set())
+            # Nothing left to sample (App `guard let firstChapter = chapters.first else` fails the stage) is the ordinary "no usable
+            # chapter" outcome below.
             if kept_rows:
                 pick_url, pick_title, pick_runtime, pick_index, pick_count, pick_base = kept_rows[0]
                 first_chapter_final_url = final_url

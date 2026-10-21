@@ -5,5 +5,6 @@ lxml
 py7zr
 quickjs
 rarfile
+regex
 requests
 tzdata; sys_platform == "win32"

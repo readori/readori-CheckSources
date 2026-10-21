@@ -187,12 +187,26 @@ def test_g_the_tail_scan_reraises_a_validation_deadline(monkeypatch) -> None:
             _tail([{"name": "a", "url": "/a"}], TOC_RULE)
 
 
-def test_g_every_window_row_repeating_later_is_the_ordinary_no_chapter_failure(monkeypatch) -> None:
-    """16 window rows whose urls all repeat in the tail: nothing is left to sample (no IndexError)."""
+def test_g_a_toc_page_that_lists_its_chapters_twice_falls_back_to_the_window_only_dedup(monkeypatch) -> None:
+    """R158c dbxsd / dbxsn: `id.all-chapter@div@a` lists the chapters twice, so all 16 window rows repeat in the tail. The tail-aware dedup would
+    empty the sample ("no usable chapter"); the App (`validationChapterSample`) falls back to the window-only dedup, whose first row is the sample
+    (Legado keeps the repeated list whose page is the same). The fallback exists on 1.1.2 only; 1.1.1 never scans the tail."""
     rows = [{"name": f"c{i}", "url": f"/c/{i}"} for i in range(1, 17)] * 2
+    body = json.dumps({"list": rows})
     with app_profiles.app_profile_scope("1.1.2"):
-        out, _site = _toc_walk(monkeypatch, json.dumps({"list": rows}), TOC_RULE)
-        assert out[0] is False and out[2] == ""
+        out, site = _toc_walk(monkeypatch, body, TOC_RULE)
+        assert out[0] is True and out[2] == f"{BASE}/c/1"
+        assert site.log == ["/toc"]
+    with app_profiles.app_profile_scope("1.1.1"):
+        assert _toc_walk(monkeypatch, body, TOC_RULE)[0][2] == f"{BASE}/c/1"
+    # the fallback only applies when the tail-aware sample is EMPTY: a pinned row that repeats (ciyuanji) is still removed
+    with app_profiles.app_profile_scope("1.1.2"):
+        assert _toc_walk(monkeypatch, _pinned_toc(30), TOC_RULE)[0][2] == f"{BASE}/c/1"
+    # a window-only duplicate inside the fallback keeps the LAST occurrence of the url (window-only dedup)
+    dup = [{"name": "pinned", "url": "/c/9"}] + [{"name": f"c{i}", "url": f"/c/{i}"} for i in range(1, 16)]
+    with app_profiles.app_profile_scope("1.1.2"):
+        out, _site = _toc_walk(monkeypatch, json.dumps({"list": dup + dup}), TOC_RULE)
+        assert out[2] == f"{BASE}/c/1"  # the pinned /c/9 row is deduped by the window's own c9, not sampled
 
 
 def _tail(rows: list[dict[str, Any]], rule: dict[str, Any], **kwargs: Any) -> set[str]:
@@ -844,3 +858,140 @@ def test_lone_js_init_needs_exactly_one_script_block(profile: str) -> None:
         # two `<js>` blocks are NOT one script: the generic segment pipeline runs them in turn
         assert vsp.evaluate_init_rule_nonthrowing("<js>result + '1'</js><js>result + '2'</js>", "x", rt, "html") == "x12"
         assert vsp.evaluate_init_rule_nonthrowing("<js>result + '1'</js>", "x", rt, "html") == "x1"
+
+
+# ------------------------------------------------------------------------- R158c: regex prefilter and the GIL-free large-input path
+
+HONGXIU_CHAIN = r"(\s|\S)*?阅读上一章|目录.*\s|-/-"
+
+
+def _plain_replace(value: str, chain: str) -> str:
+    """The pre-R158c semantics: plain `re` (Java dot conversion first), no prefilter, no `regex` module."""
+    parts = chain.split("##")
+    pattern, replacement = parts[0], parts[1] if len(parts) > 1 else ""
+    compiled = re.compile(vsp.java_regex_dot_to_python(pattern))
+    if len(parts) > 2:
+        first = compiled.search(value)
+        if first is None:
+            return ""
+        return compiled.sub(lambda m: vsp._java_regex_replacement(m, replacement), first.group(0), count=1)
+    return compiled.sub(lambda m: vsp._java_regex_replacement(m, replacement), value)
+
+
+def test_hongxiu_replace_regex_on_100k_text_without_the_literals_is_instant() -> None:
+    import time
+
+    text = ("这是一段没有任何标记的正文，只有普通文字。" * 6000)[:100_122]
+    assert len(text) > 100_000 and not any(literal in text for literal in ("阅读上一章", "目录", "-/-"))
+    started = time.monotonic()
+    assert vsp.legado_replace_regex(text, HONGXIU_CHAIN + "##") == text
+    assert vsp.legado_replace_regex(text, HONGXIU_CHAIN + "####") == ""  # replaceFirst: no match -> ""
+    assert time.monotonic() - started < 1.0
+
+
+def test_prefilter_leaves_results_identical_to_plain_re_with_and_without_the_literal() -> None:
+    import random
+
+    rng = random.Random(158)
+    pieces = ["阅读上一章", "目录", "-/-", " ", "\n", "abc", "正文", "x", "ABC", "目", "录", "-", "/"]
+    chains = [
+        HONGXIU_CHAIN + "##",
+        HONGXIU_CHAIN + "##[$]##",
+        r"目录.*\s|-/-##<>",
+        r"abc|xyz##[\0]",
+        r"(abc)|(目录)##$1$2",
+        r"ab(c)d|目录##$1",
+        r"(?i)abc|XYZ##_",
+        r"^目录|正文$###",
+        r"a.c|-/-##",
+    ]
+    for _ in range(60):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 40)))
+        for chain in chains:
+            expected = _plain_replace(text, chain)
+            assert vsp.legado_replace_regex(text, chain) == expected, (text, chain)
+
+
+def test_prefilter_replace_first_ignore_case_and_group_branches() -> None:
+    with_literal = "head -/- tail"
+    # replaceFirst: no possible match -> "", a present literal still replaces only the first match
+    assert vsp.legado_replace_regex("plain text", r"目录.*|-/-##X####") == ""
+    assert vsp.legado_replace_regex(with_literal, r"目录.*|-/-##X####") == "X"
+    # IGNORECASE: the literal is looked up case-insensitively, so a differently cased text still matches
+    assert vsp.legado_replace_regex("say ABC now", r"(?i)abc|xyz##_") == "say _ now"
+    assert vsp.legado_replace_regex("say nothing", r"(?i)abc|xyz##_") == "say nothing"
+    # a surviving branch with groups keeps its numbering when the replacement uses `$1`
+    assert vsp.legado_replace_regex("ab-c", r"(a)b|(x)y-c##[$1]") == "[a]-c"
+    assert vsp.legado_replace_regex("xy-c ab", r"(a)b|(x)y-c##[$1][$2]") == "[][x] [a][]"
+
+
+def test_prefilter_rebuilds_only_when_numbering_cannot_change() -> None:
+    compiled = re.compile(r"abc|(目录)|zzz")
+    can, runner = vsp.prefiltered_regex(compiled, "only abc here", False)
+    assert can is True and runner is not compiled and runner.pattern == "abc"  # no `$n` in the replacement: surviving branches only
+    can, runner = vsp.prefiltered_regex(compiled, "only abc here", True)
+    assert can is True and runner is compiled  # `$n` with groups present: keep the original numbering
+    can, _runner = vsp.prefiltered_regex(compiled, "nothing at all", False)
+    assert can is False
+    # patterns the analysis cannot reason about stay untouched
+    backref = re.compile(r"(a)\1|bb")
+    assert vsp.prefiltered_regex(backref, "no match here", False) == (True, backref)
+
+
+def test_large_inputs_use_the_regex_module_when_it_is_installed(monkeypatch) -> None:
+    pytest.importorskip("regex")
+    text = ("段落" * 15000) + "-/-" + ("尾" * 100)
+    assert len(text) > vsp.REGEX_LARGE_INPUT_CHARS
+    compiled = re.compile(r"-/-")
+    assert type(vsp.large_input_pattern(compiled, text)).__module__ in {"regex", "_regex"}
+    assert vsp.large_input_pattern(compiled, "short") is compiled
+    assert vsp.legado_replace_regex(text, "-/-##<>").count("<>") == 1
+    assert vsp.regex_search(compiled, text).start() == 30000
+    # without the module every input uses `re` as before
+    monkeypatch.setattr(vsp, "_regex_module", None)
+    assert vsp.large_input_pattern(compiled, text) is compiled
+    assert vsp.legado_replace_regex(text, "-/-##<>").count("<>") == 1
+
+
+def test_a_catastrophic_large_substitution_times_out_as_a_deadline_and_never_blocks_another_thread() -> None:
+    pytest.importorskip("regex")
+    import threading
+    import time
+
+    text = ("a" * 40_000) + "!"
+    ticks: list[float] = []
+    stop = threading.Event()
+
+    def ticker() -> None:
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0.01)
+
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        vsp.begin_source_validation_deadline(1.5)
+        try:
+            vsp.regex_sub(re.compile(r"(a+)+$b"), lambda m: "", text)
+            result["outcome"] = "returned"
+        except vsp.SourceValidationDeadlineExceeded:
+            result["outcome"] = "deadline"
+        finally:
+            vsp.clear_source_validation_deadline()
+
+    thread = threading.Thread(target=ticker, daemon=True)
+    thread.start()
+    worker = threading.Thread(target=run, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(30)
+    stop.set()
+    assert result.get("outcome") == "deadline" and time.monotonic() - started < 10
+    gaps = [later - earlier for earlier, later in zip(ticks, ticks[1:])]
+    assert gaps and max(gaps) < 0.5  # the GIL stayed free: the other thread kept ticking while the regex ran
+
+
+def test_matches_pseudo_and_attribute_regex_use_the_same_search_helper() -> None:
+    html = '<div id="a1"><p>x</p></div><div id="b2">y</div>'
+    assert len(json.loads(vsp.select_elements_json("div[id~=^a\\d$]", html, BASE))) == 1
+    assert len(json.loads(vsp.select_elements_json("div:matches(^y$)", html, BASE))) == 1
