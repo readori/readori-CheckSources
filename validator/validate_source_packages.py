@@ -15,6 +15,7 @@ import base64
 import contextlib
 import contextvars
 import copy
+import functools
 import hashlib
 import http.cookiejar
 import io
@@ -1205,11 +1206,19 @@ def response_url_differs_from_request(request_url: str, final_url: str) -> bool:
     carriers compare by their URL part."""
     request_part = parse_url_options(request_url or "")[0].strip()
     final_part = str(final_url or "").strip()
+    if app_profiles.current_app_profile().redirect_guard_ignores_url_fragment:
+        # R158 (G2, 1.1.2 `redirect_guard_ignores_url_fragment`; wenxue88 `https://host#{{key}}`): a fragment is never sent, so a response whose URL
+        # differs from the request only by it (`https://host#我的` vs `https://host/#%E6%88%91...`, `requests` re-quotes and adds the path slash)
+        # is not a redirect to a landing page. Both sides lose their fragment, then the usual compare runs.
+        request_part = request_part.split("#", 1)[0]
+        final_part = final_part.split("#", 1)[0]
     # R155b (P3-5): `http://host` and `http://host/` are the same resource, not a redirect.
     request_part = request_part.rstrip("/")
     final_part = final_part.rstrip("/")
     if final_part == request_part:
         return False
+    if app_profiles.current_app_profile().redirect_guard_ignores_url_fragment and unquote(final_part) == unquote(request_part):
+        return False  # R158: URLs that differ only by percent-encoding are the same URL (App 1.1.2 guard)
     try:
         from requests.utils import requote_uri
 
@@ -2645,7 +2654,11 @@ function __readoriBufferFromBytes(value) {
     return Buffer.from(String(value || ''), 'utf8');
 }
 if (typeof Array.prototype.toArray !== 'function') {
-    Array.prototype.toArray = function(){ return this; };
+    // R158 (E, BOTH profiles): Rhino's NativeJavaList enumerates only the indices (`for (i in list)`), and the App installs this helper with
+    // _readoriDefineHidden (JSEngine.swift `Array.prototype.toArray`, already in the 1.1.1 build: `git show HEAD:Readori/Core/Engine/JSEngine.swift`
+    // ~8686); an enumerable one made `for (i in $)` visit "toArray" as the last key (czbooks: `$[i].select` is not a function). The other
+    // list helpers keep their `js_list_helpers_non_enumerable` gating.
+    Object.defineProperty(Array.prototype, 'toArray', { value: function(){ return this; }, writable: true, configurable: true, enumerable: false });
 }
 if (typeof String.prototype.getBytes !== 'function') {
     String.prototype.getBytes = function(charset) {
@@ -3204,6 +3217,75 @@ var Packages = {
     android: { util: { Base64: Base64 }, os: { Build: AndroidBuild } },
     cn: { hutool: { core: { util: { ZipUtil: ZipUtil } } } }
 };
+// R158 D1 (1.1.2 `js_hutool_base64_shim`; gongzicp jsLib `var base64 = Packages.cn.hutool.core.codec.Base64`): hutool is on Legado's classpath.
+// A String argument is taken as UTF-8 bytes; encode / encodeStr / encodeUrlSafe (no padding) / encodeWithoutPadding answer a String (the
+// 3-argument encode answers byte[]), decode answers byte[], decodeStr UTF-8 text. Mirrors App `JSEngine` HutoolBase64.
+if (typeof __readoriHutoolBase64 !== 'undefined' && __readoriHutoolBase64) {
+    Packages.cn.hutool.core.codec = { Base64: (function() {
+        function utf8Bytes(value) {
+            if (value === null || value === undefined) return [];
+            if (typeof value === 'string' || Object.prototype.toString.call(value) === '[object String]') {
+                var raw = unescape(encodeURIComponent(String(value)));
+                var out = [];
+                for (var i = 0; i < raw.length; i++) out.push(raw.charCodeAt(i) & 255);
+                return out;
+            }
+            return __readoriToByteArray(value);
+        }
+        function encodeText(value, urlSafe, padded) {
+            var text = Base64.getEncoder().encodeToString(utf8Bytes(value));
+            if (urlSafe) text = text.replace(/\+/g, '-').replace(/\//g, '_');
+            if (urlSafe || !padded) text = text.replace(/=+$/, '');
+            return text;
+        }
+        function decodeBytes(value) {
+            var text = (typeof value === 'string') ? value : __readoriBytesToUtf8(value);
+            text = String(text || '').replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+            while (text.length % 4 !== 0) text += '=';
+            return Base64.decode(text, 0);
+        }
+        return {
+            encode: function(value, isMultiLine, isUrlSafe) {
+                var text = encodeText(value, arguments.length > 2 && !!isUrlSafe, true);
+                if (arguments.length > 2) return __readoriSignedBytes(utf8Bytes(text));
+                return text;
+            },
+            encodeStr: function(value, isMultiLine, isUrlSafe) { return encodeText(value, arguments.length > 2 && !!isUrlSafe, true); },
+            encodeUrlSafe: function(value) { return encodeText(value, true, false); },
+            encodeWithoutPadding: function(value) { return encodeText(value, false, false); },
+            decode: function(value) { return decodeBytes(value); },
+            decodeStr: function(value) { return __readoriBytesToUtf8(decodeBytes(value)); },
+            isBase64: function(value) {
+                var text = String(value === undefined || value === null ? '' : value);
+                return text.length > 0 && /^[A-Za-z0-9+\/_\-\s]*={0,2}$/.test(text);
+            }
+        };
+    })() };
+}
+// R158 (1.1.2 `js_str_response_shim`; asgportal loginCheckJs `Packages.io.legado.app.help.http.StrResponse(result.url(), body)`): Legado's
+// StrResponse(url, body) constructor (StrResponse.kt: status 200, no headers) as a response object like `java.getStrResponse`.
+if (typeof __readoriStrResponseShim !== 'undefined' && __readoriStrResponseShim) {
+    // The first argument may also be an existing response object (its url(), like the App's shim); the namespace is merged, not replaced.
+    Packages.io = Packages.io || {};
+    Packages.io.legado = Packages.io.legado || {};
+    Packages.io.legado.app = Packages.io.legado.app || {};
+    Packages.io.legado.app.help = Packages.io.legado.app.help || {};
+    Packages.io.legado.app.help.http = Packages.io.legado.app.help.http || {};
+    Packages.io.legado.app.help.http.StrResponse = function(urlOrResponse, body) {
+        var responseUrl = (urlOrResponse && typeof urlOrResponse.url === 'function')
+            ? String(urlOrResponse.url() || '')
+            : String(urlOrResponse === undefined || urlOrResponse === null ? '' : urlOrResponse);
+        return __readoriResponseObject((body === undefined || body === null) ? '' : String(body), responseUrl, 200, {}, {});
+    };
+}
+// R158 (1.1.2 `js_json_object_result_get`; asgportal `result.get("statusTips")`): a JSON-object `result` is a Java Map in Legado (AnalyzeRule
+// binds the parsed JSON), so `get(key)` answers the value or null. Non-enumerable like the other helpers.
+if (typeof __readoriJsonResultGet !== 'undefined' && __readoriJsonResultGet
+    && typeof result === 'object' && result !== null && !Array.isArray(result) && typeof result.get === 'undefined') {
+    try {
+        Object.defineProperty(result, 'get', { value: function(key) { var v = this[key]; return v === undefined ? null : v; }, configurable: true, writable: true, enumerable: false });
+    } catch (error) {}
+}
 function __readoriAesAlgorithm(mode, key) {
     var modeText = String(mode || 'AES/CBC/PKCS5Padding').toUpperCase();
     var blockMode = modeText.indexOf('/') < 0 || modeText.indexOf('/ECB/') >= 0 ? 'ecb' : 'cbc';
@@ -4097,6 +4179,52 @@ function __readoriSevenZipEntryString(url, entryName, charset) {
     if (bytes === null || bytes === undefined) return '';
     return __readoriBytesToString(bytes, charset || 'UTF-8');
 }
+// R158 (asgportal `java.ajax(url, {"method": "post", body: "..."})`): the options are Legado's lenient JSON (UrlOption is read with Gson
+// lenient: bare keys, single quotes, trailing commas); the App parses them with UrlWithOptions.parse + LegadoLenientJSON. Turn them into
+// strict JSON text (data only: no expressions are evaluated).
+function __readoriLenientJsonText(text) {
+    var out = '', i = 0, n = text.length;
+    while (i < n) {
+        var ch = text.charAt(i);
+        if (ch === '"' || ch === "'") {
+            var quote = ch, body = '';
+            i++;
+            while (i < n && text.charAt(i) !== quote) {
+                var c = text.charAt(i);
+                if (c === '\\' && i + 1 < n) {
+                    var e = text.charAt(i + 1);
+                    if (quote === "'" && e === "'") body += "'";
+                    else if (e === '"') body += '\\"';
+                    else body += c + e;
+                    i += 2;
+                    continue;
+                }
+                if (c === '"') body += '\\"';
+                else if (c === '\n') body += '\\n';
+                else if (c === '\r') body += '\\r';
+                else if (c === '\t') body += '\\t';
+                else body += c;
+                i++;
+            }
+            i++;
+            out += '"' + body + '"';
+            continue;
+        }
+        if (/[A-Za-z_$]/.test(ch)) {
+            var j = i;
+            while (j < n && /[\w$-]/.test(text.charAt(j))) j++;
+            var word = text.slice(i, j), k = j;
+            while (k < n && /\s/.test(text.charAt(k))) k++;
+            out += text.charAt(k) === ':' ? '"' + word + '"' : word;
+            i = j;
+            continue;
+        }
+        if (ch === '}' || ch === ']') out = out.replace(/,\s*$/, '');
+        out += ch;
+        i++;
+    }
+    return out;
+}
 function __readoriParseUrlOptions(raw) {
     var text = String(raw || '').trim();
     var idx = -1;
@@ -4104,12 +4232,16 @@ function __readoriParseUrlOptions(raw) {
         if (text.charAt(i) !== ',') continue;
         var tail = text.slice(i + 1).trim();
         if (tail.charAt(0) !== '{') continue;
-        try {
-            var opts = JSON.parse(tail);
-            if (opts && typeof opts === 'object') {
-                return { url: text.slice(0, i).trim(), options: opts };
-            }
-        } catch (error) {}
+        var candidates = [tail];
+        try { candidates.push(__readoriLenientJsonText(tail)); } catch (error) {}
+        for (var c = 0; c < candidates.length; c++) {
+            try {
+                var opts = JSON.parse(candidates[c]);
+                if (opts && typeof opts === 'object') {
+                    return { url: text.slice(0, i).trim(), options: opts };
+                }
+            } catch (error) {}
+        }
         if (idx < 0) idx = i;
     }
     return { url: text, options: {} };
@@ -4528,9 +4660,24 @@ var java = {
             arguments.length > 1 ? String(explicitBase || '') : ''
         );
     },
-    setContent: function(content) { result = content; __readoriContent = content; },
+    // R158 (1.1.2 `set_content_keeps_result_binding`): Legado AnalyzeRule.setContent (:84-96) replaces only `content`; the `result` / `src` Rhino
+    // bindings are built per evalJS (:774-788) and stay as they were. 1.1.1 App (JSEngine setContent_raw) overwrote `result` and `src`.
+    setContent: function(content) {
+        if (!(typeof __readoriSetContentKeepsResult !== 'undefined' && __readoriSetContentKeepsResult)) result = content;
+        __readoriContent = content;
+    },
     getElement: function(selector, html) {
         var sourceHtml = arguments.length > 1 ? String(html || '') : String(__readoriCurrentContent() || '');
+        // R158 (G6, 1.1.2 `js_get_element_json_whole_value`): Legado AnalyzeRule.getElement (:331-358) in JSON mode answers `getObject(rule)` - the matched VALUE (a string
+        // or the object), not a Jsoup element row (the App evaluates the rule with resolveElementsRule(...).first, JSEngine getElement).
+        // The WHOLE value (`$.data.list` is the whole array, an indefinite path the array of all hits - JSONPathEngine.selectWholeValueJSON).
+        if (typeof __readoriGetElementJsonWhole !== 'undefined' && __readoriGetElementJsonWhole
+            && /^\s*(\$[.\[]|@json:)/i.test(String(selector || '')) && /^\s*[\[{]/.test(sourceHtml) && typeof __readoriEvaluateWholeJson === 'function') {
+            var wholeText = '';
+            try { wholeText = __readoriEvaluateWholeJson(String(selector || ''), sourceHtml) || ''; } catch (error) { wholeText = ''; }
+            if (!wholeText) return '';
+            try { return JSON.parse(wholeText); } catch (error) { return ''; }
+        }
         var rows = _readoriJsoupRowsByLegadoRule(sourceHtml, String(selector || ''));
         if (rows === null) rows = _readoriJsoupRows(sourceHtml, String(selector || ''));
         // R156 (tocContent G, App profile 1.1.2): Legado AnalyzeRule.getElement (:332-358) returns the whole Elements list in
@@ -4867,6 +5014,7 @@ var java = {
                 if (!fn) return [];
                 var blockSize = keyBlockSize(key);
                 var upper = algorithm.toUpperCase();
+                var constants = __readoriCrypto.constants || {};
                 var sourceBlockSize = blockSize;
                 if (encrypting) {
                     if (upper.indexOf('NOPADDING') >= 0) {
@@ -4880,8 +5028,29 @@ var java = {
                     }
                 }
                 var chunks = [];
-                for (var offset = 0; offset < source.length; offset += sourceBlockSize) {
-                    chunks.push(fn(cryptoOptions(key), source.subarray(offset, offset + sourceBlockSize)));
+                var pkcs1Failed = false;
+                try {
+                    for (var offset = 0; offset < source.length; offset += sourceBlockSize) {
+                        chunks.push(fn(cryptoOptions(key), source.subarray(offset, offset + sourceBlockSize)));
+                    }
+                } catch (padError) {
+                    // R158 A (1.1.2 `rsa_bare_public_decrypt_no_padding`; bookld): Legado JsEncodeUtils.kt:77 hands the bare transformation "RSA" to hutool
+                    // AsymmetricCrypto -> Cipher.getInstance("RSA") (no explicit padding: raw RSA on Android, the leading zero bytes of every block are
+                    // dropped). Data encrypted by the server WITHOUT padding fails the PKCS1 type-1 check. Only a public-key decrypt with no `/` in the
+                    // transformation whose PKCS1 pass FAILED is redone as NoPadding over the whole input (App rawRSAPublicDecryptDroppingLeadingZeros).
+                    if (typeof __readoriRsaBareNoPadding === 'undefined' || !__readoriRsaBareNoPadding
+                        || encrypting || !usePublic || algorithm.indexOf('/') >= 0) throw padError;
+                    pkcs1Failed = true;
+                }
+                if (pkcs1Failed) {
+                    chunks = [];
+                    if (source.length === 0 || source.length % blockSize !== 0) return [];
+                    for (var rawOffset = 0; rawOffset < source.length; rawOffset += blockSize) {
+                        var rawBlock = fn({ key: key, padding: constants.RSA_NO_PADDING }, source.subarray(rawOffset, rawOffset + blockSize));
+                        var skip = 0;
+                        while (skip < rawBlock.length && rawBlock[skip] === 0) skip++;
+                        chunks.push(rawBlock.subarray(skip));
+                    }
                 }
                 var output = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
                 return __readoriByteArrayWithUtf8String(Array.from(output));
@@ -6768,10 +6937,13 @@ function __readoriAppNatives() {
       } catch (error) {}
       return '';
     },
-    __readoriEvaluateList(rule, html) {
+    __readoriEvaluateWholeJson(rule, html) {
+      return context.__readoriEvaluateList(rule, html, true);
+    },
+    __readoriEvaluateList(rule, html, whole) {
       rule = String(rule || '').trim();
       html = String(html || '');
-      if (!rule) return '[]';
+      if (!rule) return whole ? '' : '[]';
       function stringify(value) {
         if (value === undefined || value === null) return '';
         if (Array.isArray(value) || (value && typeof value === 'object')) return JSON.stringify(value);
@@ -6865,6 +7037,16 @@ function __readoriAppNatives() {
         }
         return [];
       }
+      if (whole) {
+        // R158 (G6): the whole JSONPath value as JSON text ('' when nothing matched); an indefinite path answers the array of all hits.
+        try {
+          const wholeObj = JSON.parse(html);
+          const hits = readPathAll(wholeObj, rule);
+          if (!hits.length) return '';
+          const indefinite = /\*|\.\.|\[\s*\?|\[[^\]]*,|\[\s*-?\d*\s*:/.test(rule);
+          return JSON.stringify(indefinite ? hits : hits[0]) || '';
+        } catch (error) { return ''; }
+      }
       let values = [];
       try {
         const obj = JSON.parse(html);
@@ -6890,6 +7072,7 @@ function __readoriAppNatives() {
   context.__readoriListNonEnumerable = data.listNonEnumerable === true;
   context.__readoriGetStringUnescapeFlag = data.getStringUnescapeFlag === true;
   context.__readoriGetElementsJsonObjects = data.getElementsJsonObjects === true;
+  Object.assign(context, data.r158Flags || {});
   context.__readoriRecordSuppressedInteraction = function(kind) {
     const name = String(kind);
     if (!suppressedInteractions.includes(name)) suppressedInteractions.push(name);
@@ -7030,6 +7213,7 @@ function __readoriAppNatives() {
   if (appJs.cryptoJSBeforeCode) __readoriInstallAppJs(appJsSources.builtin, 'readori-app-cryptojs-112.js');
   let value;
   let scriptError = '';
+  let scriptThrew = false;
   function __readoriErrorText(error) {
     let text = 'unknown';
     try { text = String(error); } catch (ignored) {}
@@ -7047,18 +7231,30 @@ function __readoriAppNatives() {
     }
     const directText = __readoriErrorText(error);
     if (directText && !__readoriIsTopLevelReturn(directText)) scriptError = directText;
+    // R158 (B): the App keeps the `fallback != input` guard only for a script that THREW (JSEngine.swift `hadException` branches).
+    scriptThrew = !__readoriIsTopLevelReturn(directText);
     try {
-      value = vm.runInContext(`(function(){ ${data.code || ''} })()`, context, { timeout: 1200, filename: 'readori-source.js' });
+      if (/has already been declared/i.test(directText || '')) {
+        // R158 (D1, gongzicp): jsLib `let d;` + rule script `var d` - Rhino and the App (function-scoped direct eval) accept it.
+        scriptError = '';
+        scriptThrew = false;
+        value = vm.runInContext('(function(){ return eval(' + JSON.stringify(data.code || '') + '); })()', context, { timeout: 1200, filename: 'readori-source.js' });
+      } else {
+        value = vm.runInContext(`(function(){ ${data.code || ''} })()`, context, { timeout: 1200, filename: 'readori-source.js' });
+      }
     } catch (inner) {
       if (__debugNode) {
         __hostConsole.error('NODE_WRAP_FAIL', inner && inner.message);
       }
+      scriptThrew = true;
       if (!scriptError && directText) scriptError = __readoriErrorText(inner);
       value = context.result !== initialResult ? context.result : '';
     }
   }
   if (value === undefined || value === null || String(value) === 'undefined') {
-    value = context.result !== initialResult ? context.result : '';
+    // R158 (B): an unchanged `result` is the script value only where the ES5 completion value explains it (a control-flow tail,
+    // `data.tailControlFlow`, computed by `_js_tail_is_control_flow`); the guarded fallback of a script that threw stays.
+    value = (context.result !== initialResult || (!scriptThrew && data.tailControlFlow === true)) ? context.result : '';
   }
   let text = '';
   try {
@@ -7102,6 +7298,19 @@ def _js_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _r158_js_flags() -> dict[str, bool]:
+    """R158 profile flags the JS prelude reads (QuickJS: ctx.set; node: payload `r158Flags` copied onto the context)."""
+    profile = app_profiles.current_app_profile()
+    return {
+        "__readoriHutoolBase64": bool(profile.js_hutool_base64_shim),
+        "__readoriStrResponseShim": bool(profile.js_str_response_shim),
+        "__readoriJsonResultGet": bool(profile.js_json_object_result_get),
+        "__readoriSetContentKeepsResult": bool(profile.set_content_keeps_result_binding),
+        "__readoriRsaBareNoPadding": bool(profile.rsa_bare_public_decrypt_no_padding),
+        "__readoriGetElementJsonWhole": bool(profile.js_get_element_json_whole_value),
+    }
+
+
 def install_quickjs_app_globals(ctx: Any, runtime: RuleRuntime) -> None:
     """App globals (btoa/atob/md5/sha256, UTF-8 semantics), the CryptoJS native bridges and the interaction gate.
 
@@ -7121,6 +7330,9 @@ def install_quickjs_app_globals(ctx: Any, runtime: RuleRuntime) -> None:
         ctx.set("__readoriListNonEnumerable", bool(app_profiles.current_app_profile().js_list_helpers_non_enumerable))
         ctx.set("__readoriGetStringUnescapeFlag", bool(app_profiles.current_app_profile().get_string_unescape_flag))
         ctx.set("__readoriGetElementsJsonObjects", bool(app_profiles.current_app_profile().js_get_elements_json_objects))
+        # R158 (1.1.2): hutool Base64, StrResponse constructor, Map.get on a JSON-object `result`, java.setContent keeps `result`.
+        for _flag_name, _flag_value in _r158_js_flags().items():
+            ctx.set(_flag_name, _flag_value)
     except Exception:
         pass
 
@@ -7357,6 +7569,8 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         "listNonEnumerable": bool(app_profiles.current_app_profile().js_list_helpers_non_enumerable),
         "getStringUnescapeFlag": bool(app_profiles.current_app_profile().get_string_unescape_flag),
         "getElementsJsonObjects": bool(app_profiles.current_app_profile().js_get_elements_json_objects),
+        "r158Flags": _r158_js_flags(),
+        "tailControlFlow": _js_tail_is_control_flow(script),
         "appJs": app_js_plan,
         "appJsSources": app_cryptojs_sources(app_js_plan),
         "percentEncodeMap": build_percent_encode_map(
@@ -7369,7 +7583,10 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         ),
     }
     def run_node(current_payload: dict[str, Any]) -> dict[str, Any] | None:
-        node_timeout = remaining_source_validation_seconds(4)
+        # R158: the App has no JS CPU limit of its own; a source is bounded by the per-source bulk timeout (BookSourceValidator.swift
+        # bulkTimeoutCeiling 15 s for >= 100 sources, 20 s otherwise), and `remaining_source_validation_seconds` clamps to what is left of that
+        # budget. A fixed 4 s cut was the CI-only `TimeoutExpired` on shubl / shuqi when many workers started node processes at once.
+        node_timeout = remaining_source_validation_seconds(NODE_JS_SUBPROCESS_SECONDS)
         # R145b: minimal environment (no server token / API key reaches source scripts) + Node permission model.
         env = node_sandbox_env()
         try:
@@ -7475,9 +7692,21 @@ def _source_comment_crypto_needed(code: str, runtime: RuleRuntime) -> bool:
     return bool(comment) and js_requires_node_crypto(comment)
 
 
+def _js_obfuscated_needs_node(code: str) -> bool:
+    """R158 (F, lcread): a jsfuck-style script with renamed non-ASCII identifiers builds its `java.*` calls (the anti-tamper
+    `java.HMacBase64(source.bookSourceComment, 'HmacSHA256', key)` + DES decrypt) from characters at run time, so the text scan of
+    `js_requires_node_crypto` cannot see them and QuickJS degrades HMacBase64 to a plain base64 (the App runs the native HMAC in
+    JavaScriptCore, JSEngine.swift `HMacBase64`). Such a script (long, mostly characters above U+2000, no literal `java.`) goes to node."""
+    if len(code) < 1500 or "java." in code.lower():
+        return False
+    non_ascii = sum(1 for ch in code if ord(ch) > 0x2000)
+    return non_ascii * 3 > len(code)
+
+
 def js_needs_node_crypto_engine(code: str, runtime: RuleRuntime) -> bool:
     return (
         js_requires_node_crypto(code)
+        or _js_obfuscated_needs_node(code)
         or _js_lib_crypto_needed(code, runtime)
         or _source_comment_crypto_needed(code, runtime)
     )
@@ -8119,11 +8348,288 @@ def _is_js_format_character(char: str) -> bool:
 
 def _js_lib_for_engine(runtime: "RuleRuntime") -> str:
     """The shared jsLib as the engine evaluates it: App 1.1.2 strips Unicode format characters from it like from every script
-    (`JSEngine` bootstrap `strippingJSFormatCharactersOutsideStrings`)."""
+    (`JSEngine` bootstrap `strippingJSFormatCharactersOutsideStrings`) and relaxes parameter redeclarations (R158 D1)."""
     lib = runtime.js_lib or ""
     if lib and app_profiles.current_app_profile().js_strip_format_chars:
-        return strip_js_format_characters_outside_strings(lib)
+        lib = strip_js_format_characters_outside_strings(lib)
+    if lib and app_profiles.current_app_profile().js_param_redeclare_relaxed:
+        lib = relax_parameter_redeclarations(lib)
     return lib
+
+
+_JS_REGEX_KEYWORDS = frozenset((
+    "return", "typeof", "case", "in", "of", "new", "delete", "void", "throw", "instanceof", "do", "else", "yield", "await", "default",
+))
+_JS_REGEX_PREFIX_CHARS = frozenset("(,=:[!&|?{};+-*%<>~^")
+
+
+def _js_identifier_start(ch: str) -> bool:
+    return ch == "_" or ch == "$" or ch.isalpha()
+
+
+def _js_identifier_part(ch: str) -> bool:
+    return _js_identifier_start(ch) or ch.isdigit()
+
+
+def _js_code_mask(source: str) -> list[bool]:
+    """True for every character that is JavaScript code (False inside strings, templates, comments and regex literals)."""
+    count = len(source)
+    mask = [True] * count
+
+    def skip_string(start: int) -> int:
+        quote = source[start]
+        i = start + 1
+        while i < count:
+            current = source[i]
+            if current == "\\":
+                i += 2
+                continue
+            if current == quote:
+                return i + 1
+            if current == "\n":
+                return i
+            i += 1
+        return count
+
+    def skip_interpolation(start: int) -> int:
+        depth = 1
+        i = start
+        while i < count:
+            current = source[i]
+            if current in "'\"":
+                i = skip_string(i)
+                continue
+            if current == "`":
+                i = skip_template(i)
+                continue
+            if source.startswith("//", i):
+                while i < count and source[i] != "\n":
+                    i += 1
+                continue
+            if source.startswith("/*", i):
+                end = source.find("*/", i + 2)
+                i = count if end < 0 else end + 2
+                continue
+            if current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return count
+
+    def skip_template(start: int) -> int:
+        i = start + 1
+        while i < count:
+            current = source[i]
+            if current == "\\":
+                i += 2
+                continue
+            if current == "`":
+                return i + 1
+            if current == "$" and i + 1 < count and source[i + 1] == "{":
+                i = skip_interpolation(i + 2)
+                continue
+            i += 1
+        return count
+
+    previous_significant = ""
+    previous_word_is_keyword = False
+    index = 0
+    while index < count:
+        char = source[index]
+        following = source[index + 1] if index + 1 < count else ""
+        if char == "/" and following == "/":
+            while index < count and source[index] != "\n":
+                mask[index] = False
+                index += 1
+            continue
+        if char == "/" and following == "*":
+            end = source.find("*/", index + 2)
+            stop = count if end < 0 else end + 2
+            for position in range(index, stop):
+                mask[position] = False
+            index = stop
+            continue
+        if char in "'\"`":
+            end = skip_template(index) if char == "`" else skip_string(index)
+            for position in range(index, min(end, count)):
+                mask[position] = False
+            index = end
+            previous_significant = char
+            previous_word_is_keyword = False
+            continue
+        if char == "/":
+            regex_allowed = previous_word_is_keyword or not previous_significant or previous_significant in _JS_REGEX_PREFIX_CHARS
+            if regex_allowed:
+                position = index + 1
+                in_class = False
+                while position < count:
+                    current = source[position]
+                    if current == "\\":
+                        position += 2
+                        continue
+                    if current == "\n":
+                        break
+                    if current == "[":
+                        in_class = True
+                    elif current == "]":
+                        in_class = False
+                    if current == "/" and not in_class:
+                        position += 1
+                        break
+                    position += 1
+                end = min(position, count)
+                for mark in range(index, end):
+                    mask[mark] = False
+                index = end
+                previous_significant = "/"
+                previous_word_is_keyword = False
+                continue
+        if _js_identifier_start(char):
+            end = index + 1
+            while end < count and _js_identifier_part(source[end]):
+                end += 1
+            previous_word_is_keyword = source[index:end] in _JS_REGEX_KEYWORDS
+            previous_significant = source[end - 1]
+            index = end
+            continue
+        if not char.isspace():
+            # `i++ / 2`, `i-- / 2`: a `/` after an increment / decrement is a division, not a regex start (App JSEngine.swift ~1612).
+            if char in "+-" and index > 0 and source[index - 1] == char:
+                previous_significant = ")"
+            else:
+                previous_significant = char
+            previous_word_is_keyword = False
+        index += 1
+    return mask
+
+
+@functools.lru_cache(maxsize=64)
+def relax_parameter_redeclarations(code: str) -> str:
+    """R158 D1 (1.1.2 `js_param_redeclare_relaxed`; gongzicp): `function f(text, key, iv) { let key = "..."; ... }`. Rhino (Legado) treats a
+    function-body `let` that repeats a parameter name as an assignment to the parameter; JavaScriptCore (App) and QuickJS reject it as an
+    early SyntaxError, so the whole jsLib fails to load. Mirrors App `JSEngine.relaxingParameterRedeclarations`: the `let` / `const` keyword
+    of a declaration at the outermost brace depth of a `function` body whose first declarator is one of the function's own parameters is
+    replaced by `var` (`var key = 1` re-declares the parameter legally, so it is an assignment; the other declarators of the same statement
+    stay function-local instead of leaking into the global scope). Block-scoped shadowing (inner braces) is legal and untouched; strings, templates, comments and
+    regex literals are never scanned; code without `function` and `let` / `const` is returned as it is."""
+    if "function" not in code or ("let " not in code and "const " not in code):
+        return code
+    count = len(code)
+    mask = _js_code_mask(code)
+
+    def matches(keyword: str, position: int) -> bool:
+        if not code.startswith(keyword, position):
+            return False
+        end = position + len(keyword)
+        before_ok = position == 0 or not (_js_identifier_part(code[position - 1]) or code[position - 1] == ".")
+        after_ok = end >= count or not _js_identifier_part(code[end])
+        return before_ok and after_ok
+
+    def skip_whitespace(position: int) -> int:
+        while position < count and code[position].isspace():
+            position += 1
+        return position
+
+    def closing_index(open_at: int, open_char: str, close_char: str) -> int | None:
+        depth = 0
+        cursor = open_at
+        while cursor < count:
+            if mask[cursor]:
+                if code[cursor] == open_char:
+                    depth += 1
+                elif code[cursor] == close_char:
+                    depth -= 1
+                    if depth == 0:
+                        return cursor
+            cursor += 1
+        return None
+
+    keyword_spans: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < count:
+        if not (mask[cursor] and code[cursor] == "f" and matches("function", cursor)):
+            cursor += 1
+            continue
+        after_keyword = cursor + len("function")
+        position = skip_whitespace(after_keyword)
+        cursor = after_keyword
+        if position < count and code[position] == "*":
+            position = skip_whitespace(position + 1)
+        if position < count and _js_identifier_start(code[position]):
+            while position < count and _js_identifier_part(code[position]):
+                position += 1
+            position = skip_whitespace(position)
+        if position >= count or code[position] != "(":
+            continue
+        parameter_close = closing_index(position, "(", ")")
+        if parameter_close is None:
+            continue
+        body_open = skip_whitespace(parameter_close + 1)
+        if body_open >= count or code[body_open] != "{":
+            continue
+        body_close = closing_index(body_open, "{", "}")
+        if body_close is None:
+            continue
+        body_open += 1
+
+        parameters: set[str] = set()
+        part_start = position + 1
+        nesting = 0
+        scan = position + 1
+        while scan <= parameter_close:
+            if scan == parameter_close or (nesting == 0 and mask[scan] and code[scan] == ","):
+                start = skip_whitespace(part_start)
+                if start < scan and _js_identifier_start(code[start]):
+                    end = start
+                    while end < scan and _js_identifier_part(code[end]):
+                        end += 1
+                    parameters.add(code[start:end])
+                part_start = scan + 1
+            elif mask[scan]:
+                if code[scan] in "([{":
+                    nesting += 1
+                elif code[scan] in ")]}":
+                    nesting -= 1
+            scan += 1
+        if not parameters:
+            continue
+
+        depth = 0
+        body_index = body_open
+        while body_index < body_close:
+            if not mask[body_index]:
+                body_index += 1
+                continue
+            char = code[body_index]
+            if char in "{([":
+                depth += 1
+            elif char in "})]":
+                depth -= 1
+            elif depth == 0 and char in "lc":
+                keyword_length = 3 if matches("let", body_index) else (5 if matches("const", body_index) else 0)
+                if keyword_length and body_index + keyword_length < count and code[body_index + keyword_length].isspace():
+                    name_start = skip_whitespace(body_index + keyword_length)
+                    declared_start = name_start
+                    while name_start < count and _js_identifier_part(code[name_start]):
+                        name_start += 1
+                    if name_start > declared_start and code[declared_start:name_start] in parameters:
+                        keyword_spans.append((body_index, body_index + keyword_length))
+                    body_index = name_start
+                    continue
+            body_index += 1
+    if not keyword_spans:
+        return code
+    out: list[str] = []
+    last = 0
+    for start, stop in sorted(keyword_spans):
+        out.append(code[last:start])
+        out.append("var")
+        last = stop
+    out.append(code[last:])
+    return "".join(out)
 
 
 def strip_js_format_characters_outside_strings(code: str) -> str:
@@ -8222,6 +8728,9 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
         return ""
     if app_profiles.current_app_profile().js_strip_format_chars:
         code = strip_js_format_characters_outside_strings(code)
+    if app_profiles.current_app_profile().js_param_redeclare_relaxed:
+        # R158 D1: App evaluateRuleScript = hoistTopLevelLetConstToVar(relaxingParameterRedeclarations(strip(script)))
+        code = relax_parameter_redeclarations(code)
     code = repair_glued_var_declarations(code)
     extra_vars = dict(extra_vars or {})
     inject_rar_script_fixtures(code, runtime, extra_vars)
@@ -8280,7 +8789,12 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
 # script, executes the first recorded call in Python, caches its result and replays the script (the Node path does
 # the same with its request log). Results are cached per call position, so repeated identical calls still execute.
 QUICKJS_NATIVE_REPLAY_LIMIT = 150
-QUICKJS_NATIVE_REPLAY_SCRIPT_SECONDS = 6.0  # JS time summed over the replays (native calls themselves not counted)
+# R158 (G7): JS time summed over the replays (native calls themselves not counted). The App runs the script once and is bounded only by the
+# per-source bulk timeout (15 s, BookSourceValidator.swift bulkTimeoutCeiling); a 6 s cap cut `m.jjwxc.net` (20 sequential java.ajax plus
+# Jsoup.parse of a 795 KB page per hit, every replay re-runs the prefix). The source deadline still clamps every native call.
+QUICKJS_NATIVE_REPLAY_SCRIPT_SECONDS = 15.0
+# R158: per-call node subprocess ceiling (the App's bulk per-source timeout, see run_node).
+NODE_JS_SUBPROCESS_SECONDS = 15.0
 _QUICKJS_NATIVE_STUB = r"""
 (function (name) {
   var stringify = JSON.stringify, slice = Array.prototype.slice;
@@ -8388,6 +8902,44 @@ def _evaluate_js_quickjs(
     for effect in state["pending"]:
         effect()
     return outcome
+
+
+def _js_tail_is_control_flow(code: str) -> bool:
+    """R158 (B): True when `code` ends in a block (`}`) and has a top-level `if` / `for` / `while` / `switch` / `try` statement - the only
+    statements whose ES5 completion value (Rhino keeps the last executed expression statement of a branch that ran) differs from ES2015+
+    (`undefined`). Strings, templates, comments and regex literals are not scanned."""
+    text = code.rstrip()
+    if not text.endswith("}"):
+        return False
+    mask = _js_code_mask(text)
+    count = len(text)
+    depth = 0
+    found = False
+    index = 0
+    while index < count:
+        if not mask[index]:
+            index += 1
+            continue
+        char = text[index]
+        if char in "({[":
+            depth += 1
+        elif char in ")}]":
+            depth -= 1
+        elif depth == 0 and (char.isalpha() or char in "_$") and (index == 0 or not (_js_identifier_part(text[index - 1]) or text[index - 1] == ".")):
+            end = index
+            while end < count and _js_identifier_part(text[end]):
+                end += 1
+            if text[index:end] in ("if", "for", "while", "switch", "try"):
+                found = True
+            index = end
+            continue
+        index += 1
+    return found and depth == 0
+
+
+def _is_global_redeclaration_error(message: str) -> bool:
+    """R158: V8 (`Identifier 'd' has already been declared`) and QuickJS (`redeclaration of 'd'`) reject a global `var` next to a global `let`."""
+    return bool(re.search(r"has already been declared|redeclaration of", message or ""))
 
 
 def _evaluate_js_quickjs_attempt(
@@ -8569,6 +9121,14 @@ def _evaluate_js_quickjs_attempt(
             )
         except Exception:
             pass
+        if app_profiles.current_app_profile().js_get_element_json_whole_value:
+            try:
+                ctx.add_callable(
+                    "__readoriEvaluateWholeJson",
+                    lambda rule, html: evaluate_json_whole_value(str(rule or ""), str(html or "")),
+                )
+            except Exception:
+                pass
         try:
             ctx.add_callable(
                 "__readoriPercentEncodeNative",
@@ -8786,7 +9346,22 @@ def _evaluate_js_quickjs_attempt(
                 return text
         except Exception as error:
             direct_error = _quickjs_error_message(error)
+            if _is_global_redeclaration_error(direct_error):
+                # R158 (D1, gongzicp): the jsLib declares `let d;` at top level and the rule script `var d = ...`. Rhino and the App accept it
+                # (JSEngine.hoistTopLevelLetConstToVar rewrites the top-level let / const to var and each script runs in its own function
+                # scope, `scopedEvaluationProgram`); a QuickJS global script cannot. Re-run as a direct eval inside a function: var /
+                # function declarations become locals, the completion value is kept.
+                try:
+                    ret = ctx.eval("(function(){ return eval(" + json.dumps(code) + "); })()")
+                    direct_error = ""
+                    text = quickjs_value_text(ret)
+                    if text and text != "undefined":
+                        sync_quickjs_variables()
+                        return text
+                except Exception as error2:
+                    direct_error = _quickjs_error_message(error2)
 
+        script_threw = bool(direct_error) and not _is_top_level_return_error(direct_error)
         try:
             wrapped = f"(function(){{ {code} }})()"
             ret = ctx.eval(wrapped)
@@ -8797,6 +9372,7 @@ def _evaluate_js_quickjs_attempt(
                 sync_quickjs_variables()
                 return text
         except Exception as error:
+            script_threw = True
             if direct_error and not _is_top_level_return_error(direct_error):
                 defer_script_error(direct_error)
             elif direct_error:
@@ -8806,6 +9382,14 @@ def _evaluate_js_quickjs_attempt(
             fallback = ctx.eval("String(result)")
             fallback_text = "" if fallback is None else str(fallback)
             sync_quickjs_variables()
+            # R158 (B, both profiles): Rhino keeps the value of the last EXECUTED expression statement when a script ends in an `if` / `for` /
+            # `switch` / `try` whose branch is not taken (ES5 completion value, ndlib `if(...){result=result}else{...}` + a false `if`), and
+            # ES2015+ engines give `undefined`. The App falls back to the global `result` binding for an empty script value (JSEngine.swift
+            # evaluate() `result.isEmpty, fallback = result`; evaluateToArray `s.isEmpty` fallbacks) and keeps the `fallback != input` guard only for
+            # a script that THREW (the `hadException` branches). The validator mirrors the unguarded branch ONLY where the ES5 completion value
+            # explains an unchanged `result` (a control-flow tail) - a script that merely returned "" (`{{java.get("k")}}`) still yields "".
+            if not script_threw and fallback_text and fallback_text == input_text and _js_tail_is_control_flow(code):
+                return fallback_text
             return fallback_text if fallback_text and fallback_text != input_text else ""
         except Exception:
             if js_ctx.has_native_miss():
@@ -9773,15 +10357,38 @@ def build_url_with_options(template: str, keyword: str, page: int, runtime: Rule
         runtime.book_binding = previous_binding
 
 
+def _leading_js_prefix_url_text(template: str, runtime: RuleRuntime, js_vars: dict[str, Any]) -> str | None:
+    """R158 (D2): a template that STARTS with `<js>..</js>` and continues with URL text. Legado AnalyzeUrl.analyzeJs (:153-176) walks the
+    `<js>` matches: the text before a match replaces `result` (its `@result` is substituted), the code runs with that `result`, and the text after the
+    last match replaces `result` again (`@result` -> the last JS value); so the JS value survives only through an explicit `@result` and
+    `{{key}}` in the text is evaluated afterwards. App: BookSourceEngine `legadoAnalyzeUrlRule`. Returns the resulting text (still holding its
+    `{{..}}`), or None when the template has no text after the last `</js>` (a whole-template script)."""
+    blocks = list(re.finditer(r"<js>([\s\S]*?)</js>", template, re.I))
+    if not blocks:
+        return None
+    tail = template[blocks[-1].end():].strip()
+    if not tail:
+        return None
+    result = template  # Legado `var result = ruleUrl`: the first script sees the whole rule text as `result`
+    position = 0
+    for block in blocks:
+        segment = template[position:block.start()].strip()
+        if segment:
+            result = segment.replace("@result", result)
+        code = block.group(1).strip()
+        result = evaluate_js(code, result, runtime, extra_vars=js_vars).strip() if code else result
+        position = block.end()
+    return tail.replace("@result", result)
+
+
 def _build_url_with_options(template: str, keyword: str, page: int, runtime: RuleRuntime, session: requests.Session | None = None) -> tuple[str, dict[str, Any]]:
     # R156 (network): a plain URL template binds the keyword already in this first pass, so a `{{js}}` expression that uses
     # `key` (`data:;base64,{{java.base64Encode("/search?keyword="+key)}}`) sees it. Script URLs get it through `js_vars`.
-    if template.lstrip().lower().startswith(("@js:", "<js>")):
-        pre_resolved = resolve_template(template, runtime, page=page)
-    else:
-        pre_resolved = resolve_template(template, runtime, keyword=keyword, page=page, raw_keyword=keyword)
-    raw = normalize_legacy_template(strip_leading_cookie_side_effect_template(pre_resolved))
-    raw = apply_page_expression_templates(raw, page)
+    # R158 (D2, both profiles; ndlib `.cn`): a `<js>..</js>` prefix followed by plain URL text is NOT a whole-template script. Legado
+    # AnalyzeUrl.analyzeJs (:153-176) drops the JS value when URL text follows and `{{key}}` is evaluated afterwards (replaceKeyPageJs);
+    # the App does the same (BookSourceEngine.legadoAnalyzeUrlRule: the tail text replaces `result`, then every `{{..}}` is evaluated with
+    # key / page bound). Only `@js:` or a template that is `<js>..</js>` as a whole keeps the keyword out of this first pass.
+    _template_low = template.strip().lower()
     js_vars = {
         "key": keyword,
         "searchKey": encode_keyword(keyword),
@@ -9791,6 +10398,17 @@ def _build_url_with_options(template: str, keyword: str, page: int, runtime: Rul
         "pageIndex": page - 1,
         "pagePlus1": page + 1,
     }
+    _leading_js_tail = None
+    if _template_low.startswith("<js>") and not _template_low.endswith("</js>"):
+        _leading_js_tail = _leading_js_prefix_url_text(template, runtime, js_vars)
+    if _template_low.startswith("@js:") or (_template_low.startswith("<js>") and _template_low.endswith("</js>")):
+        pre_resolved = resolve_template(template, runtime, page=page)
+    elif _leading_js_tail is not None:
+        pre_resolved = resolve_template(_leading_js_tail, runtime, keyword=keyword, page=page, raw_keyword=keyword)
+    else:
+        pre_resolved = resolve_template(template, runtime, keyword=keyword, page=page, raw_keyword=keyword)
+    raw = normalize_legacy_template(strip_leading_cookie_side_effect_template(pre_resolved))
+    raw = apply_page_expression_templates(raw, page)
     raw_stripped = raw.strip()
     if raw_stripped.lower().startswith("@js:") or (raw_stripped.lower().startswith("<js>") and raw_stripped.lower().endswith("</js>")):
         raw = execute_js_block_if_needed(raw, runtime, extra_vars=js_vars, session=session)
@@ -10311,14 +10929,73 @@ def normalize_selector(selector: str) -> str:
 _JSOUP_REGEX_ATTR_RE = re.compile(r"\[\s*([A-Za-z_][-\w:.]*)\s*~=\s*([^\]]*?)\s*\]")
 
 
+_JSOUP_TEXT_REGEX_PSEUDO_RE = re.compile(r":(matchesOwn|matches)\(", re.IGNORECASE)
+
+
+def _jsoup_text_regex_pseudo_prepare(root: Any, selector: str) -> tuple[str, list[tuple[Any, str]]]:
+    """R158 (xs8): Jsoup `:matches(regex)` / `:matchesOwn(regex)` (Evaluator.Matches / MatchesOwn) test the element's text() / ownText() with
+    Pattern.find; the App passes the selector straight to SwiftSoup (CSSEngine.swift `select`, which implements both), while soupsieve reads
+    `:matches` as an alias of `:is` and rejects the regex. Mark the matching elements with a synthetic attribute and replace the pseudo with
+    `[marker]` (same technique as `_jsoup_regex_attr_prepare`); the caller strips the markers."""
+    if ":match" not in selector.lower():
+        return selector, []
+    marked: list[tuple[Any, str]] = []
+    out: list[str] = []
+    pos = 0
+    counter = 0
+    while True:
+        found = _JSOUP_TEXT_REGEX_PSEUDO_RE.search(selector, pos)
+        if not found:
+            out.append(selector[pos:])
+            break
+        depth = 1
+        i = found.end()
+        while i < len(selector) and depth:
+            ch = selector[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth:
+            out.append(selector[pos:])
+            break
+        raw = selector[found.end():i - 1]
+        try:
+            pattern = re.compile(raw)
+        except re.error:
+            out.append(selector[pos:i])
+            pos = i
+            continue
+        counter += 1
+        marker = "data-jstm%d" % counter
+        own = found.group(1).lower() == "matchesown"
+        nodes = list(root.find_all(True)) if hasattr(root, "find_all") else []
+        # Jsoup Evaluator.Matches / MatchesOwn test element.text() / ownText() (whitespace collapsed, blocks spaced, comments / script / style
+        # ignored): `_jsoup_text` is the text `@text` uses; `_jsoup_own_text` is Jsoup ownText() (direct text nodes, no separator).
+        for node in nodes:
+            node_text = _jsoup_own_text(node) if own else _jsoup_text(node)
+            if pattern.search(node_text):
+                node[marker] = "1"
+                marked.append((node, marker))
+        out.append(selector[pos:found.start()])
+        out.append("[%s]" % marker)
+        pos = i
+    return "".join(out), marked
+
+
 def _jsoup_regex_attr_prepare(root: Any, selector: str) -> tuple[str, list[tuple[Any, str]]]:
     """R156 (tocContent F / searchjs E): Jsoup `[attr~=regex]` is Evaluator.AttributeWithValueMatching (a regex `find` on the
     attribute value); soupsieve's `~=` is the whitespace-separated word operator and rejects most regexes. Every element under
     `root` (and `root` itself) whose attribute matches gets a synthetic marker attribute and the clause becomes `[marker]`.
     Returns (selector, [(element, marker)]); the caller strips the markers with `_jsoup_regex_attr_cleanup` (try / finally)."""
+    selector, text_marked = _jsoup_text_regex_pseudo_prepare(root, selector)
     if "~=" not in selector:
-        return selector, []
-    marked: list[tuple[Any, str]] = []
+        return selector, text_marked
+    marked: list[tuple[Any, str]] = list(text_marked)
     counter = [0]
 
     def rewrite(match: re.Match[str]) -> str:
@@ -11928,6 +12605,14 @@ def evaluate_single_rule(rule: str, content: str, runtime: RuleRuntime, content_
     if t.lower() in bare_attrs:
         return _evaluate_bare_html_attribute(content, t, runtime)
 
+    # R158 (huarenv5): Legado Default mode on non-JSON content hands EVERY remaining rule to AnalyzeByJSoup (App RuleType.parseSingle:
+    # "标签白名单只是快速通道，不再是 CSS 的门槛"; `.contentDependent(json:, css:)`), so `title@ownText` is `select("title")` + ownText even
+    # though `title` is not in the tag fast-path list. Only `@` chains are routed here; the first / middle segments are selectors.
+    if "@" in t and not t.startswith("@") and not is_json_content(content):
+        css_values = evaluate_css_rule(t, content, runtime, content_type)
+        if css_values:
+            return css_values
+
     return [t] if literal_allowed else []
 
 
@@ -12044,6 +12729,13 @@ def _apply_css_index_selection(
     return [elems[index] for index in ordered]
 
 
+_CSS_RESULT_ATTRIBUTE_WORDS = frozenset({
+    "text", "html", "innerhtml", "outerhtml", "textnodes", "owntext",
+    "href", "src", "data-src", "data-href", "alt", "class", "id", "content",
+    "name", "value", "title", "type", "onclick", "action", "style", "all",
+})
+
+
 def parse_css_chain_part(
     part: str,
 ) -> tuple[tuple[str, str], tuple[bool, list[tuple[str, int | None, int | None, int]]] | None]:
@@ -12062,6 +12754,12 @@ def parse_css_chain_part(
     fields = text.split(".")
     if len(fields) > 1 and fields[0] in {"class", "tag", "id", "text"}:
         return (fields[0], fields[1]), selection
+
+    # R158 (huarenv5): a chain segment is always a Jsoup `select(segment)` (AnalyzeByJSoup.getResultList: only the LAST `@` segment is a
+    # result name; App `RuleType.isSelectorLikeSegment` is only asked about the last one). `parse_css_rule` pops a trailing
+    # attribute-named part as the result attribute, which turned a lone `title` / `name` / `content` segment into `*` plus an attribute.
+    if "@" not in text and re.fullmatch(r"[A-Za-z][\w-]*", text) and (text.lower() in _CSS_RESULT_ATTRIBUTE_WORDS or text.lower().startswith("data-")):
+        return ("css", text), selection
 
     selector, _attr, _index = parse_css_rule(text)
     return ("css", selector), selection
@@ -12168,6 +12866,11 @@ _JSOUP_BLOCK_TAGS = {
 }
 
 
+# Jsoup / SwiftSoup StringUtil.isActuallyWhitespace: space, \t, \n, \f, \r and U+00A0 - NOT Python's wider `\s` (U+3000 ideographic space, the U+2000
+# series, U+0085 and U+1680 survive, so an ideographic paragraph indent stays in `text()`).
+_JSOUP_WHITESPACE_RE = re.compile(r"[ \t\n\f\r\u00a0]+")
+
+
 def _jsoup_text(node: Any) -> str:
     output: list[str] = []
 
@@ -12176,7 +12879,7 @@ def _jsoup_text(node: Any) -> str:
             output.append(" ")
 
     def append_text(value: str) -> None:
-        normalized = re.sub(r"\s+", " ", value)
+        normalized = _JSOUP_WHITESPACE_RE.sub(" ", value)
         if not normalized:
             return
         if normalized.startswith(" "):
@@ -12188,6 +12891,9 @@ def _jsoup_text(node: Any) -> str:
     def visit(value: Any) -> None:
         name = str(getattr(value, "name", "") or "").lower()
         if not name:
+            # Jsoup text() skips comments (Comment / CDATA / doctype / declarations are not TextNodes); bs4 keeps them as string nodes.
+            if type(value).__name__ in {"Comment", "CData", "Doctype", "Declaration", "ProcessingInstruction"}:
+                return
             append_text(str(value))
             return
         # JSoup stores script/style payloads as DataNode rather than TextNode,
@@ -12205,7 +12911,26 @@ def _jsoup_text(node: Any) -> str:
             visit(child)
 
     visit(node)
-    return "".join(output).strip()
+    return "".join(output).strip(" ")
+
+
+def _jsoup_own_text(node: Any) -> str:
+    """Jsoup / SwiftSoup `Element.ownText()`: the element's DIRECT text nodes concatenated with no separator (`a<!--c-->b<i>x</i>d` -> `abd`),
+    a direct `<br>` adds a space, whitespace collapsed like appendNormalisedWhitespace, comments / CDATA / doctype skipped. Used by `:matchesOwn`;
+    the `@ownText` result keeps `_css_own_text`."""
+    output: list[str] = []
+    for child in getattr(node, "children", []):
+        name = str(getattr(child, "name", "") or "").lower()
+        if not name:
+            if type(child).__name__ in {"Comment", "CData", "Doctype", "Declaration", "ProcessingInstruction"}:
+                continue
+            normalized = _JSOUP_WHITESPACE_RE.sub(" ", str(child))
+            if normalized.startswith(" ") and output and output[-1].endswith(" "):
+                normalized = normalized.lstrip(" ")
+            output.append(normalized)
+        elif name == "br" and output and not output[-1].endswith(" "):
+            output.append(" ")
+    return "".join(output).strip(" ")
 
 
 def _evaluate_bare_html_attribute(content: str, attr: str, runtime: RuleRuntime) -> list[str]:
@@ -12613,6 +13338,45 @@ def legado_get_string_json_values(matches: list[Any], indefinite: bool) -> list[
     return out
 
 
+def evaluate_json_whole_value(rule: str, content: str) -> str:
+    """R158 (G6, 1.1.2 `js_get_element_json_whole_value`): Legado AnalyzeRule.getElement in JSON mode -> AnalyzeByJSonPath.getObject (`ctx.read(rule)`): the WHOLE JSONPath
+    value as JSON text, not the rows a list rule flattens. A definite path (`$.data.list`) answers its value (the whole array); an indefinite path
+    (wildcard, deep scan, filter, slice, union) answers the array of every hit. Empty text when nothing matches (App
+    `JSONPathEngine.selectWholeValueJSON`, `JSEngine` getJSONValue_raw)."""
+    json_text = extract_json(content)
+    if not json_text:
+        return ""
+    try:
+        obj = json.loads(json_text)
+    except Exception as _swallowed:
+        note_debug_error("json whole value parse", _swallowed)
+        return ""
+    path = rule.strip()
+    if path.lower().startswith("@json:"):
+        path = path[6:].strip()
+    if not path:
+        return ""
+    if not path.startswith(("$", "[")):
+        path = "$." + path
+    if path.startswith("$.["):
+        path = "$" + path[2:]
+    property_union = evaluate_legado_jsonpath_property_union(obj, path)
+    if property_union is not None:
+        return json.dumps(property_union, ensure_ascii=False) if property_union else ""
+    for special in (evaluate_legado_jsonpath_filter, evaluate_legado_jsonpath_dot_wildcard):
+        hits = special(obj, path)
+        if hits is not None:
+            return json.dumps(hits, ensure_ascii=False) if hits else ""
+    try:
+        matches = [m.value for m in parse_jsonpath_expression(path).find(obj)]
+    except Exception as _swallowed:
+        note_debug_error("json whole value path", _swallowed)
+        return ""
+    if not matches:
+        return ""
+    return json.dumps(matches if jsonpath_is_indefinite(path) else matches[0], ensure_ascii=False)
+
+
 def evaluate_json_rule(rule: str, content: str, runtime: RuleRuntime) -> list[str]:
     text = rule.strip()
     if not text:
@@ -12968,11 +13732,50 @@ def _has_invalid_legado_jsonpath_collection_operand(item: Any, expression: str) 
     return isinstance(_json_key_path_value(item, match.group(1)), dict)
 
 
+def _evaluate_jsonpath_deep_scan_filter(root: Any, scan_root_path: str, expression: str, tail: str) -> list[Any]:
+    """R158 G5 (1.1.2 `jsonpath_deep_scan_filter`; jjwxc `$..[?(@.novelName)]`): Jayway `$..[?(filter)]` walks the document in pre-order and
+    every OBJECT node that passes the filter is a result (a list is only reported when the filter passes on the list itself, which a
+    property filter never does). `scan_root_path` is what precedes `..` (`$` for the whole document). The invalid base `$..` made this
+    return nothing before."""
+    try:
+        roots = [root] if scan_root_path == "$" else [item.value for item in parse_jsonpath_expression(scan_root_path).find(root)]
+    except Exception:
+        return []
+    selected: list[Any] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if _matches_legado_jsonpath_filter(node, expression):
+                selected.append(node)
+            for child in node.values():
+                if isinstance(child, (dict, list)):
+                    walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                if isinstance(child, (dict, list)):
+                    walk(child)
+
+    for scan_root in roots:
+        walk(scan_root)
+    if not tail:
+        return selected
+    output: list[Any] = []
+    tail_path = "$" + tail if tail.startswith(".") else tail
+    for item in selected:
+        try:
+            output.extend(match.value for match in parse_jsonpath_expression(tail_path).find(item))
+        except Exception:
+            continue
+    return output
+
+
 def evaluate_legado_jsonpath_filter(root: Any, path: str) -> list[Any] | None:
     match = re.fullmatch(r"(.*?)\[\?\((.*)\)\](.*)", path or "")
     if match is None:
         return None
     base_path, expression, tail = match.groups()
+    if app_profiles.current_app_profile().jsonpath_deep_scan_filter and base_path.endswith(".."):
+        return _evaluate_jsonpath_deep_scan_filter(root, base_path[:-2] or "$", expression, tail)
     try:
         base_matches = [item.value for item in parse_jsonpath_expression(base_path).find(root)]
     except Exception:
@@ -14715,6 +15518,20 @@ def capture_search_item_rule_variables(rule: dict[str, Any], item: str, runtime:
     return author
 
 
+_SELECTED_BOOK_STATE_KEYS = ("book_kind", "book_last_chapter", "book_intro", "book_cover_url")
+
+
+def _apply_selected_book_state(runtime: RuleRuntime, selected_variables: dict[str, str]) -> dict[str, str]:
+    """R158 (H): split the `__book_*` carrier keys written by `collect_app_book_candidates` back onto the runtime Book binding."""
+    rest: dict[str, str] = {}
+    for key, value in selected_variables.items():
+        if key.startswith("__") and key[2:] in _SELECTED_BOOK_STATE_KEYS:
+            setattr(runtime, key[2:], value)
+        else:
+            rest[key] = value
+    return rest
+
+
 def fallback_name_from_item(item: str) -> str:
     if is_json_content(item):
         try:
@@ -15815,7 +16632,23 @@ def evaluate_init_rule_nonthrowing(rule: str, html: str, runtime: RuleRuntime, c
     mark = len(sink) if sink is not None else 0
     previous_error = getattr(runtime, "script_error", "")
     try:
-        values = evaluate_rule(rule, html, runtime, content_type)
+        # R158 (huarenv5): a lone `<js>..</js>` / `@js:` init answers its WHOLE string (App JSEngine.evaluateToArray returns `[s]` for a
+        # string result, and `evaluateString` takes that first value; Legado getElement(init) is the script value as it is). The generic
+        # rule path splits a multi-line JS result into trimmed lines (`js_result_to_list`), which cut an init that returns the page
+        # (`...;result`) down to its first line.
+        lone_js = re.fullmatch(r"\s*<js>([\s\S]*?)</js>\s*", rule, re.I) or re.fullmatch(r"\s*@js:([\s\S]*)", rule, re.I)
+        if (lone_js is not None and "##" not in lone_js.group(1) and lone_js.group(1).strip()
+                and "</js>" not in lone_js.group(1).lower() and "<js>" not in lone_js.group(1).lower()):
+            whole = evaluate_js(lone_js.group(1).strip(), html, runtime)
+            if str(whole or "").lstrip().startswith("["):
+                # `evaluate_js` hands back TEXT, so a real JS array result and a string that merely looks like a JSON array (java.ajax output)
+                # cannot be told apart here. The App keeps a string whole ([s]) and takes the first item of an array; the generic path (first
+                # item of a JSON array) is the stricter choice for the string case - a documented limitation.
+                values = evaluate_rule(rule, html, runtime, content_type)
+            else:
+                values = [whole] if str(whole or "").strip() else []
+        else:
+            values = evaluate_rule(rule, html, runtime, content_type)
     finally:
         if sink is not None:
             sink[mark:] = [entry for entry in sink[mark:] if entry.get("kind") != "error"]
@@ -15959,6 +16792,13 @@ def collect_app_book_candidates(
             _dbg.emit("item", index=len(book_urls) - 1, name=name, value=book_url)
         if selected_variables is None:
             selected_variables = dict(item_runtime.variables or {})
+            # R158 (H, qq `novel.html5.qq.com/`; both profiles): SearchBook.toBook() carries kind / lastChapter / intro / coverUrl into the Book that
+            # the detail / toc stages see (`{{book.kind}}` in ruleBookInfo.tocUrl when the detail JSON has no kind of its own; App
+            # SearchBook.kind -> Book.kind, BookSourceEngine.swift). Reserved `__book_*` keys carry them through `runtime.variables`.
+            for _state_key in _SELECTED_BOOK_STATE_KEYS:
+                _state_value = str(getattr(item_runtime, _state_key, "") or "")
+                if _state_value:
+                    selected_variables["__" + _state_key] = _state_value
             selected_author = item_author
         if first_only:
             break
@@ -15990,6 +16830,56 @@ def _fetch_first_book_candidates(session: requests.Session, src: dict[str, Any],
         return fetch_book_candidates(session, src, runtime)
     finally:
         _FIRST_CANDIDATE_ONLY.reset(token)
+
+
+def search_book_from_detail_rules(src: dict[str, Any], runtime: RuleRuntime, body: str, final_url: str) -> tuple[str, str, dict[str, str]] | None:
+    """R158 (G8, both profiles; huarenv5): Legado BookList.analyzeBookList (:59-87) parses the response as a DETAIL page (`getInfoItem`,
+    ruleBookInfo init / name / author) when the list is empty and `bookUrlPattern` is empty; a non-blank name makes a book whose url is the
+    response url. App: `extractSearchBookFromDetailRules` (BookSourceEngine.swift ~1317; search at `bookItems.isEmpty`, explore in
+    BookSourceEngine+Flagship.swift) - rule driven only, no heuristics. Returns (book url, author, variables) or None: `variables` are the
+    `@put` values the info rules stored (App `capturedVariables = detailContext.serializedVariables()`, kept on the SearchBook)."""
+    if str(src.get("bookUrlPattern") or "").strip():
+        return None
+    info_rule = src.get("ruleBookInfo")
+    if not isinstance(info_rule, dict):
+        return None
+    name_rule = str(info_rule.get("name") or "").strip()
+    if not name_rule or not final_url.strip():
+        return None
+    info_runtime = RuleRuntime(**{**runtime.__dict__, "source_url": final_url, "base_url": final_url, "book_url": final_url,
+                                  "book_toc_url": final_url, "variables": dict(runtime.variables or {})})
+    content = body
+    try:
+        init_rule = str(info_rule.get("init") or info_rule.get("initJs") or "").strip()
+        if init_rule:
+            transformed = evaluate_init_rule_nonthrowing(init_rule, content, info_runtime, "json" if is_json_content(content) else "html")
+            if transformed:
+                content = transformed
+        content_type = "json" if is_json_content(content) else "html"
+        name = legado_get_string(name_rule, content, info_runtime, content_type).strip()
+        if not name:
+            return None
+        author = legado_get_string(str(info_rule.get("author") or ""), content, info_runtime, content_type).strip()
+        # The App also evaluates intro / kind / lastChapter / updateTime / wordCount / coverUrl before capturing the variables, so an `@put`
+        # inside any of them reaches the later stages.
+        for field in ("intro", "kind", "lastChapter", "updateTime", "wordCount", "coverUrl"):
+            field_rule = str(info_rule.get(field) or "").strip()
+            if not field_rule:
+                continue
+            try:
+                evaluate_rule(field_rule, content, info_runtime, content_type)
+            except SourceValidationDeadlineExceeded:
+                raise
+            except Exception:
+                continue
+    except SourceValidationDeadlineExceeded:
+        raise
+    except Exception:
+        return None
+    before = dict(runtime.variables or {})
+    captured = {key: value for key, value in (info_runtime.variables or {}).items()
+                if not str(key).startswith("__") and before.get(key) != value}
+    return final_url, author, captured
 
 
 def fetch_book_candidates(
@@ -16113,6 +17003,17 @@ def fetch_book_candidates(
                 _dbg.emit("list", field="bookList", rule=str(explore_rule.get("bookList") or ""), count=len(items),
                           value=items[0][:2000] if items else "")
             if not items:
+                detail_book = search_book_from_detail_rules(src, runtime2, explore_body, final_url)
+                if detail_book is not None:
+                    if _dbg.active():
+                        _dbg.emit("info", code="detail_page", url=final_url, value="bookList 为空：按 ruleBookInfo 把响应当作详情页（Legado BookList getInfoItem）")
+                    explore_capture.clear()
+                    explore_capture.update({"base": final_url, "variables": dict(detail_book[2]), "author": detail_book[1]})
+                    runtime.validation_book_author = detail_book[1]
+                    if detail_book[2]:
+                        runtime.variables = dict(runtime.variables or {})
+                        runtime.variables.update(_apply_selected_book_state(runtime, detail_book[2]))
+                    return [detail_book[0]], final_url
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
@@ -16126,7 +17027,7 @@ def fetch_book_candidates(
                 explore_capture.update({"base": final_url, "variables": dict(selected_variables or {}), "author": selected_author})
             if selected_variables:
                 runtime.variables = dict(runtime.variables or {})
-                runtime.variables.update(selected_variables)
+                runtime.variables.update(_apply_selected_book_state(runtime, selected_variables))
             if book_urls:
                 runtime.validation_book_author = selected_author
             if not book_urls and error_page:
@@ -16212,6 +17113,15 @@ def fetch_book_candidates(
                 _dbg.emit("list", field="bookList", rule=str(search_rule.get("bookList") or ""), count=len(items),
                           value=items[0][:2000] if items else "")
             if not items:
+                detail_book = search_book_from_detail_rules(src, runtime2, html, final_url)
+                if detail_book is not None:
+                    if _dbg.active():
+                        _dbg.emit("info", code="detail_page", url=final_url, value="bookList 为空：按 ruleBookInfo 把响应当作详情页（Legado BookList getInfoItem）")
+                    runtime.validation_book_author = detail_book[1]
+                    if detail_book[2]:
+                        runtime.variables = dict(runtime.variables or {})
+                        runtime.variables.update(_apply_selected_book_state(runtime, detail_book[2]))
+                    return [detail_book[0]], final_url
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
@@ -16222,7 +17132,7 @@ def fetch_book_candidates(
             if book_urls:
                 if selected_variables:
                     runtime.variables = dict(runtime.variables or {})
-                    runtime.variables.update(selected_variables)
+                    runtime.variables.update(_apply_selected_book_state(runtime, selected_variables))
                 # R157 (tocContent E mowan): the author of the selected item is kept even when it has no variables (the
                 # assignment used to sit inside the `if selected_variables` guard).
                 runtime.validation_book_author = selected_author
@@ -17350,9 +18260,173 @@ def fallback_search_items_from_content(html: str) -> list[str]:
 # R156 (network T): BookSourceValidator.validateCandidate asks for `engine.fetchFirstTocPage(book:, chapterLimit: 16)`
 # (`BookSourceValidator` TOC stage, `fetchFirstTocPage(chapterLimit: 16)`) = getChapterList(firstPageOnly: true, firstPageChapterLimit: 16).
 APP_VALIDATION_TOC_CHAPTER_LIMIT = 16
+# R158 (1.1.2 `content_sample_dedups_whole_toc_page`): the rows past the 16-chapter window are scanned for repeated chapter urls only when
+# there are at most this many and the scan takes at most TOC_TAIL_SECONDS (the App's first-page tail urls use the same limits); beyond
+# either limit the window-only approximation stays.
+TOC_TAIL_URL_ROW_CAP = 5000
+TOC_TAIL_SECONDS = 3.0
 # Deep inspection switch: READORI_VALIDATOR_FULL_TOC=1 makes the batch validation walk the whole table of contents again
 # (variant aggregation compares `tocUniqueChapterCount`, which is capped by the window otherwise).
 FULL_TOC_WALK = os.environ.get("READORI_VALIDATOR_FULL_TOC", "").strip() == "1"
+
+
+def _is_usable_content_page_url(url: str) -> bool:
+    """App `BookSourceEngine.isUsableContentPageURL`: a plausible http(s) page URL (a `data:` pseudo-URL carrying script parameters counts)."""
+    text = (url or "").strip()
+    if not text:
+        return False
+    if text.lower().startswith("data:"):
+        return True
+    if not (is_plausible_source_url(text) or is_plausible_request_url(text)):
+        return False
+    url_part = parse_url_options(text)[0].strip()
+    low = url_part.lower()
+    if not url_part or low.startswith(("javascript:", "mailto:")) or low == "#":
+        return False
+    scheme = urlparse(url_part).scheme.lower()
+    return scheme in {"http", "https"}
+
+
+_TOC_TAIL_INLINE_TEMPLATE_RE = re.compile(r"\{\{([\s\S]*?)\}\}")
+
+
+def _toc_tail_url_rule_has_inline_script(rule: str) -> bool:
+    """App `looksLikeInlineTemplateScript` over every `{{body}}` of the chapterUrl rule."""
+    for match in _TOC_TAIL_INLINE_TEMPLATE_RE.finditer(rule):
+        body = match.group(1)
+        low = body.lower()
+        if "java." in low or "source." in low or "cookie" in low or ";" in body:
+            return True
+        if re.search(r"[A-Za-z_$][A-Za-z0-9_$]*\s*\(", body):
+            return True
+    return False
+
+
+def _toc_tail_chapter_urls(
+    tail_items: list[str],
+    first_index: int,
+    toc_rule: dict[str, Any],
+    runtime: RuleRuntime,
+    content_type: str,
+    final_url: str,
+    *,
+    reversed_list: bool,
+    heuristic_toc: bool,
+    name_rule_blank: bool,
+    all_items: list[str] | None = None,
+    audio_source: bool = False,
+) -> set[str]:
+    """R158: the chapter urls of the toc rows after the validation window (see `content_sample_dedups_whole_toc_page`). Mirrors App
+    `BookSourceEngine.collectWindowOverflowChapterURLs` (BookSourceEngine.swift ~3797; called from `getChapterList` when the 16-row window is full).
+
+    Only a chapterUrl rule without a JS segment or an inline script `{{java..}}` is evaluated (otherwise the window-only approximation stays, an
+    empty set); no request is made; a list-less toc (`heuristic_toc`) and a reversed list (it keeps the FIRST occurrence, BookChapterList.kt:119-128)
+    skip the scan. Row filters as in Swift: a redundant JSON digest row is skipped; a name rule without JS must evaluate to a non-empty title; a
+    url holding `option@` / `@put` / `@get` is skipped; an empty url is the page url (BookChapterList.kt:230-241) but a volume / audio row with an
+    empty url (or a volume rule holding JS) is skipped; `#` / `javascript:` / `mailto:` links are the page url; a non-volume url must be
+    `_is_usable_content_page_url`. Limits: at most TOC_TAIL_URL_ROW_CAP rows (the FIRST rows are scanned) and TOC_TAIL_SECONDS (checked every
+    64 rows); on either limit the urls collected so far are KEPT (Swift `break`), not dropped. A validation deadline is re-raised.
+    """
+    chapter_url_rule = str(toc_rule.get("chapterUrl") or "").strip()
+    chapter_name_rule = str(toc_rule.get("chapterName") or "").strip()
+    chapter_list_rule = str(toc_rule.get("chapterList") or "").strip()
+    is_volume_rule = str(toc_rule.get("isVolume") or "").strip()
+
+    def has_js_segment(rule: str) -> bool:
+        low_rule = rule.lower()
+        return "@js:" in low_rule or ("<js>" in low_rule and "</js>" in low_rule)
+
+    # A blank chapterUrl rule is still scanned (Swift: evaluateString("") is "", every row's url becomes the page url).
+    if (heuristic_toc or reversed_list or has_js_segment(chapter_url_rule)
+            or _toc_tail_url_rule_has_inline_script(chapter_url_rule)):
+        return set()
+    name_rule_is_checkable = bool(chapter_name_rule) and not has_js_segment(chapter_name_rule)
+    volume_rule_blank = not is_volume_rule
+    volume_rule_has_js = has_js_segment(is_volume_rule)
+    non_digest_ids: set[str] | None = None
+    deadline = time.monotonic() + TOC_TAIL_SECONDS
+    urls: set[str] = set()
+    for offset, tail_item in enumerate(tail_items):
+        if offset >= TOC_TAIL_URL_ROW_CAP:
+            break
+        if offset % 64 == 0 and time.monotonic() > deadline:
+            break
+        try:
+            tail_type = "json" if is_json_content(tail_item) else content_type
+            if tail_type == "json":
+                if non_digest_ids is None:
+                    non_digest_ids = set()
+                    for other in (all_items if all_items is not None else tail_items):
+                        if not is_json_content(other):
+                            continue
+                        try:
+                            other_obj = json.loads(extract_json(other) or other)
+                        except Exception:
+                            continue
+                        if isinstance(other_obj, dict) and "digest" not in json_first_text(other_obj, ["type"]).lower():
+                            other_id = json_first_text(other_obj, ["id", "attributes.id"])
+                            if other_id:
+                                non_digest_ids.add(other_id)
+                try:
+                    tail_obj = json.loads(extract_json(tail_item) or tail_item)
+                except Exception:
+                    tail_obj = None
+                if isinstance(tail_obj, dict) and "digest" in json_first_text(tail_obj, ["type"]).lower():
+                    chapid = json_first_text(tail_obj, ["attributes.chapid", "chapid", "chapterId", "chapter_id"])
+                    if chapid and chapid in non_digest_ids:
+                        continue
+            tail_runtime = RuleRuntime(**{**runtime.__dict__, "variables": dict(runtime.variables or {}), "chapter_active": True})
+            if name_rule_is_checkable:
+                with _evaluating_non_url_string_field():
+                    title_values = evaluate_rule(chapter_name_rule, tail_item, tail_runtime, tail_type)
+                if not (legado_get_string_value(title_values).strip() if title_values else ""):
+                    continue
+            if chapter_url_rule:
+                expanded = expand_regex_group_template(chapter_url_rule, chapter_list_rule, tail_item)
+                if expanded != chapter_url_rule and "$" not in expanded:
+                    raw_values = [expanded]
+                else:
+                    with _evaluating_non_url_string_field():
+                        raw_values = evaluate_rule(chapter_url_rule, tail_item, tail_runtime, tail_type)
+            else:
+                raw_values = []
+            raw = raw_values[0] if raw_values and raw_values[0].strip() else ""
+            raw = substitute_variable_references(raw, tail_runtime)
+            if contains_json_placeholder(raw):
+                raw = substitute_json_placeholders(raw, tail_item)
+            if "{{" in raw and "@css:" in raw:
+                raw = substitute_css_placeholders(raw, tail_item, tail_runtime, tail_type)
+            if "{{" in raw and "}}" in raw:
+                raw = _resolve_js_template_expressions(raw, tail_runtime, input_text=tail_item)
+            if contains_json_placeholder(chapter_url_rule) and (not raw.strip() or contains_json_placeholder(raw)):
+                literal = substitute_json_placeholders(chapter_url_rule, tail_item)
+                literal = substitute_css_placeholders(literal, tail_item, tail_runtime, tail_type)
+                literal = substitute_variable_references(literal, tail_runtime)
+                literal = _resolve_js_template_expressions(literal, tail_runtime, input_text=tail_item)
+                if literal.strip() and not contains_json_placeholder(literal):
+                    raw = literal
+            if "option@" in raw or "@put" in raw or "@get" in raw:
+                continue
+            url = resolve_url_preserving_options(raw, final_url) if raw.strip() else ""
+            if raw.strip().lower().startswith(("#", "javascript:", "mailto:")):
+                url = final_url
+            is_volume = False
+            if not volume_rule_blank and not volume_rule_has_js:
+                with _evaluating_non_url_string_field():
+                    volume_values = evaluate_rule(is_volume_rule, tail_item, tail_runtime, tail_type)
+                is_volume = legado_is_true(legado_get_string_value(volume_values))
+            if not url:
+                if audio_source or is_volume or (not volume_rule_blank and volume_rule_has_js):
+                    continue
+                url = final_url
+            if not is_volume and not _is_usable_content_page_url(url):
+                continue
+            urls.add(url)
+        except SourceValidationDeadlineExceeded:
+            raise
+        except Exception:
+            continue
+    return urls
 
 
 def resolve_toc_source(
@@ -17620,10 +18694,20 @@ def resolve_toc_source(
                 if queue:
                     continue
 
+        tail_urls: set[str] = set()
         for item_index, item in enumerate(items):
             # R156 (network T): firstPageChapterLimit - stop evaluating items once the App's 16-chapter window is full
             # (`getChapterList` firstPageChapterLimit); every item costs several rule / JS evaluations.
             if window_only and window_chapter_count >= APP_VALIDATION_TOC_CHAPTER_LIMIT:
+                # R158 (1.1.2 `content_sample_dedups_whole_toc_page`; ciyuanji / xxsy): BookChapterList.kt:114-125 dedups the WHOLE list
+                # (the last duplicate wins), so a pinned "latest chapter" row that repeats after the window is never the first chapter.
+                # Evaluate only the chapterUrl rule for the rest of the page (no JS rule, no network, at most TOC_TAIL_URL_ROW_CAP rows / TOC_TAIL_SECONDS).
+                if dedup_window and current_profile.content_sample_dedups_whole_toc_page:
+                    tail_urls = _toc_tail_chapter_urls(
+                        items[item_index:], item_index, toc_rule, runtime2, content_type, final_url,
+                        reversed_list=toc_list_reversed, heuristic_toc=heuristic_toc, name_rule_blank=name_rule_blank,
+                        all_items=items, audio_source=int(src.get("bookSourceType") or 0) == 1,
+                    )
                 break
             item_type = "json" if is_json_content(item) else content_type
             if item_type == "json" and is_redundant_json_digest_toc_item(item, items):
@@ -17819,18 +18903,21 @@ def resolve_toc_source(
                 seen_urls: set[str] = set()
                 kept_rows = [row for row in window_rows if not (row[0] in seen_urls or seen_urls.add(row[0]))]
             else:
-                later_urls: set[str] = set()
+                later_urls: set[str] = set(tail_urls)
                 survivors: list[tuple[str, str, RuleRuntime, int, int, dict[str, str]]] = []
                 for row in reversed(window_rows):
                     if row[0] not in later_urls:
                         later_urls.add(row[0])
                         survivors.append(row)
                 kept_rows = list(reversed(survivors))
-            pick_url, pick_title, pick_runtime, pick_index, pick_count, pick_base = kept_rows[0]
-            first_chapter_final_url = final_url
-            first_chapter_url = pick_url
-            first_chapter_title = pick_title
-            _adopt_first_chapter_runtime(runtime, pick_base, pick_runtime, pick_url, pick_title, pick_index, pick_count)
+            # Every window row can repeat later on the page: nothing is left to sample (App `guard let firstChapter = chapters.first else`
+            # fails the stage, BookSourceValidator.swift ~2504), which is the ordinary "no usable chapter" outcome below.
+            if kept_rows:
+                pick_url, pick_title, pick_runtime, pick_index, pick_count, pick_base = kept_rows[0]
+                first_chapter_final_url = final_url
+                first_chapter_url = pick_url
+                first_chapter_title = pick_title
+                _adopt_first_chapter_runtime(runtime, pick_base, pick_runtime, pick_url, pick_title, pick_index, pick_count)
         window_rows.clear()
 
         # App `newChaptersThisPage == 0` branch on a jump page: the guessed page produced no chapter at all (items without a usable
@@ -18638,6 +19725,8 @@ def _quick_scan_single_source(
             "variables": dict(runtime.variables or {}),
             "cookies": requests.utils.dict_from_cookiejar(session.cookies),
             "searchBookAuthor": runtime.validation_book_author,
+            # R158 (H): the selected search item's SearchBook fields reach the full chain's Book binding
+            "bookState": {key: str(getattr(runtime, key, "") or "") for key in _SELECTED_BOOK_STATE_KEYS},
             # R151 (E1): the discovery candidate (App `.discovery`), so the full chain runs it without re-fetching discovery.
             "exploreCandidate": copy.deepcopy(runtime.explore_candidate) if isinstance(runtime.explore_candidate, dict) else None,
             "quickDetail": detail,
@@ -18771,7 +19860,10 @@ def _run_explore_candidate_chain(
     ex_runtime = make_runtime(src)
     ex_runtime.interaction_state = runtime.interaction_state
     variables = candidate.get("variables")
-    ex_runtime.variables = {str(key): str(value) for key, value in variables.items()} if isinstance(variables, dict) else {}
+    ex_runtime.variables = (
+        _apply_selected_book_state(ex_runtime, {str(key): str(value) for key, value in variables.items()})
+        if isinstance(variables, dict) else {}
+    )
     ex_runtime.validation_book_author = str(candidate.get("author") or "")
     ensure_source_validation_time_remaining()
     recovered_url = recover_book_detail_url_from_reader_candidate(session, ex_runtime, book_url)
@@ -18923,6 +20015,11 @@ def _validate_single_source(
                 note_debug_error("seed cookies", _swallowed)
                 pass
         runtime.validation_book_author = str(quick_seed.get("searchBookAuthor") or "")
+        book_state = quick_seed.get("bookState")
+        if isinstance(book_state, dict):
+            for state_key, state_value in book_state.items():
+                if state_value and state_key in _SELECTED_BOOK_STATE_KEYS:
+                    setattr(runtime, state_key, str(state_value))
     start = time.perf_counter()
 
     try:

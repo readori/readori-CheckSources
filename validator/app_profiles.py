@@ -133,6 +133,32 @@ class AppProfile:
     # R157 REV: `java.getString(rule, bool)` honours the second argument as the unescape flag (AnalyzeRule.kt:256). 1.1.1 App
     #   ignores it and always unescapes.
     get_string_unescape_flag: bool = False
+    # A11 (R158 E1, mirrors the Swift engine package): rule-engine parity gaps closed in 1.1.2 only.
+    # G: the validation content sample sees duplicates in the WHOLE first toc page, not only in the 16-chapter window
+    #    (Legado BookChapterList.kt:114-125 dedups the whole list, keeping the last occurrence): rows beyond the window evaluate only
+    #    their chapterUrl rule (no JS rule, no extra request, at most 5000 rows; App BookSourceEngine firstPage tail URLs).
+    content_sample_dedups_whole_toc_page: bool = False
+    # A: public-key decrypt with the bare transformation "RSA" retries a failed PKCS1 block as NoPadding and drops the leading zero bytes
+    #    (JsEncodeUtils.kt:77 hands "RSA" to hutool AsymmetricCrypto -> Cipher.getInstance("RSA"), raw RSA on Android).
+    rsa_bare_public_decrypt_no_padding: bool = False
+    # D1: a jsLib function whose body `let` / `const`-redeclares one of its parameters loads (Rhino assigns; JavaScriptCore / QuickJS
+    #     reject it as an early SyntaxError) and `Packages.cn.hutool.core.codec.Base64` exists (hutool is on Legado's classpath).
+    js_param_redeclare_relaxed: bool = False
+    js_hutool_base64_shim: bool = False
+    # 4: `Packages.io.legado.app.help.http.StrResponse(url, body)` builds a response (StrResponse.kt) and a JSON-object `result` has
+    #    the Java Map `get(key)` (null when missing).
+    js_str_response_shim: bool = False
+    js_json_object_result_get: bool = False
+    # 5: `java.setContent(x)` replaces only AnalyzeRule.content; the `result` / `src` bindings stay (AnalyzeRule.kt:84-96, evalJS :774-788).
+    set_content_keeps_result_binding: bool = False
+    # 6: JSONPath `$..[?(@.x == 'y')]` deep-scans and returns every matching object (Jayway pre-order walk).
+    jsonpath_deep_scan_filter: bool = False
+    # 7 (G2): a search response whose URL differs from the request only by the URL fragment (`https://host#我的` vs `https://host/#%E6...`) is
+    #    not a redirect to a landing page (a fragment is never sent; the App's finalUrl != searchUrl guard compares fragment-less URLs).
+    redirect_guard_ignores_url_fragment: bool = False
+    # G6: `java.getElement("$.x")` in JSON mode answers the WHOLE JSONPath value (Legado AnalyzeRule.getElement -> getObject = ctx.read(rule); App
+    #    JSEngine getJSONValue_raw, `JSONPathEngine.selectWholeValueJSON`). 1.1.1 App: getElementRawFn = resolveElementsRule(...).first (the first row's text).
+    js_get_element_json_whole_value: bool = False
 
 
 APP_PROFILES: dict[str, AppProfile] = {
@@ -152,6 +178,11 @@ APP_PROFILES: dict[str, AppProfile] = {
         js_rule_replace_suffix=True, validation_content_sample_skips_volumes=True,
         interaction_runtime_verdict_only=True, content_sample_dedups_by_url=True,
         list_rule_js_tail_whole_list=True, get_string_unescape_flag=True,
+        content_sample_dedups_whole_toc_page=True, rsa_bare_public_decrypt_no_padding=True,
+        js_param_redeclare_relaxed=True, js_hutool_base64_shim=True,
+        js_str_response_shim=True, js_json_object_result_get=True,
+        set_content_keeps_result_binding=True, jsonpath_deep_scan_filter=True,
+        redirect_guard_ignores_url_fragment=True, js_get_element_json_whole_value=True,
     ),
 }
 
