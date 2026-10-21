@@ -288,6 +288,37 @@ def test_b_only_a_control_flow_tail_gets_the_fallback_and_a_throw_keeps_the_guar
         assert engine("result = 'changed'; if(false){ result = 'x' }", "page-body", _runtime()) == "changed"
 
 
+JJWXC_NAME_RULE = (
+    '@js:if(baseUrl.match(/www/)){\njava.getString("@@tag.a.1@text",false)\n}else{\n'
+    'a=String(result).match(/x/)?"y":"";\nString(java.getString("@@tag.a.0@text",false)).replace(/a/g,"")+a}'
+)
+JUNK_ROW = '<tr>\n<td height="10"></td>\n</tr>'
+
+
+@engine_param
+def test_b_a_defined_empty_completion_is_empty_on_1_1_2_and_falls_back_on_1_1_1(engine) -> None:
+    """R158d (jjwxc explore): `if(c){java.getString(..)}` that finds nothing completes with a DEFINED "" - the junk first row of the explore
+    table must stay empty (Legado skips it) instead of becoming the whole row as name / bookUrl. 1.1.1 App: `result.isEmpty` -> `result`."""
+    runtime = _runtime()
+    runtime.base_url = "https://www.jjwxc.net/topten.php"
+    with app_profiles.app_profile_scope("1.1.2"):
+        assert engine('if(true){ "" }', JUNK_ROW, _runtime()) == ""
+        assert engine('if(false){ "x" }', JUNK_ROW, _runtime()) == JUNK_ROW  # undefined completion (not-taken branch): the ES5 `result` fallback stays
+        assert engine("if(true){ result }", JUNK_ROW, _runtime()) == JUNK_ROW  # a non-empty completion is the value
+    with app_profiles.app_profile_scope("1.1.1"):
+        assert engine('if(true){ "" }', JUNK_ROW, _runtime()) == JUNK_ROW
+        assert engine('if(false){ "x" }', JUNK_ROW, _runtime()) == JUNK_ROW
+
+
+def test_b_the_jjwxc_explore_name_rule_skips_the_junk_row_on_1_1_2() -> None:
+    runtime = vsp.make_runtime({"bookSourceUrl": "https://www.jjwxc.net", "bookSourceName": "jjwxc"})
+    runtime.base_url = "https://www.jjwxc.net/topten.php?orderstr=19&t=0"
+    with app_profiles.app_profile_scope("1.1.2"):
+        assert vsp.evaluate_rule(JJWXC_NAME_RULE, JUNK_ROW, runtime, "html") == []
+    with app_profiles.app_profile_scope("1.1.1"):
+        assert vsp.evaluate_rule(JJWXC_NAME_RULE, JUNK_ROW, runtime, "html") != []  # App 1.1.1 keeps the fallback
+
+
 def test_b_js_tail_is_control_flow_scanner() -> None:
     f = vsp._js_tail_is_control_flow
     assert f("if(a){x=1}else{y=2}\nif(b){z}") is True

@@ -7251,6 +7251,10 @@ function __readoriAppNatives() {
       value = context.result !== initialResult ? context.result : '';
     }
   }
+  if (value === '' && !scriptThrew && data.tailControlFlow === true && context.__readoriEmptyCompletionKeepsEmpty !== true) {
+    // R158d: 1.1.1 App - an empty completion value falls back to the global `result` like an undefined one (JSEngine.evaluate `result.isEmpty`).
+    value = context.result;
+  }
   if (value === undefined || value === null || String(value) === 'undefined') {
     // R158 (B): an unchanged `result` is the script value only where the ES5 completion value explains it (a control-flow tail,
     // `data.tailControlFlow`, computed by `_js_tail_is_control_flow`); the guarded fallback of a script that threw stays.
@@ -7308,6 +7312,7 @@ def _r158_js_flags() -> dict[str, bool]:
         "__readoriSetContentKeepsResult": bool(profile.set_content_keeps_result_binding),
         "__readoriRsaBareNoPadding": bool(profile.rsa_bare_public_decrypt_no_padding),
         "__readoriGetElementJsonWhole": bool(profile.js_get_element_json_whole_value),
+        "__readoriEmptyCompletionKeepsEmpty": bool(profile.js_empty_completion_keeps_empty),
     }
 
 
@@ -9338,12 +9343,14 @@ def _evaluate_js_quickjs_attempt(
         install_quickjs_app_cryptojs(ctx, app_js_plan, "code")
 
         direct_error = ""
+        direct_empty_completion = False  # R158d: the script's completion value is a DEFINED "" (not undefined / null)
         try:
             ret = ctx.eval(code)
             text = quickjs_value_text(ret)
             if text and text != "undefined":
                 sync_quickjs_variables()
                 return text
+            direct_empty_completion = isinstance(ret, str) and ret == ""
         except Exception as error:
             direct_error = _quickjs_error_message(error)
             if _is_global_redeclaration_error(direct_error):
@@ -9358,6 +9365,7 @@ def _evaluate_js_quickjs_attempt(
                     if text and text != "undefined":
                         sync_quickjs_variables()
                         return text
+                    direct_empty_completion = isinstance(ret, str) and ret == ""
                 except Exception as error2:
                     direct_error = _quickjs_error_message(error2)
 
@@ -9388,7 +9396,10 @@ def _evaluate_js_quickjs_attempt(
             # evaluate() `result.isEmpty, fallback = result`; evaluateToArray `s.isEmpty` fallbacks) and keeps the `fallback != input` guard only for
             # a script that THREW (the `hadException` branches). The validator mirrors the unguarded branch ONLY where the ES5 completion value
             # explains an unchanged `result` (a control-flow tail) - a script that merely returned "" (`{{java.get("k")}}`) still yields "".
-            if not script_threw and fallback_text and fallback_text == input_text and _js_tail_is_control_flow(code):
+            # R158d (jjwxc explore junk row, 1.1.2 `js_empty_completion_keeps_empty`): a DEFINED "" completion (`if(c){java.getString(..)}` that found
+            # nothing) is "" - Legado / Rhino - and must not turn the whole list item into the field value. 1.1.1 keeps the App's `result.isEmpty` fallback.
+            empty_completion_is_final = direct_empty_completion and app_profiles.current_app_profile().js_empty_completion_keeps_empty
+            if not script_threw and fallback_text and fallback_text == input_text and _js_tail_is_control_flow(code) and not empty_completion_is_final:
                 return fallback_text
             return fallback_text if fallback_text and fallback_text != input_text else ""
         except Exception:

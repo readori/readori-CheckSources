@@ -159,6 +159,10 @@ class AppProfile:
     # G6: `java.getElement("$.x")` in JSON mode answers the WHOLE JSONPath value (Legado AnalyzeRule.getElement -> getObject = ctx.read(rule); App
     #    JSEngine getJSONValue_raw, `JSONPathEngine.selectWholeValueJSON`). 1.1.1 App: getElementRawFn = resolveElementsRule(...).first (the first row's text).
     js_get_element_json_whole_value: bool = False
+    # R158d (jjwxc explore junk row): a script whose completion value is a DEFINED empty string (`if(c){java.getString("@@tag.a.1@text",false)}` on a row
+    #    without a link) is "" (Legado / Rhino); the App's `s.isEmpty` -> global `result` fallback (JSEngine.evaluate / evaluateToArray) must only apply to
+    #    an `undefined` / `null` completion. 1.1.1 App: any empty script value falls back to `result` (the whole list item).
+    js_empty_completion_keeps_empty: bool = False
 
 
 APP_PROFILES: dict[str, AppProfile] = {
@@ -183,6 +187,7 @@ APP_PROFILES: dict[str, AppProfile] = {
         js_str_response_shim=True, js_json_object_result_get=True,
         set_content_keeps_result_binding=True, jsonpath_deep_scan_filter=True,
         redirect_guard_ignores_url_fragment=True, js_get_element_json_whole_value=True,
+        js_empty_completion_keeps_empty=True,
     ),
 }
 
