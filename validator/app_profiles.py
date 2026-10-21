@@ -163,6 +163,24 @@ class AppProfile:
     #    without a link) is "" (Legado / Rhino); the App's `s.isEmpty` -> global `result` fallback (JSEngine.evaluate / evaluateToArray) must only apply to
     #    an `undefined` / `null` completion. 1.1.1 App: any empty script value falls back to `result` (the whole list item).
     js_empty_completion_keeps_empty: bool = False
+    # A12 (R159 E1, mirrors the Swift engine packages E1-JS / E1-RULE): rule-engine parity gaps closed in 1.1.2 only.
+    # G1: an option-js (`url,{"js": ...}`) sees `java.url` = the request URL being built and a writable `java.headerMap` (put / get / remove ...)
+    #     whose writes reach the request headers (Legado AnalyzeUrl.kt:218, :246-249, :348-360). 1.1.1 App: `java.url` is the source base URL and
+    #     `java.headerMap` is a read-only copy without `put`.
+    js_option_java_url_header_map: bool = False
+    # G2: `"abc".length()` (java.lang.String.length(), callable on a Rhino string) answers the length; the `.length` property is unchanged.
+    js_string_length_method: bool = False
+    # xs8: `Elements.remove(int)` removes the item at that index from the list (Java List.remove(int)); `remove()` without arguments stays the
+    #      DOM removal.
+    js_elements_remove_by_index: bool = False
+    # G3: content that starts with `<?xml` is parsed with the XML parser for CSS / Jsoup rules (Legado AnalyzeByJSoup.kt:25-38), so RSS
+    #     `<link>url</link>` keeps its text (HTML parsers treat `link` as a void element).
+    xml_prefix_uses_xml_parser: bool = False
+    # yamibo: JsoupXpath string operators `^=` `$=` `*=` `~=` `!~` in XPath predicates (Legado's JsoupXpath dependency).
+    xpath_string_operators: bool = False
+    # wenxue88: in the toc, a volume row whose RAW (pre-absolutization) url starts with its title keeps the raw url so the volume filters apply
+    #           (Legado `isVolume && url.startsWith(title)`).
+    toc_volume_raw_url_title_prefix_filter: bool = False
 
 
 APP_PROFILES: dict[str, AppProfile] = {
@@ -188,6 +206,9 @@ APP_PROFILES: dict[str, AppProfile] = {
         set_content_keeps_result_binding=True, jsonpath_deep_scan_filter=True,
         redirect_guard_ignores_url_fragment=True, js_get_element_json_whole_value=True,
         js_empty_completion_keeps_empty=True,
+        js_option_java_url_header_map=True, js_string_length_method=True,
+        js_elements_remove_by_index=True, xml_prefix_uses_xml_parser=True,
+        xpath_string_operators=True, toc_volume_raw_url_title_prefix_filter=True,
     ),
 }
 

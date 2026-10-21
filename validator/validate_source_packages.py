@@ -395,6 +395,9 @@ class RuleRuntime:
     chapter_count: int = 0
     chapter_variable: str = ""
     chapter_active: bool = False
+    # Legado AnalyzeRule.nextChapterUrl (:786): the url of the chapter after the sampled one (`toc[1].url ?: toc.first().url`), "" outside the
+    # content stage. Bound as the JS global `nextChapterUrl` and the pagination boundary of nextContentUrl.
+    next_chapter_url: str = ""
     cookie: str = ""
     previous_result: str = ""
     source_book_source_name: str = ""
@@ -952,6 +955,19 @@ def current_validation_group_tag() -> str:
 def normalize_book_source_url(url: str) -> str:
     """Return the serialized Legado source identity without request rewriting."""
     return (url or "").strip()
+
+
+def safe_book_source_type(src: Any) -> int:
+    """`bookSourceType` as an int; a missing / non-numeric / odd value (list, dict, "abc", float string) is 0 (text), never an exception."""
+    value = src.get("bookSourceType") if isinstance(src, dict) else None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip()) if value is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def effective_base_url(url: str) -> str:
@@ -3561,13 +3577,13 @@ var __readoriS2TMap = {
     '风':'風','梦':'夢','险':'險','军':'軍','竞':'競','辈':'輩','选':'選','择':'擇','录':'錄'
 };
 function __readoriConvertChinese(value, map) {
+    // R159 (czbooks): one regex pass over the CJK characters instead of a per-character `out +=` loop (a 262 KB page took 4 s, over the 2 s
+    // QuickJS limit, and the interrupted script came back as ""). Same result as the loop: only single-character keys of the map apply.
     var text = String(value === undefined || value === null ? '' : value);
-    var out = '';
-    for (var i = 0; i < text.length; i++) {
-        var ch = text.charAt(i);
-        out += Object.prototype.hasOwnProperty.call(map, ch) ? map[ch] : ch;
-    }
-    return out;
+    if (!text) return '';
+    return text.replace(/[㐀-鿿豈-﫿]/g, function(ch) {
+        return Object.prototype.hasOwnProperty.call(map, ch) ? map[ch] : ch;
+    });
 }
 function __readoriChineseNumberValue(value) {
     var digits = {
@@ -6203,7 +6219,6 @@ function _readoriJsoupElement(row, parent) {
     var element = {
         _html: elementHtml,
         _innerHtml: row.html || '',
-        _parent: parent || null,
         text: function(){ return row.text || ''; },
         ownText: function(){ return row.ownText || row.text || ''; },
         attr: function(name){
@@ -6228,6 +6243,10 @@ function _readoriJsoupElement(row, parent) {
         },
         toString: function(){ return this._html || row.outerHtml || row.html || row.text || ''; }
     };
+    // R159 (xs8, 1.1.2 `js_list_helpers_non_enumerable`): the parent link is bookkeeping, not data. Enumerable, JSON.stringify of a 98-element list
+    // repeated the whole parent list for every element (over the 2 s / 32 MB QuickJS limits, so the value came back as ""); Rhino's Element has no
+    // such property either. 1.1.1 keeps it enumerable (`__readoriHide` only hides under the 1.1.2 flag, so a 1.1.1 `java.getElement` JSON is unchanged).
+    __readoriHide(element, '_parent', parent || null);
     if (_readoriJsoupExtrasEnabled()) {
         // R157 (js G1, 1.1.2): Rhino exposes the full Java Element API.
         element.hasClass = function(name) { return _readoriJsoupHasClass(row, name); };
@@ -6261,13 +6280,38 @@ function _readoriJsoupElements(rows, parent) {
     __readoriHide(out, 'select', function(selector) {
         return _readoriJsoupElements(_readoriJsoupRows(this.toString(), selector), this);
     });
-    __readoriHide(out, 'remove', function(){
+    __readoriHide(out, 'remove', function(index){
+        if (arguments.length && typeof index === 'number' && typeof __readoriElementsRemoveByIndex !== 'undefined' && __readoriElementsRemoveByIndex) {
+            // R159 (xs8, 1.1.2 `js_elements_remove_by_index`): Rhino picks java.util.List.remove(int) for a numeric argument: the element at that
+            // index leaves the LIST (the DOM is untouched) and is returned. `remove()` without arguments stays Elements.remove().
+            if (index < 0 || index >= this.length) throw new Error('java.lang.IndexOutOfBoundsException: Index: ' + index + ', Size: ' + this.length);
+            var removed = this.splice(index, 1)[0];
+            this._sourceHtml = '';
+            return removed;
+        }
         var htmls = this.map(function(e){ return e.toString(); }).filter(function(s){ return !!s; });
         _readoriRemoveHtmlFromParent(this._parent, htmls);
         this._sourceHtml = '';
         this.length = 0;
         return this;
     });
+    if (typeof __readoriElementsRemoveByIndex !== 'undefined' && __readoriElementsRemoveByIndex) {
+        // R159 (xs8, 1.1.2 `js_elements_remove_by_index`): java.util.List.subList(from, to) is a view; `.clear()` removes that range from this list
+        // (`lr.subList(0, 3).clear()`). Indexes are clamped like the App shim (JSEngine `out.subList`).
+        __readoriHide(out, 'subList', function(from, to){
+            var owner = this;
+            var start = Math.max(0, Math.min(Number(from) || 0, owner.length));
+            var end = Math.max(start, Math.min(to === undefined ? owner.length : (Number(to) || 0), owner.length));
+            var view = Array.prototype.slice.call(owner, start, end);
+            __readoriHide(view, 'toArray', function(){ return this; });
+            __readoriHide(view, 'clear', function(){
+                owner.splice(start, end - start);
+                owner._sourceHtml = '';
+                this.length = 0;
+            });
+            return view;
+        });
+    }
     __readoriHide(out, 'toString', function(){
         if (typeof this._sourceHtml === 'string' && this._sourceHtml.length > 0) return this._sourceHtml;
         return Array.prototype.map.call(this, function(e){ return e.toString(); }).join('');
@@ -6451,7 +6495,7 @@ try {
         globalThis.title = String(chapterTitle || '');
     }
 } catch (error) {}
-"""
+""" + JAVA_LENGTH_HELPER_JS
     if _dbg.active():
         # R147 (H9): java.log(msg) also lands in the debug trace (kind="log"); batch validation keeps the plain stub.
         java_api_js = java_api_js.replace(
@@ -6704,6 +6748,7 @@ function __readoriAppNatives() {
     chapterCount: Number(data.chapterCount || 0),
     chapterVariable: data.chapterVariable || '',
     chapterActive: !!data.chapterActive,
+    nextChapterUrl: data.nextChapterUrl || '',
     __readoriBookIsNull: !!data.bookIsNull,
     sourceBookSourceName: data.sourceBookSourceName || '',
     sourceBookSourceComment: data.sourceBookSourceComment || '',
@@ -7303,7 +7348,7 @@ def _js_text(value: Any) -> str:
 
 
 def _r158_js_flags() -> dict[str, bool]:
-    """R158 profile flags the JS prelude reads (QuickJS: ctx.set; node: payload `r158Flags` copied onto the context)."""
+    """R158 / R159 profile flags the JS prelude reads (QuickJS: ctx.set; node: payload `r158Flags` copied onto the context)."""
     profile = app_profiles.current_app_profile()
     return {
         "__readoriHutoolBase64": bool(profile.js_hutool_base64_shim),
@@ -7313,6 +7358,8 @@ def _r158_js_flags() -> dict[str, bool]:
         "__readoriRsaBareNoPadding": bool(profile.rsa_bare_public_decrypt_no_padding),
         "__readoriGetElementJsonWhole": bool(profile.js_get_element_json_whole_value),
         "__readoriEmptyCompletionKeepsEmpty": bool(profile.js_empty_completion_keeps_empty),
+        "__readoriElementsRemoveByIndex": bool(profile.js_elements_remove_by_index),
+        "__readoriJavaLengthHelper": bool(profile.js_string_length_method),
     }
 
 
@@ -7547,9 +7594,10 @@ def evaluate_js_with_node(script: str, input_text: str, runtime: RuleRuntime, ex
         "chapterCount": runtime.chapter_count,
         "chapterVariable": runtime.chapter_variable,
         "chapterActive": runtime.chapter_active,
+        "nextChapterUrl": runtime.next_chapter_url,
         "bookIsNull": runtime_binds_book_as_null(runtime),
         "sourceBookSourceName": runtime.source_book_source_name,
-        "sourceBookSourceComment": runtime.source_book_source_comment,
+        "sourceBookSourceComment": _source_comment_for_engine(runtime),
         "sourceVariableComment": runtime.source_variable_comment,
         "sourceBookSourceType": runtime.source_book_source_type,
         "sourceLastUpdateTime": runtime.source_last_update_time,
@@ -7975,7 +8023,7 @@ def build_js_response_fixtures(script: str, runtime: RuleRuntime) -> dict[str, d
         target = urljoin(runtime.base_url or runtime.book_source_url or runtime.source_url, url_part)
         headers = dict(runtime.headers or {})
         if isinstance(opts.get("headers"), dict):
-            headers.update({str(k): str(v) for k, v in opts["headers"].items() if v is not None})
+            headers = merge_request_headers(headers, opts["headers"])
         response_meta: dict[str, Any] = {}
         text, final_url, status = fetch_text(
             session,
@@ -8118,11 +8166,7 @@ def build_rar_script_fixtures(
         )
         headers = dict(runtime.headers or {})
         if isinstance(opts.get("headers"), dict):
-            headers.update({
-                str(key): str(value)
-                for key, value in opts["headers"].items()
-                if value is not None
-            })
+            headers = merge_request_headers(headers, opts["headers"])
         try:
             data, final_url, _ = fetch_bytes(session, target, headers=headers)
         except Exception:
@@ -8351,6 +8395,196 @@ def _is_js_format_character(char: str) -> bool:
     return ord(char) > 127 and char != "\ufeff" and unicodedata.category(char) == "Cf"
 
 
+_JAVA_LENGTH_REPLACEMENT = ".__readoriJavaLength()"
+
+@functools.lru_cache(maxsize=64)
+def rewrite_java_string_length_calls(code: str) -> str:
+    """R159 G2 (1.1.2 `js_string_length_method`; mysignal `k.length()`): Rhino (Legado) exposes java.lang.String methods on JS strings, so
+    `"abc".length()` is 3; QuickJS / JavaScriptCore strings only have the numeric `length` property, and the property cannot be turned into a
+    callable. Every member call `.length()` in CODE is rewritten to `.__readoriJavaLength()`: a non-enumerable `Object.prototype` helper
+    (`JAVA_LENGTH_HELPER_JS`) calls an own `length()` method when the object has one (the file proxy, a jsLib stack / queue class), returns the
+    number for a string and throws like before for anything else. The property read `.length` and calls with arguments are not matched; strings,
+    comments and regex literals are never scanned, the code inside a template literal's `${...}` is. Port of the App's
+    `JSEngine.rewritingJavaStringLengthCalls`."""
+    if ".length" not in code:
+        return code
+    count = len(code)
+    out: list[str] = []
+    index = 0
+    # frames: ("code", depth) for code (also template interpolation) / ("template",) for the literal text of a template
+    stack: list[list[Any]] = [["code", 0]]
+    previous = ""
+    current_word = ""
+    last_word = ""
+
+    def copy_quoted(quote: str) -> None:
+        nonlocal index
+        out.append(code[index])
+        index += 1
+        while index < count:
+            char = code[index]
+            out.append(char)
+            index += 1
+            if char == "\\" and index < count:
+                out.append(code[index])
+                index += 1
+                continue
+            if char == quote or char == "\n":
+                break
+
+    def copy_regex() -> None:
+        nonlocal index
+        out.append(code[index])
+        index += 1
+        in_class = False
+        while index < count:
+            char = code[index]
+            out.append(char)
+            index += 1
+            if char == "\\" and index < count:
+                out.append(code[index])
+                index += 1
+                continue
+            if char == "\n":
+                break
+            if char == "[":
+                in_class = True
+            elif char == "]":
+                in_class = False
+            if char == "/" and not in_class:
+                break
+
+    def length_call_end(start: int) -> int | None:
+        position = start + 1
+        if not code.startswith("length", position):
+            return None
+        position += len("length")
+        while position < count and code[position].isspace():
+            position += 1
+        if position >= count or code[position] != "(":
+            return None
+        position += 1
+        while position < count and code[position].isspace():
+            position += 1
+        if position >= count or code[position] != ")":
+            return None
+        return position + 1
+
+    while index < count:
+        char = code[index]
+        if not _js_identifier_part(char) and current_word:
+            last_word = current_word
+            current_word = ""
+        frame = stack[-1]
+        if frame[0] == "template":
+            if char == "\\" and index + 1 < count:
+                out.append(char)
+                out.append(code[index + 1])
+                index += 2
+            elif char == "`":
+                out.append(char)
+                index += 1
+                stack.pop()
+                previous = char
+            elif char == "$" and index + 1 < count and code[index + 1] == "{":
+                out.append(char)
+                out.append(code[index + 1])
+                index += 2
+                stack.append(["code", 0])
+                previous = "{"
+            else:
+                out.append(char)
+                index += 1
+            continue
+        depth = frame[1]
+        following = code[index + 1] if index + 1 < count else ""
+        if char == "/" and following == "/":
+            while index < count:
+                char = code[index]
+                out.append(char)
+                index += 1
+                if char == "\n":
+                    break
+        elif char == "/" and following == "*":
+            out.append(char)
+            out.append(following)
+            index += 2
+            while index < count:
+                char = code[index]
+                out.append(char)
+                index += 1
+                if char == "*" and index < count and code[index] == "/":
+                    out.append("/")
+                    index += 1
+                    break
+        elif char in "'\"":
+            copy_quoted(char)
+            previous = char
+        elif char == "`":
+            out.append(char)
+            index += 1
+            stack.append(["template"])
+            previous = char
+        elif char == "/" and (
+            not previous or previous in _JS_REGEX_PREFIX_CHARS or (_js_identifier_part(previous) and last_word in _JS_REGEX_KEYWORDS)
+        ):
+            copy_regex()
+            previous = "/"
+        elif char == "." and previous != ".":
+            end = length_call_end(index)
+            if end is None:
+                out.append(char)
+                index += 1
+                previous = char
+            else:
+                out.append(_JAVA_LENGTH_REPLACEMENT)
+                index = end
+                previous = ")"
+        else:
+            if char == "{":
+                frame[1] = depth + 1
+            elif char == "}":
+                if depth == 0 and len(stack) > 1:
+                    stack.pop()
+                elif depth > 0:
+                    frame[1] = depth - 1
+            out.append(char)
+            index += 1
+            if _js_identifier_part(char):
+                current_word += char
+            if not char.isspace():
+                previous = char
+    return "".join(out)
+
+
+# Installed by the java prelude when the profile flag is on (`__readoriJavaLengthHelper`); same text as the App's `javaStringLengthHelperScript`.
+JAVA_LENGTH_HELPER_JS = r"""
+try {
+  if (typeof __readoriJavaLengthHelper !== 'undefined' && __readoriJavaLengthHelper && !Object.prototype.__readoriJavaLength) {
+    Object.defineProperty(Object.prototype, '__readoriJavaLength', {
+      enumerable: false,
+      configurable: true,
+      writable: true,
+      value: function() {
+        var own = this.length;
+        if (typeof own === 'function') return own.apply(this, arguments);
+        if (Object.prototype.toString.call(this) === '[object String]') return own;
+        return this.length();
+      }
+    });
+  }
+} catch (error) {}
+"""
+
+
+def _source_comment_for_engine(runtime: "RuleRuntime") -> str:
+    """`source.bookSourceComment` as the engine sees it (the comment is eval()ed as code by some sources: mysignal)."""
+    comment = runtime.source_book_source_comment
+    if comment and app_profiles.current_app_profile().js_string_length_method:
+        return rewrite_java_string_length_calls(comment)
+    return comment
+
+
 def _js_lib_for_engine(runtime: "RuleRuntime") -> str:
     """The shared jsLib as the engine evaluates it: App 1.1.2 strips Unicode format characters from it like from every script
     (`JSEngine` bootstrap `strippingJSFormatCharactersOutsideStrings`) and relaxes parameter redeclarations (R158 D1)."""
@@ -8359,6 +8593,8 @@ def _js_lib_for_engine(runtime: "RuleRuntime") -> str:
         lib = strip_js_format_characters_outside_strings(lib)
     if lib and app_profiles.current_app_profile().js_param_redeclare_relaxed:
         lib = relax_parameter_redeclarations(lib)
+    if lib and app_profiles.current_app_profile().js_string_length_method:
+        lib = rewrite_java_string_length_calls(lib)
     return lib
 
 
@@ -8736,6 +8972,8 @@ def evaluate_js(script: str, input_text: str, runtime: RuleRuntime, extra_vars: 
     if app_profiles.current_app_profile().js_param_redeclare_relaxed:
         # R158 D1: App evaluateRuleScript = hoistTopLevelLetConstToVar(relaxingParameterRedeclarations(strip(script)))
         code = relax_parameter_redeclarations(code)
+    if app_profiles.current_app_profile().js_string_length_method:
+        code = rewrite_java_string_length_calls(code)
     code = repair_glued_var_declarations(code)
     extra_vars = dict(extra_vars or {})
     inject_rar_script_fixtures(code, runtime, extra_vars)
@@ -9040,8 +9278,9 @@ def _evaluate_js_quickjs_attempt(
         ctx.set("chapterCount", runtime.chapter_count)
         ctx.set("chapterVariable", runtime.chapter_variable)
         ctx.set("chapterActive", runtime.chapter_active)
+        ctx.set("nextChapterUrl", runtime.next_chapter_url)
         ctx.set("sourceBookSourceName", runtime.source_book_source_name)
-        ctx.set("sourceBookSourceComment", runtime.source_book_source_comment)
+        ctx.set("sourceBookSourceComment", _source_comment_for_engine(runtime))
         ctx.set("sourceVariableComment", runtime.source_variable_comment)
         ctx.set("sourceBookSourceType", runtime.source_book_source_type)
         ctx.set("sourceLastUpdateTime", runtime.source_last_update_time)
@@ -9675,7 +9914,7 @@ def resolve_url_with_options(raw_url: str, base_url: str, headers: dict[str, Any
     if headers is not None and str(opts.get("method") or "").upper() == "POST" and isinstance(opts.get("body"), str):
         merged_headers = dict(headers)
         if isinstance(opts.get("headers"), dict):
-            merged_headers.update(opts["headers"])
+            merged_headers = merge_request_headers(merged_headers, opts["headers"])
         if not _has_explicit_content_type(merged_headers) and not _is_json_or_xml_request_body(opts["body"]):
             opts = dict(opts)
             opts["body"] = encode_legado_form_body(
@@ -10130,7 +10369,7 @@ def recover_book_detail_url_from_reader_candidate(session: requests.Session, run
         return ""
     request_headers = dict(runtime.headers or {})
     if isinstance(request_options.get("headers"), dict):
-        request_headers.update({str(k): str(v) for k, v in request_options["headers"].items() if v is not None})
+        request_headers = merge_request_headers(request_headers, request_options["headers"])
     html, final_url, _ = fetch_text(
         session,
         abs_url,
@@ -10392,6 +10631,108 @@ def _leading_js_prefix_url_text(template: str, runtime: RuleRuntime, js_vars: di
     return tail.replace("@result", result)
 
 
+_OPTION_JS_HEADER_STATE_VARIABLE = "__optHdrState"
+
+
+def _option_js_seed_headers(runtime: RuleRuntime, opts: dict[str, Any]) -> dict[str, str]:
+    """AnalyzeUrl.headerMap at the time the option js runs: the source headers plus the `headers` option of this very URL."""
+    seed = {str(k): str(v) for k, v in dict(runtime.headers or {}).items()}
+    option_headers = opts.get("headers")
+    if isinstance(option_headers, dict):
+        seed.update({str(k): str(v) for k, v in option_headers.items() if v is not None})
+    return seed
+
+
+# The prelude is constant text; the request URL and the seed headers arrive as JSON arguments of the IIFE (nothing is spliced into the code).
+# `java.headerMap` mirrors the App's `_readoriHeaderMap` (JSEngine.swift): header names are case-insensitive, `put` overwrites an existing name in
+# place and returns the previous value (or null), `remove` returns the removed value (or null). After every write the whole map is recorded with
+# `java.put("__optHdrState", JSON)`: java.put variables survive the QuickJS replay driver and the node path alike, and
+# `_take_option_js_header_state` turns the last recorded state into the request headers afterwards.
+_OPTION_JS_PRELUDE = """(function(url, seed) {
+  java.url = url;
+  var m = {};
+  Object.keys(seed).forEach(function(k) { m[k] = String(seed[k]); });
+  var find = function(key) {
+    var wanted = String(key === undefined || key === null ? '' : key).toLowerCase();
+    var names = Object.keys(m);
+    for (var i = 0; i < names.length; i++) { if (names[i].toLowerCase() === wanted) return names[i]; }
+    return null;
+  };
+  var record = function() { java.put('__optHdrState', JSON.stringify(m)); };
+  var def = function(name, fn) { Object.defineProperty(m, name, { enumerable: false, configurable: true, writable: true, value: fn }); };
+  def('put', function(key, value) {
+    var existing = find(key);
+    var previous = existing === null ? null : m[existing];
+    m[existing === null ? String(key === undefined || key === null ? '' : key) : existing] = String(value === undefined || value === null ? '' : value);
+    record();
+    return previous;
+  });
+  def('putAll', function(other) {
+    other = other || {};
+    Object.keys(other).forEach(function(k) { if (typeof other[k] !== 'function') m[k] = String(other[k]); });
+    record();
+    return null;
+  });
+  def('get', function(key) { var existing = find(key); return existing === null ? null : m[existing]; });
+  def('containsKey', function(key) { return find(key) !== null; });
+  def('remove', function(key) {
+    var existing = find(key);
+    if (existing === null) return null;
+    var previous = m[existing];
+    delete m[existing];
+    record();
+    return previous;
+  });
+  java.headerMap = m;
+})(%s, %s);
+"""
+
+
+def _option_js_java_url_prelude(request_url: str, seed_headers: dict[str, str]) -> str:
+    """JS statements that give an option js `java.url` and a mutable `java.headerMap` (Legado AnalyzeUrl.url / .headerMap)."""
+    return _OPTION_JS_PRELUDE % (json.dumps(request_url), json.dumps(seed_headers))
+
+
+def _take_option_js_header_state(runtime: RuleRuntime) -> dict[str, str] | None:
+    """The header map the option js left behind (None when it never wrote one); removes the bookkeeping variable (also after a script error)."""
+    variables = runtime.variables or {}
+    if _OPTION_JS_HEADER_STATE_VARIABLE not in variables:
+        return None
+    raw = variables.get(_OPTION_JS_HEADER_STATE_VARIABLE)
+    runtime.variables = {k: v for k, v in variables.items() if k != _OPTION_JS_HEADER_STATE_VARIABLE}
+    try:
+        state = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return {str(k): str(v) for k, v in state.items()} if isinstance(state, dict) else None
+
+
+def merge_request_headers(base: dict[str, str], option_headers: dict[str, Any] | None) -> dict[str, str]:
+    """`base` + the `headers` option of a request. A None value is a tombstone: the header was removed by the option js (`java.headerMap.remove`),
+    so the (case-insensitively) matching base header goes too."""
+    merged = dict(base)
+    for key, value in (option_headers or {}).items():
+        name = str(key)
+        if value is None:
+            for existing in [k for k in merged if k.lower() == name.lower()]:
+                del merged[existing]
+        else:
+            merged[name] = str(value)
+    return merged
+
+
+def _option_js_headers_from_state(runtime: RuleRuntime, state: dict[str, str]) -> dict[str, Any]:
+    """The `headers` option that, merged over the source headers (`merge_request_headers`), gives the map the option js left: changed / new
+    entries carry their value, a source header the script removed is a tombstone (None)."""
+    base = {str(k): str(v) for k, v in dict(runtime.headers or {}).items()}
+    headers: dict[str, Any] = {key: value for key, value in state.items() if base.get(key) != value}
+    kept = {key.lower() for key in state}
+    for key in base:
+        if key.lower() not in kept:
+            headers[key] = None
+    return headers
+
+
 def _build_url_with_options(template: str, keyword: str, page: int, runtime: RuleRuntime, session: requests.Session | None = None) -> tuple[str, dict[str, Any]]:
     # R156 (network): a plain URL template binds the keyword already in this first pass, so a `{{js}}` expression that uses
     # `key` (`data:;base64,{{java.base64Encode("/search?keyword="+key)}}`) sees it. Script URLs get it through `js_vars`.
@@ -10440,12 +10781,23 @@ def _build_url_with_options(template: str, keyword: str, page: int, runtime: Rul
         opts["body"] = apply_legado_page_segments(opts["body"], page, requires_comma=True)
     option_js = opts.get("js")
     if isinstance(option_js, str) and option_js.strip():
-        evaluated_url = evaluate_js(
-            option_js,
-            raw,
-            runtime,
-            extra_vars=js_vars,
-        ).strip()
+        option_headers_hook = app_profiles.current_app_profile().js_option_java_url_header_map
+        if option_headers_hook:
+            # R159 (ganggou, 1.1.2 `js_option_java_url_header_map`): Legado AnalyzeUrl.analyzeUrl :218 / :246-249 runs the option js with the
+            # AnalyzeUrl itself as `java`, so `java.url` is the absolute request URL and `java.headerMap` the live request header map.
+            option_js = _option_js_java_url_prelude(legado_absolute_url(raw, runtime.base_url), _option_js_seed_headers(runtime, opts)) + option_js
+        try:
+            evaluated_url = evaluate_js(
+                option_js,
+                raw,
+                runtime,
+                extra_vars=js_vars,
+            ).strip()
+        finally:
+            if option_headers_hook:
+                header_state = _take_option_js_header_state(runtime)  # also after a script error: the writes made so far stay (live map)
+                if header_state is not None:
+                    opts["headers"] = _option_js_headers_from_state(runtime, header_state)
         if evaluated_url:
             raw = evaluated_url
     charset = opts.get("charset") if isinstance(opts.get("charset"), str) else None
@@ -10470,7 +10822,7 @@ def _build_url_with_options(template: str, keyword: str, page: int, runtime: Rul
             if charset_encoded != keyword:
                 body = body.replace(charset_encoded, keyword)
         merged_headers = dict(runtime.headers or {})
-        merged_headers.update(opts.get("headers") or {})
+        merged_headers = merge_request_headers(merged_headers, opts.get("headers"))
         if not _has_explicit_content_type(merged_headers) and not _is_json_or_xml_request_body(body):
             body = encode_legado_form_body(body, charset)
         opts["body"] = body
@@ -10925,19 +11277,115 @@ def _quote_jsoup_attribute_value(match: re.Match[str]) -> str:
     return '[%s%s"%s"]' % (match.group(1), match.group(2), escaped)
 
 
+def _split_selector_top_level_commas(text: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    escaped = False
+    start = 0
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return parts
+
+
+def _wrap_complex_has_item(item: str) -> str:
+    """soupsieve takes only a relative selector with a LEADING combinator (or one compound) inside `:has()` (`:has(> a)`, `:has(a.b)`) and
+    rejects `:has(div + div)` / `:has(ul li)` ("the complex selectors ... is not allowed"); Jsoup's Evaluator.Has matches any descendant
+    against a full selector. `:has(:is(div + div))` says the same to soupsieve."""
+    if not item or item[0] in ">+~":
+        return item
+    depth = 0
+    quote = ""
+    escaped = False
+    for char in item:
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif depth == 0 and (char.isspace() or char in ">+~"):
+            return ":is(%s)" % item
+    return item
+
+
+def _wrap_complex_has_arguments(selector: str) -> str:
+    """R159 (xs8): wrap every complex item of a `:has(...)` argument list in `:is()` (see `_wrap_complex_has_item`); nested `:has()` too."""
+    if ":has(" not in selector:
+        return selector
+    out: list[str] = []
+    pos = 0
+    while True:
+        index = selector.find(":has(", pos)
+        if index < 0:
+            out.append(selector[pos:])
+            break
+        start = index + len(":has(")
+        depth = 1
+        end = start
+        quote = ""
+        escaped = False
+        while end < len(selector) and depth:
+            char = selector[end]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            end += 1
+        if depth:  # unbalanced: leave it to the selector engine
+            out.append(selector[pos:])
+            break
+        inner = _wrap_complex_has_arguments(selector[start:end - 1])
+        items = [item.strip() for item in _split_selector_top_level_commas(inner)]
+        out.append(selector[pos:index])
+        out.append(":has(%s)" % ", ".join(_wrap_complex_has_item(item) for item in items))
+        pos = end
+    return "".join(out)
+
+
 def normalize_selector(selector: str) -> str:
     selector = selector.replace(":contains(", ":-soup-contains(")
     if "[" in selector:
         # R155 (R): Jsoup's QueryParser takes everything up to `]` as the raw value of `[attr=value]` (`div[style=text-indent: 2em;]`,
         # sfacg's content rule); soupsieve only accepts an identifier or a quoted string there.
         selector = _JSOUP_UNQUOTED_ATTR_VALUE_RE.sub(_quote_jsoup_attribute_value, selector)
+    selector = _wrap_complex_has_arguments(selector)
     if ":lt(" in selector or ":gt(" in selector or ":eq(" in selector:
         # R155 (M): soupsieve has no Jsoup index pseudo selectors.
         selector = _JSOUP_INDEX_PSEUDO_RE.sub(_jsoup_index_pseudo_to_nth_child, selector)
     return selector
-
-
-_JSOUP_REGEX_ATTR_RE = re.compile(r"\[\s*([A-Za-z_][-\w:.]*)\s*~=\s*([^\]]*?)\s*\]")
 
 
 _JSOUP_TEXT_REGEX_PSEUDO_RE = re.compile(r":(matchesOwn|matches)\(", re.IGNORECASE)
@@ -10998,6 +11446,48 @@ def _jsoup_text_regex_pseudo_prepare(root: Any, selector: str) -> tuple[str, lis
     return "".join(out), marked
 
 
+_JSOUP_REGEX_ATTR_START_RE = re.compile(r"\[\s*([A-Za-z_][-\w:.]*)\s*~=\s*")
+
+
+def _jsoup_sub_regex_attr_clauses(selector: str, rewrite: Callable[[str, str, str], str]) -> str:
+    """R159 (xs8 `a[href~=chapter[/_-]?list]`): replace every `[attr~=value]` clause with `rewrite(name, value, original_clause)`.
+    Jsoup's QueryParser takes the clause with `chompBalanced('[', ']')`, so brackets INSIDE the value (a regex character class) nest, a backslash
+    escapes the next character and a quoted value keeps its brackets; the old `[^\\]]*?` pattern ended the clause at the first `]` and left the
+    selector broken (tocUrl stayed the book page)."""
+    out: list[str] = []
+    pos = 0
+    length = len(selector)
+    while True:
+        found = _JSOUP_REGEX_ATTR_START_RE.search(selector, pos)
+        if found is None:
+            break
+        index = found.end()
+        depth = 1
+        quote = ""
+        while index < length and depth:
+            char = selector[index]
+            if char == "\\":
+                index += 2
+                continue
+            if quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'" and index == found.end():
+                quote = char
+            elif char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+            index += 1
+        if depth:  # unbalanced: leave the rest to the selector engine
+            break
+        out.append(selector[pos:found.start()])
+        out.append(rewrite(found.group(1), selector[found.end():index - 1].strip(), selector[found.start():index]))
+        pos = index
+    out.append(selector[pos:])
+    return "".join(out)
+
+
 def _jsoup_regex_attr_prepare(root: Any, selector: str) -> tuple[str, list[tuple[Any, str]]]:
     """R156 (tocContent F / searchjs E): Jsoup `[attr~=regex]` is Evaluator.AttributeWithValueMatching (a regex `find` on the
     attribute value); soupsieve's `~=` is the whitespace-separated word operator and rejects most regexes. Every element under
@@ -11009,14 +11499,13 @@ def _jsoup_regex_attr_prepare(root: Any, selector: str) -> tuple[str, list[tuple
     marked: list[tuple[Any, str]] = list(text_marked)
     counter = [0]
 
-    def rewrite(match: re.Match[str]) -> str:
-        name, raw = match.group(1), match.group(2)
+    def rewrite(name: str, raw: str, original: str) -> str:
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
             raw = raw[1:-1]
         try:
             pattern = re.compile(raw)
         except re.error:
-            return match.group(0)
+            return original
         counter[0] += 1
         marker = "data-jsrx%d" % counter[0]
         nodes = list(root.find_all(True)) if hasattr(root, "find_all") else []
@@ -11031,7 +11520,7 @@ def _jsoup_regex_attr_prepare(root: Any, selector: str) -> tuple[str, list[tuple
                 marked.append((node, marker))
         return "[%s]" % marker
 
-    return _JSOUP_REGEX_ATTR_RE.sub(rewrite, selector), marked
+    return _jsoup_sub_regex_attr_clauses(selector, rewrite), marked
 
 
 def _jsoup_regex_attr_cleanup(marked: list[tuple[Any, str]]) -> None:
@@ -11251,6 +11740,173 @@ def xpath_extract(html: str, xpath: str, attr: str | None, base_url: str) -> lis
     return results
 
 
+_JSOUPXPATH_STRING_OPERATORS = ("^=", "$=", "*=", "~=", "!~")
+_XPATH_EXSLT_RE_NAMESPACE = {"re": "http://exslt.org/regular-expressions"}
+_XPATH_OPERAND_NAME_CHARS = frozenset("_-:.@*/")
+
+
+def _xpath_quote_and_bracket_maps(text: str) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+    """Quote pairs (end -> start), bracket pairs (close -> open) and (open -> close) of an XPath text; quoted text is never scanned."""
+    quote_start: dict[int, int] = {}
+    close_to_open: dict[int, int] = {}
+    open_to_close: dict[int, int] = {}
+    stack: list[int] = []
+    quote = ""
+    quote_at = 0
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote_start[index] = quote_at
+                quote = ""
+            continue
+        if char in "'\"":
+            quote, quote_at = char, index
+        elif char in "([":
+            stack.append(index)
+        elif char in ")]" and stack:
+            opened = stack.pop()
+            close_to_open[index] = opened
+            open_to_close[opened] = index
+    return quote_start, close_to_open, open_to_close
+
+
+def _xpath_first_string_operator(text: str) -> tuple[int, str] | None:
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif text[index:index + 2] in _JSOUPXPATH_STRING_OPERATORS and (
+            text[index] != "*" or _xpath_star_equals_is_operator(text, index)
+        ):
+            return index, text[index:index + 2]
+        index += 1
+    return None
+
+
+_XPATH_OPERAND_KEYWORDS = frozenset(("and", "or", "div", "mod"))
+
+
+def _xpath_star_equals_is_operator(text: str, index: int) -> bool:
+    """`*=` is the contains operator only right after an operand (a name, a literal, `)` or `]`); after `[`, `(`, `,`, `/`, `@`, `|`, `=` or
+    a keyword the `*` is the wildcard name test (`li[*='x']`, `@*='x'`) and `=` the ordinary comparison."""
+    before = text[:index].rstrip()
+    if not before:
+        return False
+    last = before[-1]
+    if last in "'\")]":
+        return True
+    if last.isalnum() or last in "_-:.":
+        word = re.search(r"[A-Za-z0-9_.:-]*$", before)
+        return (word.group(0) if word else "") not in _XPATH_OPERAND_KEYWORDS
+    return False
+
+
+def _xpath_operand_start(text: str, end: int, quote_start: dict[int, int], close_to_open: dict[int, int]) -> int | None:
+    """Start index of the operand that ends right before `end` (whitespace skipped): a quoted literal, or a path / function-call expression
+    (name characters, balanced `(...)` / `[...]` groups)."""
+    index = end
+    while index > 0 and text[index - 1].isspace():
+        index -= 1
+    if index == 0:
+        return None
+    if text[index - 1] in "'\"":
+        return quote_start.get(index - 1)
+    start = index
+    while start > 0:
+        char = text[start - 1]
+        if char in ")]":
+            opened = close_to_open.get(start - 1)
+            if opened is None:
+                break
+            start = opened
+        elif char.isalnum() or char in _XPATH_OPERAND_NAME_CHARS:
+            start -= 1
+        else:
+            break
+    return start if start < index else None
+
+
+def _xpath_operand_end(text: str, begin: int, open_to_close: dict[int, int]) -> tuple[int, int] | None:
+    """(start, end) of the operand that begins at or after `begin` (whitespace skipped); `end` is exclusive."""
+    index = begin
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        return None
+    start = index
+    if text[index] in "'\"":
+        closing = text.find(text[index], index + 1)
+        return (start, closing + 1) if closing >= 0 else None
+    while index < len(text):
+        char = text[index]
+        if char in "([":
+            closed = open_to_close.get(index)
+            if closed is None:
+                break
+            index = closed + 1
+        elif char.isalnum() or char in _XPATH_OPERAND_NAME_CHARS:
+            index += 1
+        else:
+            break
+    return (start, index) if index > start else None
+
+
+def _xpath_literal_is_valid_regex(pattern: str) -> bool:
+    try:
+        re.compile(pattern)
+        return True
+    except re.error:
+        return False
+
+
+def jsoupxpath_rewrite_string_operators(xpath: str) -> str:
+    """R159 (yamibo; 1.1.2 `xpath_string_operators`): JsoupXpath (the XPath engine Legado ships) adds the relational operators `a ^= b` (starts
+    with), `a $= b` (ends with), `a *= b` (contains), `a ~= b` (regex find) and `a !~ b` (regex does not find); both operands are compared as
+    their string value (`asString()`; an empty node-set is ""). A bare name is a CHILD element test (no `@`), so `li[class^=list]` compares two
+    empty strings and is true for every `li`. XPath 1.0 (lxml) rejects the operators, so each is rewritten to string functions with the same
+    operand semantics: `starts-with(string(L), string(R))`, `contains(..)`, `substring(..) = ..` for the suffix test and EXSLT `re:test(..)`
+    (the caller binds the `re` prefix, see `_XPATH_EXSLT_RE_NAMESPACE`). Quoted literals are left untouched; text without an operator is
+    returned as it is."""
+    text = xpath or ""
+    for _ in range(64):
+        found = _xpath_first_string_operator(text)
+        if found is None:
+            return text
+        position, operator = found
+        quote_start, close_to_open, open_to_close = _xpath_quote_and_bracket_maps(text)
+        left_start = _xpath_operand_start(text, position, quote_start, close_to_open)
+        right_span = _xpath_operand_end(text, position + 2, open_to_close)
+        if left_start is None or right_span is None:
+            return text  # not an operator position (malformed): leave it to the XPath engine
+        right_start, right_end = right_span
+        left_text = text[left_start:position].strip()
+        right_text = text[right_start:right_end]
+
+        def operand(value: str) -> str:
+            return value if value[:1] in "'\"" else "string(%s)" % value
+
+        left, right = operand(left_text), operand(right_text)
+        if operator == "^=":
+            replacement = "starts-with(%s, %s)" % (left, right)
+        elif operator == "*=":
+            replacement = "contains(%s, %s)" % (left, right)
+        elif operator == "$=":
+            replacement = "(substring(%s, string-length(%s) - string-length(%s) + 1) = %s)" % (left, left, right, right)
+        elif right[:1] in "'\"" and not _xpath_literal_is_valid_regex(right[1:-1]):
+            replacement = "false()"  # an invalid pattern never matches (neither `~=` nor `!~`), the evaluation does not throw
+        elif operator == "~=":
+            replacement = "re:test(%s, %s)" % (left, right)
+        else:
+            replacement = "not(re:test(%s, %s))" % (left, right)
+        text = text[:left_start] + replacement + text[right_end:]
+    return text
+
+
 def _xpath_extract_document(html: str, xpath: str, attr: str | None, base_url: str) -> list[str]:
     """XPath 提取 — 与 Swift XPathEngine 双策略完全对齐：
     策略1: HTML→XHTML + lxml.etree（对应 Foundation.XMLParser 严格 XML 路径）
@@ -11261,6 +11917,12 @@ def _xpath_extract_document(html: str, xpath: str, attr: str | None, base_url: s
     except Exception as _swallowed:
         note_debug_error("xpath lxml import", _swallowed)
         return []
+
+    xpath_namespaces: dict[str, str] | None = None
+    if app_profiles.current_app_profile().xpath_string_operators:
+        xpath = jsoupxpath_rewrite_string_operators(xpath)
+        if "re:test(" in xpath:
+            xpath_namespaces = _XPATH_EXSLT_RE_NAMESPACE
 
     def extract_items(items: list) -> list[str]:
         results: list[str] = []
@@ -11323,7 +11985,7 @@ def _xpath_extract_document(html: str, xpath: str, attr: str | None, base_url: s
     try:
         xhtml = html_to_xhtml(html)
         doc_xml = etree.fromstring(xhtml.encode("utf-8", errors="replace"))
-        items_xml = doc_xml.xpath(xpath)
+        items_xml = doc_xml.xpath(xpath, namespaces=xpath_namespaces)
         results_xml = extract_items(items_xml)
         if results_xml:
             return results_xml
@@ -11334,7 +11996,7 @@ def _xpath_extract_document(html: str, xpath: str, attr: str | None, base_url: s
     # 策略2：lxml.html 降级（与 Swift SwiftSoup CSS 降级方向一致）
     try:
         doc_html = lxml_html.fromstring(html)
-        items_html = doc_html.xpath(xpath)
+        items_html = doc_html.xpath(xpath, namespaces=xpath_namespaces)
         return extract_items(items_html)
     except Exception as _swallowed:
         note_debug_error("xpath strategy 2 (html)", _swallowed)
@@ -13075,6 +13737,59 @@ def _is_selector_like_segment(segment: str) -> bool:
     return lower in _LEGADO_SELECTOR_TAG_NAMES
 
 
+# App CSSEngine.xmlItemMarkerCapacity / xmlItemMarkerMaxUTF8: at most 4096 remembered items (cleared when full), none larger than 256 KB.
+XML_ELEMENT_STRING_CAP = 4096
+XML_ELEMENT_STRING_MAX_UTF8 = 256 * 1024
+
+
+def _xml_element_strings() -> set[str]:
+    strings = getattr(_thread_local, "xml_element_strings", None)
+    if strings is None:
+        strings = set()
+        _thread_local.xml_element_strings = strings
+    return strings
+
+
+def _css_content_is_xml_prefixed(content: str) -> bool:
+    """R159 G3 (1.1.2 `xml_prefix_uses_xml_parser`; asmregg): Legado AnalyzeByJSoup.kt:25-38 parses content whose raw string starts with `<?xml`
+    (case-insensitive, NO whitespace / BOM trimming, :31) with Jsoup's XML parser, so RSS `<link>url</link>` keeps its text. An item taken out of
+    such a document stays an Element of the XML document in Legado; the validator passes items around as plain outerHtml strings (what a JS /
+    regex `result` sees), so the strings produced from an XML document are remembered out of band (`_note_xml_element_strings`) and parsed as XML
+    again when a field rule evaluates them."""
+    if not app_profiles.current_app_profile().xml_prefix_uses_xml_parser:
+        return False
+    text = content or ""
+    if text[:5].lower() == "<?xml":
+        return True
+    return len(text) <= XML_ELEMENT_STRING_MAX_UTF8 and text in _xml_element_strings()
+
+
+def _note_xml_element_strings(values: list[str]) -> None:
+    strings = _xml_element_strings()
+    for value in values:
+        if not value or len(value.encode("utf-8", "ignore")) > XML_ELEMENT_STRING_MAX_UTF8:
+            continue
+        if len(strings) >= XML_ELEMENT_STRING_CAP:
+            strings.clear()
+        strings.add(value)
+
+
+def begin_xml_element_scope() -> None:
+    """The items remembered from XML documents belong to one source's run (called with `begin_debug_errors`)."""
+    _xml_element_strings().clear()
+
+
+def _css_chain_soup(content: str, xml_document: bool) -> Any:
+    if not xml_document:
+        return BeautifulSoup(content, "html.parser")
+    # no void elements: the html.parser builder would make `<link>` / `<meta>` empty and move the URL out as a sibling text node
+    from bs4.builder import HTMLParserTreeBuilder
+
+    builder = HTMLParserTreeBuilder()
+    builder.empty_element_tags = set()
+    return BeautifulSoup(content, builder=builder)
+
+
 def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_override: str | None = None) -> list[str]:
     known_attrs = {
         "text", "html", "innerhtml", "outerhtml", "textnodes", "owntext",
@@ -13111,7 +13826,8 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
     if attr_override is not None:
         final_attr = attr_override
 
-    soup = BeautifulSoup(content, "html.parser")
+    xml_document = _css_content_is_xml_prefixed(content)
+    soup = _css_chain_soup(content, xml_document)
     if "tbody" in rule.lower():
         _insert_implicit_tbody(soup)
     current: list[Any] = [soup]
@@ -13176,7 +13892,10 @@ def evaluate_css_chain_rule(rule: str, content: str, runtime: RuleRuntime, attr_
     current = _apply_css_index(current, final_index)
     if not current:
         return []
-    return _extract_css_values(current, final_attr, runtime.base_url)
+    values = _extract_css_values(current, final_attr, runtime.base_url)
+    if xml_document and final_attr in (None, "", "html", "outerhtml", "all"):
+        _note_xml_element_strings(values)
+    return values
 
 
 def evaluate_css_rule(rule: str, content: str, runtime: RuleRuntime, content_type: str, attr_override: str | None = None) -> list[str]:
@@ -14616,6 +15335,13 @@ def classify_network_error(exc: BaseException | str) -> tuple[str, str]:
 def begin_network_stage() -> None:
     """Forget the transport errors of the previous stage (per thread)."""
     _thread_local.network_events = []
+    _thread_local.explore_event_mark = 0
+
+
+def mark_explore_network_events() -> None:
+    """R159 (G5): the discovery pass starts here; `_mark_explore_failed` only reads the transport events recorded after this point (a timeout /
+    TLS error the SEARCH pass retried successfully must not be pinned on a later rule failure of the discovery)."""
+    _thread_local.explore_event_mark = len(getattr(_thread_local, "network_events", None) or [])
 
 
 # ---- R147 (L7): swallowed exceptions on the verdict path --------------------------------------------------------------
@@ -14684,10 +15410,109 @@ def first_network_event() -> dict[str, Any] | None:
     return dict(events[0]) if events else None
 
 
-def attach_network_error(detail: dict[str, Any], stage: str, reason_is_generic: bool = True) -> bool:
+# R159 (G6, biquge365 `搜索间隔15秒,请稍后重新搜索！`, freexiaoshuo): the App turns a zero-result HTML search page into `rateLimited` only when the
+# page is a blocking / error page (`containsSearchBlockingPageSignals`) AND carries an anti-bot / rate-limit keyword
+# (`containsAntiBotOrRateLimitSignals`), BookSourceEngine.swift:867-876 (explore :1189-1191); the keyword lists are copied from :2225-2265
+# (the http-error part of the blocking test is the validator's `contains_http_error_page_signals`, already computed by the caller as `error_page`).
+# The validator filed such a page under `rule: no search/explore result`. No size cap, no extra phrase: the App has none.
+ANTI_BOT_OR_RATE_LIMIT_KEYWORDS = (
+    "cloudflare", "cf-chl", "captcha", "challenge", "cf-turnstile",
+    "系统限制的搜索", "搜索时间间隔", "请求过于频繁", "频率限制", "访问过于频繁",
+    "操作过于频繁", "请稍后再试", "异常访问", "安全验证", "人机验证",
+    "verifying you are human", "just a moment", "ddos-guard", "hcaptcha",
+    "访问频率超限", "风控拦截", "访问限制", "非正常访问",
+)
+SEARCH_BLOCKING_CHALLENGE_MARKERS = (
+    "cf-chl", "cf-turnstile", "challenge-platform", "verifying you are human", "just a moment", "ddos-guard", "hcaptcha",
+)
+SEARCH_BLOCKING_ERROR_MARKERS = (
+    "<title>404", "<h1>404", "404 not found", "not found</title>",
+    "page not found", "页面未找到", "网页未找到", "未找到页面", "页面无法访问", "网址有错误", "网址已失效", "文件不存在",
+    "抱歉，页面无法访问", "您请求的文件不存在",
+)
+RATE_LIMITED_CATEGORY = "rate limited"
+
+
+def contains_anti_bot_or_rate_limit_signals(html: str) -> bool:
+    """App `containsAntiBotOrRateLimitSignals` (BookSourceEngine.swift:2225)."""
+    if not html:
+        return False
+    lowered = html.lower()
+    return any(keyword in lowered for keyword in ANTI_BOT_OR_RATE_LIMIT_KEYWORDS)
+
+
+def contains_search_blocking_page_signals(html: str, http_error_page: bool) -> bool:
+    """App `containsSearchBlockingPageSignals` (BookSourceEngine.swift:2240): challenge markers, an http-error page, or 404-like markers."""
+    if not html:
+        return False
+    lowered = html.lower()
+    if any(marker in lowered for marker in SEARCH_BLOCKING_CHALLENGE_MARKERS):
+        return True
+    if http_error_page:
+        return True
+    return any(marker in lowered for marker in SEARCH_BLOCKING_ERROR_MARKERS)
+
+
+def contains_rate_limit_page_signals(html: str, http_error_page: bool = False) -> bool:
+    return contains_search_blocking_page_signals(html, http_error_page) and contains_anti_bot_or_rate_limit_signals(html)
+
+
+def _reset_search_rate_limit(runtime: RuleRuntime) -> None:
+    """The App decides per request (one keyword / one explore call): a verdict from an earlier keyword must not outlive it."""
+    variables = runtime.variables or {}
+    if "__searchRateLimited" in variables or "__searchRateLimitedUrl" in variables:
+        runtime.variables = {k: v for k, v in variables.items() if k not in ("__searchRateLimited", "__searchRateLimitedUrl")}
+
+
+def _note_search_rate_limit(runtime: RuleRuntime, html: str, url: str, error_page: bool) -> None:
+    """A zero-result HTML search / explore page the App answers with `rateLimited` (blocking page AND anti-bot / rate-limit keyword): remember it
+    for the verdict. JSON bodies are skipped like the App (`contentType == .html`)."""
+    if is_json_content(html) or not contains_rate_limit_page_signals(html, error_page):
+        return
+    runtime.variables = dict(runtime.variables or {})
+    runtime.variables["__searchRateLimited"] = "1"
+    runtime.variables["__searchRateLimitedUrl"] = str(url or "")
+
+
+def attach_rate_limited_error(detail: dict[str, Any], runtime: RuleRuntime, stage: str) -> bool:
+    """Class the failure as `network error: rate limited` when the last empty search page was a throttle notice (no retry)."""
+    variables = runtime.variables or {}
+    if variables.get("__searchRateLimited") != "1":
+        return False
+    detail["networkError"] = {
+        "category": RATE_LIMITED_CATEGORY,
+        "message": "the site answered the search with a rate-limit notice",
+        "url": str(variables.get("__searchRateLimitedUrl") or ""),
+        "status": 0,
+        "stage": stage,
+    }
+    detail["failureReason"] = NETWORK_ERROR_REASON_PREFIX + RATE_LIMITED_CATEGORY
+    if not detail.get("error"):
+        detail["error"] = "rate limited: the site answered the search with a rate-limit notice"
+    return True
+
+
+# R159 (G5): transport-level categories of `classify_network_error` (the request never produced an HTTP response). An `http NNN` event is
+# often an expected probe (ndlib's explore GET answers 404 before the successful POST), so it must not relabel a later rule failure.
+TRANSPORT_NETWORK_CATEGORIES = frozenset({
+    "tls", "timed out", "dns", "connection refused", "connection reset", "connection failed", "too many redirects",
+})
+
+
+def first_transport_network_event(start: int = 0) -> dict[str, Any] | None:
+    for event in (getattr(_thread_local, "network_events", None) or [])[max(0, start):]:
+        if event.get("category") in TRANSPORT_NETWORK_CATEGORIES:
+            return dict(event)
+    return None
+
+
+def attach_network_error(detail: dict[str, Any], stage: str, reason_is_generic: bool = True, transport_only: bool = False) -> bool:
     """If the stage that just failed recorded a transport/HTTP error, put it into `detail` and make the
-    failureReason `network error: <category>`. Returns whether an event was attached."""
-    event = first_network_event()
+    failureReason `network error: <category>`. Returns whether an event was attached. `transport_only` considers only the events listed in
+    TRANSPORT_NETWORK_CATEGORIES (no HTTP status events)."""
+    event = (
+        first_transport_network_event(int(getattr(_thread_local, "explore_event_mark", 0) or 0)) if transport_only else first_network_event()
+    )
     if not event:
         return False
     detail["networkError"] = dict(event, stage=stage)
@@ -15130,7 +15955,7 @@ def make_runtime(src: dict[str, Any]) -> RuleRuntime:
         header_raw = json.dumps(header_raw, ensure_ascii=False)
     base = fallback_base_url_from_entry_point(src, effective_base_url(url))
     try:
-        source_type = int(src.get("bookSourceType") or 0)
+        source_type = safe_book_source_type(src)
     except Exception:
         source_type = 0
     headers = parse_headers(header_raw, RuleRuntime(
@@ -15212,8 +16037,7 @@ def request_search_or_explore(
     method = opts.get("method", "GET")
     body = opts.get("body") if isinstance(opts.get("body"), str) else None
     extra_headers = opts.get("headers") if isinstance(opts.get("headers"), dict) else {}
-    headers = dict(runtime.headers)
-    headers.update({str(k): str(v) for k, v in extra_headers.items() if v is not None})
+    headers = merge_request_headers(dict(runtime.headers), extra_headers)
     return abs_url, method, {"headers": headers, "body": body, "charset": charset}
 
 
@@ -17276,6 +18100,7 @@ def fetch_book_candidates(
                         runtime.variables = dict(runtime.variables or {})
                         runtime.variables.update(_apply_selected_book_state(runtime, detail_book[2]))
                     return [detail_book[0]], final_url
+                _note_search_rate_limit(runtime, html, final_url, error_page)
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
@@ -17292,6 +18117,8 @@ def fetch_book_candidates(
                 runtime.variables.update(_apply_selected_book_state(runtime, selected_variables))
             if book_urls:
                 runtime.validation_book_author = selected_author
+            if not book_urls:
+                _note_search_rate_limit(runtime, html, final_url, error_page)
             if not book_urls and error_page:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables["__searchChallenge"] = "1"
@@ -17301,6 +18128,7 @@ def fetch_book_candidates(
 
         # search
         for kw in keywords:
+            _reset_search_rate_limit(runtime)
             if _dbg.active():
                 _dbg.emit("keyword", value=kw)
             req = request_search_or_explore(session, src, runtime, kw, mode="search")
@@ -17384,6 +18212,7 @@ def fetch_book_candidates(
                         runtime.variables = dict(runtime.variables or {})
                         runtime.variables.update(_apply_selected_book_state(runtime, detail_book[2]))
                     return [detail_book[0]], final_url
+                _note_search_rate_limit(runtime, html, final_url, error_page)
                 if error_page:
                     runtime.variables = dict(runtime.variables or {})
                     runtime.variables["__searchChallenge"] = "1"
@@ -17399,6 +18228,7 @@ def fetch_book_candidates(
                 # assignment used to sit inside the `if selected_variables` guard).
                 runtime.validation_book_author = selected_author
                 return book_urls, final_url
+            _note_search_rate_limit(runtime, html, final_url, error_page)
             if error_page:
                 runtime.variables = dict(runtime.variables or {})
                 runtime.variables["__searchChallenge"] = "1"
@@ -17423,6 +18253,7 @@ def fetch_book_candidates(
             # pass starts from the source-level variables, not from the search item's `@put` state.
             runtime.variables = dict(source_level_variables)
             explore_capture.clear()
+            mark_explore_network_events()
             try:
                 explore_ok_urls, _explore_ok_base = try_mode("explore")
             finally:
@@ -17532,7 +18363,7 @@ def _fetch_book_info(session: requests.Session, src: dict[str, Any], runtime: Ru
     request_charset = request_options.get("charset") if isinstance(request_options.get("charset"), str) else None
     request_headers = dict(runtime.headers or {})
     if isinstance(request_options.get("headers"), dict):
-        request_headers.update({str(k): str(v) for k, v in request_options["headers"].items() if v is not None})
+        request_headers = merge_request_headers(request_headers, request_options["headers"])
     response_meta: dict[str, Any] = {}
     html, final_url, status = fetch_text(
         session,
@@ -18792,7 +19623,7 @@ def resolve_toc_source(
         request_charset = request_options.get("charset") if isinstance(request_options.get("charset"), str) else None
         request_headers = dict(runtime_seed.headers or {})
         if isinstance(request_options.get("headers"), dict):
-            request_headers.update({str(k): str(v) for k, v in request_options["headers"].items() if v is not None})
+            request_headers = merge_request_headers(request_headers, request_options["headers"])
         visit_key = f"{request_method.upper()} {request_url} {request_body or ''}"
         if visit_key in visited:
             continue
@@ -18968,7 +19799,7 @@ def resolve_toc_source(
                     tail_urls = _toc_tail_chapter_urls(
                         items[item_index:], item_index, toc_rule, runtime2, content_type, final_url,
                         reversed_list=toc_list_reversed, heuristic_toc=heuristic_toc, name_rule_blank=name_rule_blank,
-                        all_items=items, audio_source=int(src.get("bookSourceType") or 0) == 1,
+                        all_items=items, audio_source=safe_book_source_type(src) == 1,
                     )
                 break
             item_type = "json" if is_json_content(item) else content_type
@@ -19136,7 +19967,15 @@ def resolve_toc_source(
             # the first fetchable text chapter for its content-stage probe.
             # App batch validation (BookSourceValidator `fetchFirstTocPage`): only volume rows whose URL is the synthetic `title + index`
             # are dropped from the sample; a volume with a real URL stays a chapter. The full walk keeps skipping every volume row.
-            if is_volume and (not window_only or chapter_url.startswith(title)):
+            # R159 (wenxue88, 1.1.2 `toc_volume_raw_url_title_prefix_filter`): Legado checks `isVolume && url.startsWith(title)` on the RAW chapter url
+            # (BookChapterList / LiveSourceCheckTest), the App keeps the raw url of such a volume row so the same filters drop it; the absolutized
+            # url (`https://host/序章`) no longer starts with the title.
+            volume_raw_url_is_title = bool(
+                is_volume and chapter_url_rule and title
+                and app_profiles.current_app_profile().toc_volume_raw_url_title_prefix_filter
+                and raw_chapter_url.strip().startswith(title)
+            )
+            if is_volume and (not window_only or chapter_url.startswith(title) or volume_raw_url_is_title):
                 continue
             if heuristic_toc and is_likely_toc_noise_title(title, chapter_url, final_url):
                 continue
@@ -19155,6 +19994,8 @@ def resolve_toc_source(
                         first_chapter_url = chapter_url
                         first_chapter_title = title
                         _adopt_first_chapter_runtime(runtime, runtime2.variables or {}, item_runtime, chapter_url, title, item_index, len(items))
+                    elif first_chapter_url and not dedup_window and len(seen_chapter_urls) == 2:
+                        runtime.next_chapter_url = chapter_url
 
         if dedup_window and window_rows and not first_chapter_url:
             # R157 REV / tocContent C xxsy: Legado BookChapterList.kt:119-128 (App keepLastChapterPerURL): of the window's chapters only the
@@ -19187,7 +20028,10 @@ def resolve_toc_source(
                 first_chapter_final_url = final_url
                 first_chapter_url = pick_url
                 first_chapter_title = pick_title
-                _adopt_first_chapter_runtime(runtime, pick_base, pick_runtime, pick_url, pick_title, pick_index, pick_count)
+                _adopt_first_chapter_runtime(
+                    runtime, pick_base, pick_runtime, pick_url, pick_title, pick_index, pick_count,
+                    kept_rows[1][0] if len(kept_rows) > 1 else "",
+                )
         window_rows.clear()
 
         # App `newChaptersThisPage == 0` branch on a jump page: the guessed page produced no chapter at all (items without a usable
@@ -19258,8 +20102,12 @@ def _adopt_first_chapter_runtime(
     title: str,
     item_index: int,
     item_count: int,
+    next_chapter_url: str = "",
 ) -> None:
-    """The first sampled chapter becomes the runtime the content stage copies (chapter binding + chapter-stage variables)."""
+    """The first sampled chapter becomes the runtime the content stage copies (chapter binding + chapter-stage variables).
+
+    `next_chapter_url` is the url of the chapter after it; a toc with a single chapter uses the chapter itself (CheckSourceService.kt:218)."""
+    runtime.next_chapter_url = next_chapter_url or chapter_url
     runtime.chapter_url = chapter_url
     runtime.chapter_title = title
     runtime.chapter_tag = item_runtime.chapter_tag
@@ -19286,6 +20134,20 @@ def _adopt_first_chapter_runtime(
             runtime.variables = {**(runtime.variables or {}), **delta}
 
 
+
+def normalized_chapter_url_for_comparison(raw: str) -> str:
+    """App `normalizedBookCandidateURLForComparison` (BookSourceEngine.swift ~1612): url options dropped, fragment dropped, trailing slashes
+    stripped, lowercased; a JSON / list looking value has no identity ("")."""
+    text = str(raw or "").strip()
+    if not text or text[:1] in "{[":
+        return ""
+    url = parse_url_options(text)[0].strip()
+    if not url:
+        return ""
+    url = url.split("#", 1)[0]
+    return url.rstrip("/").lower()
+
+
 def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runtime: RuleRuntime, chapter_url: str, chapter_title: str, book_name: str) -> tuple[bool, str, int]:
     begin_network_stage()
     # R155 (B): the content request URL expands any leftover `@get:{key}` (BookSourceEngine.swift:5397 / :8149).
@@ -19300,7 +20162,7 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         # reader would show a bare URL. Sources whose chapter URL really is the content (audio = 1, image = 2)
         # still pass.
         try:
-            content_source_type = int(src.get("bookSourceType") or 0)
+            content_source_type = safe_book_source_type(src)
         except Exception:
             content_source_type = 0
         if content_source_type in (1, 2):
@@ -19352,7 +20214,7 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
         request_charset = request_options.get("charset") if isinstance(request_options.get("charset"), str) else None
         request_headers = dict(runtime2.headers or {})
         if isinstance(request_options.get("headers"), dict):
-            request_headers.update({str(k): str(v) for k, v in request_options["headers"].items() if v is not None})
+            request_headers = merge_request_headers(request_headers, request_options["headers"])
         visit_key = f"{request_method.upper()} {request_url} {request_body or ''}"
         if visit_key in visited:
             continue
@@ -19548,11 +20410,19 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
             next_values = derive_paged_chapter_urls(abs_url, page_html, page_content)
         pending_url_values = {url for url, _ in pending_urls}
         next_candidates: list[str] = []
+        # R159 (rwsk2): Legado BookContent.kt:50-55 / :87-91 stops the nextContentUrl loop at the NEXT CHAPTER's url (CheckSourceService.kt:218 passes
+        # `toc[1].url ?: toc.first().url`); the App does the same (BookSourceEngine `isNextChapterContentBoundary`). The stem heuristic below cannot
+        # see it when the chapters share a numeric stem (`txtread/166_1.html` -> `166_2.html`).
+        next_chapter_boundary = ""
+        if runtime2.next_chapter_url:
+            next_chapter_boundary = normalized_chapter_url_for_comparison(resolve_url_with_options(runtime2.next_chapter_url, final_url)[0])
         for raw in next_values:
             if not raw or not raw.strip():
                 continue
             next_url, next_options = resolve_url_with_options(raw, final_url)
             if not next_url:
+                continue
+            if next_chapter_boundary and not next_rule and normalized_chapter_url_for_comparison(next_url) == next_chapter_boundary:
                 continue
             # R150: the page keeps its `url,{options}` (the fetch loop splits them again).
             next_entry = compose_url_with_options(next_url, next_options)
@@ -19561,11 +20431,20 @@ def resolve_chapter_content(session: requests.Session, src: dict[str, Any], runt
             if not is_same_chapter_content_page(next_url, abs_url, first_abs_url):
                 continue
             next_candidates.append(next_entry)
+        # App `isNextChapterContentBoundary` (BookSourceEngine ~10146): a rule-given nextContentUrl is the chapter boundary only when it is the
+        # single page link (Legado BookContent.kt:87-91); several links are paging and stay.
+        if (
+            next_rule and next_chapter_boundary and len(next_candidates) == 1
+            and normalized_chapter_url_for_comparison(resolve_url_with_options(next_candidates[0], final_url)[0]) == next_chapter_boundary
+        ):
+            next_candidates = []
 
         if next_rule and not next_candidates:
             for raw in derive_paged_chapter_urls(abs_url, page_html, page_content):
                 next_url, _ = resolve_url_with_options(raw, final_url)
                 if not next_url:
+                    continue
+                if next_chapter_boundary and normalized_chapter_url_for_comparison(next_url) == next_chapter_boundary:
                     continue
                 if next_url in visited or next_url in pending_url_values or next_url in next_candidates:
                     continue
@@ -19633,6 +20512,8 @@ def _empty_detail(src: dict[str, Any]) -> dict[str, Any]:
         "ok": False,
         "stages": {"search": False, "detail": False, "toc": False, "content": False},
         "failureReason": "",
+        # R159 (G5, freexiaoshuo): the legado parity comparison files a `download-only source` failure under unsupportedSourceType by this key.
+        "bookSourceType": safe_book_source_type(src),
         "detailBookName": "",
         "detailBookAuthor": "",
         "sampleBookUrl": "",
@@ -19687,7 +20568,7 @@ def is_download_only_file_source(src: dict[str, Any]) -> bool:
     has_toc_rule = bool(str((toc_rule or {}).get("chapterList") or "").strip())
     has_content_rule = bool(str((content_rule or {}).get("content") or "").strip())
     try:
-        source_type = int(src.get("bookSourceType", 0) or 0)
+        source_type = safe_book_source_type(src)
     except Exception:
         source_type = 0
     return (source_type == 3 or has_download_urls) and has_download_urls and not has_toc_rule and not has_content_rule
@@ -19870,6 +20751,7 @@ def quick_scan_single_source(src: dict[str, Any]) -> tuple[bool, dict[str, Any] 
         _dbg.set_stage("quick-scan")
         _dbg.emit("begin")
     begin_debug_errors()
+    begin_xml_element_scope()
     passed, seed, detail = _quick_scan_single_source(src, holder)
     attach_debug_errors(detail)
     if _dbg.active():
@@ -19976,7 +20858,8 @@ def _quick_scan_single_source(
                 detail["error"] = "search page requires browser challenge"
             else:
                 detail["failureReason"] = "no search/explore result"
-                attach_network_error(detail, "search")
+                if not attach_rate_limited_error(detail, runtime, "search"):
+                    attach_network_error(detail, "search")
                 if (runtime.variables or {}).get("__exploreOnlyRescue") == "1":
                     detail["error"] = "search returned no usable result (App marks 搜索失效); a working discovery entry does not rescue it"
             detail["responseTimeMs"] = int((time.perf_counter() - started) * 1000)
@@ -20190,6 +21073,9 @@ def _mark_explore_failed(detail: dict[str, Any]) -> None:
     detail["failureReason"] = "explore failed"
     detail["failureGroup"] = "发现失效"
     detail["error"] = "search passed but the discovery entry returned no book (App marks 发现失效 and the source fails)"
+    # R159 (G5, kanman): a discovery request that died on the transport (expired certificate, reset, DNS) is a network failure, not a rule one;
+    # the failure group stays 发现失效 and the verdict still fails (the App fails the host too).
+    attach_network_error(detail, "explore", transport_only=True)
 
 
 def quick_scan_group(url: str, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
@@ -20218,6 +21104,7 @@ def validate_single_source(
         _dbg.set_stage("full-validation")
         _dbg.emit("begin")
     begin_debug_errors()
+    begin_xml_element_scope()
     outcome, merged, detail = _validate_single_source(src, quick_seed, holder)
     attach_debug_errors(detail)
     if _dbg.active():
@@ -20326,7 +21213,7 @@ def _validate_single_source(
         if book_urls and (runtime.variables or {}).get("__exploreFailed") == "1":
             _mark_explore_failed(detail)
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
-            return ValidationOutcome(False, reason="explore failed", response_time_ms=detail["responseTimeMs"]), None, detail
+            return ValidationOutcome(False, reason=str(detail["failureReason"]), response_time_ms=detail["responseTimeMs"]), None, detail
         if not book_urls:
             if (runtime.variables or {}).get("__searchChallenge") == "1":
                 detail["failureReason"] = "webView/paid content"
@@ -20334,7 +21221,8 @@ def _validate_single_source(
                 detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
                 return ValidationOutcome(False, reason="webView/paid content", response_time_ms=detail["responseTimeMs"]), None, detail
             detail["failureReason"] = "no search/explore result"
-            attach_network_error(detail, "search")
+            if not attach_rate_limited_error(detail, runtime, "search"):
+                attach_network_error(detail, "search")
             if (runtime.variables or {}).get("__exploreOnlyRescue") == "1":
                 detail["error"] = "search returned no usable result (App marks 搜索失效); a working discovery entry does not rescue it"
             detail["responseTimeMs"] = int((time.perf_counter() - start) * 1000)
