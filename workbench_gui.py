@@ -1467,6 +1467,9 @@ def self_test() -> int:
     except tk.TclError as exc:
         print(f"WORKBENCH_SELF_TEST_SKIPPED no display: {exc}")
         return 0
+    from source_validator_gui import apply_window_icon
+
+    apply_window_icon(root)
     root.withdraw()
     try:
         window = WorkbenchWindow(root, child_command=lambda: [sys.executable], start_rpc=False)
@@ -1492,9 +1495,11 @@ def main(argv: list[str] | None = None) -> int:
     if "--self-test" in args:
         return self_test()
     # Standalone start (development): borrow the batch GUI's child_command() so both windows launch the same CLI.
+    from source_validator_gui import apply_window_icon
     from source_validator_gui import child_command
 
     root = tk.Tk()
+    apply_window_icon(root)
     root.withdraw()
     window = WorkbenchWindow(root, child_command=child_command, input_path=args[0] if args else "")
     window.protocol("WM_DELETE_WINDOW", lambda: (window._close(), root.destroy()))

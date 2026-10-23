@@ -32,11 +32,14 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $buildRoot = Join-Path $root "build"
 New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
 
+$iconIco = Join-Path $root "assets\readori-icon.ico"
+$iconPng = Join-Path $root "assets\readori-icon.png"
 $common = @(
     "--clean", "--noconfirm", "--onefile",
     "--distpath", $OutputDir,
     "--workpath", (Join-Path $buildRoot "pyinstaller-work"),
-    "--specpath", (Join-Path $buildRoot "spec")
+    "--specpath", (Join-Path $buildRoot "spec"),
+    "--icon", $iconIco
 )
 # The workbench sub-commands are imported lazily by source_validator_cli.py; list them so PyInstaller never misses them.
 $cliHidden = @(
@@ -48,7 +51,9 @@ $cliHidden = @(
     "--hidden-import", "validator.source_edit"
 )
 & $venvPython -m PyInstaller @common @cliHidden "--name" "ReadoriSourceValidatorCLI" "--console" (Join-Path $root "source_validator_cli.py")
-& $venvPython -m PyInstaller @common "--hidden-import" "workbench_gui" "--name" "ReadoriSourceValidator" "--windowed" (Join-Path $root "source_validator_gui.py")
+# The GUI also loads the icon at run time (window / taskbar), so bundle it under assets/ inside the one-file archive.
+$guiAssets = @("--add-data", "$iconPng;assets", "--add-data", "$iconIco;assets")
+& $venvPython -m PyInstaller @common @guiAssets "--hidden-import" "workbench_gui" "--name" "ReadoriSourceValidator" "--windowed" (Join-Path $root "source_validator_gui.py")
 
 $readmeSource = [System.IO.Path]::GetFullPath((Join-Path $root "README.md"))
 $readmeDestination = [System.IO.Path]::GetFullPath((Join-Path $OutputDir "README.md"))

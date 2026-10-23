@@ -117,6 +117,8 @@ powershell -ExecutionPolicy Bypass -File .\build_windows.ps1
 - `dist/ReadoriSourceValidator.exe`：图形界面；
 - `dist/ReadoriSourceValidatorCLI.exe`：命令行版本。
 
+程序图标在 `assets/readori-icon.ico` / `readori-icon.png`（取自 App 图标）：两个 EXE 的文件图标来自 `.ico`，GUI 打包时再把 `assets/` 一并放进单文件包，窗口 / 任务栏图标运行时从那里读取；控制台页面的 favicon 是 `cloudflare/public/favicon.png`。
+
 两个 EXE 需要放在同一目录。双击 `ReadoriSourceValidator.exe` 不会显示 CMD 窗口。首次构建需要下载 Python 包；没有网络时可先使用已有虚拟环境运行源码版。
 
 ## GitHub Actions 自动构建与 Releases

@@ -42,6 +42,33 @@ def application_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def resource_dir() -> Path:
+    """Folder that holds the bundled ``assets/`` (PyInstaller extracts them to ``sys._MEIPASS``)."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", None) or Path(sys.executable).resolve().parent)
+    return Path(__file__).resolve().parent
+
+
+def apply_window_icon(root: tk.Misc) -> None:
+    """Give a Tk root the Readori icon. Missing files or Tk errors are ignored: the icon is cosmetic only."""
+    assets = resource_dir() / "assets"
+    try:
+        ico = assets / "readori-icon.ico"
+        if sys.platform == "win32" and ico.is_file():
+            root.iconbitmap(default=str(ico))
+    except (tk.TclError, OSError):
+        pass
+    try:
+        png = assets / "readori-icon.png"
+        if png.is_file():
+            photo = tk.PhotoImage(file=str(png))
+            root.iconphoto(True, photo)
+            # Tk keeps no reference to the image; hold one on the root so it is not garbage collected.
+            root._readori_icon = photo  # type: ignore[attr-defined]
+    except (tk.TclError, OSError):
+        pass
+
+
 def child_command() -> list[str]:
     root = application_dir()
     if getattr(sys, "frozen", False):
@@ -57,6 +84,7 @@ def child_command() -> list[str]:
 class ValidatorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        apply_window_icon(self)
         self.title("Readori 书源验证器")
         self.geometry("980x720")
         self.minsize(800, 560)
