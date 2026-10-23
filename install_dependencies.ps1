@@ -11,4 +11,4 @@ $venv = Join-Path $root ".venv"
 if (-not (Test-Path -LiteralPath (Join-Path $venv "Scripts\python.exe"))) { & $Python -m venv $venv }
 $venvPython = Join-Path $venv "Scripts\python.exe"
 & $venvPython -m pip install -r (Join-Path $root "requirements-validate-sources.txt")
-Write-Host "Dependencies installed. You can now run run_gui.cmd."
+Write-Host "Dependencies installed. You can now run run_gui.vbs."

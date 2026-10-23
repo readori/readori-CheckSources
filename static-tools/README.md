@@ -104,7 +104,7 @@ Audit one or more existing Legado/Readori source packages:
 
 ```bash
 python capture.py \
-  --audit-file ../data/shareBookSource.json \
+  --audit-file ../data/sources.json \
   --audit-output output/shareBookSource.audit.md \
   --report output/shareBookSource.audit.report.json \
   --audit-keyword 测试 \
@@ -151,7 +151,7 @@ Repair a local package:
 
 ```bash
 python capture.py \
-  --repair-file ../data/shareBookSource.json \
+  --repair-file ../data/sources.json \
   --package-output output/repaired-sources.json \
   --report output/repaired-sources.report.json
 ```
@@ -292,11 +292,11 @@ Static checks include:
 After static repair, run the project validator when network validation is needed:
 
 ```bash
-python validator/validate_source_packages.py \
+python ../validator/validate_source_packages.py \
   --input output/public-sources.usable.json \
-  --report-path data/validation_report_runtime.json \
-  --validated-output data/bookinfo_validated_sources.json \
-  --validated-output-full data/bookinfo_validated_sources_full.json
+  --report-path ../data/validation_report_runtime.json \
+  --validated-output ../data/bookinfo_validated_sources.json \
+  --validated-output-full ../data/bookinfo_validated_sources_full.json
 ```
 
 The validator checks the four required runtime stages: search/explore, detail,
